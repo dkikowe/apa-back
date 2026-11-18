@@ -7,7 +7,11 @@ import {
   parseMoney,
   participantSchema,
 } from "../shared/domain.js";
-import { extractFields } from "../server/services/ocr.js";
+import {
+  extractFields,
+  extractIdentityLayout,
+  type PositionedText,
+} from "../server/services/ocr.js";
 describe("Age and money", () => {
   it("calculates age on the birthday, not by a stored value", () => {
     expect(ageAt("2000-11-19", "2026-11-18")).toBe(25);
@@ -129,5 +133,55 @@ describe("OCR does not invent labels or truncate formatted money", () => {
   it("rejects negative and malformed amounts rather than recording a positive partial value", () => {
     expect(extractFields("TOTAL: -1090.00", "receipt")).toEqual({});
     expect(extractFields("TOTAL: 1.09.00", "receipt")).toEqual({});
+  });
+});
+
+describe("Hybrid PDF identity layout", () => {
+  const at = (text: string, x: number, y: number): PositionedText => ({
+    text,
+    bbox: { x0: x, y0: y, x1: x + 100, y1: y + 10 },
+  });
+  it("binds a nearby native value to its printed label and preserves Kazakh letters", () => {
+    expect(
+      extractIdentityLayout(
+        [at("СЫНАҚҰЛЫ", 100, 125)],
+        [at("ӘКЕСІНІҢ АТЫ / ОТЧЕСТВО", 100, 100)],
+      ),
+    ).toEqual({ middleName: "СЫНАҚҰЛЫ" });
+  });
+  it("does not borrow values from another column or distant fields", () => {
+    expect(
+      extractIdentityLayout(
+        [at("ҮЛГІ", 400, 125), at("СЫНАҚ", 100, 200)],
+        [at("ТЕГІ / ФАМИЛИЯ", 100, 100)],
+      ),
+    ).toEqual({});
+  });
+  it("stops at the next field label when a value is missing", () => {
+    expect(
+      extractIdentityLayout(
+        [at("СЫНАҚ", 100, 145)],
+        [at("ТЕГІ", 100, 100), at("АТЫ", 100, 125)],
+      ),
+    ).toEqual({ firstName: "СЫНАҚ" });
+  });
+  it("does not choose between ambiguous native text fragments", () => {
+    expect(
+      extractIdentityLayout(
+        [at("ҮЛГІ", 100, 125), at("СЫНАҚ", 115, 125)],
+        [at("ТЕГІ", 100, 100)],
+      ),
+    ).toEqual({});
+  });
+  it("reads original MRZ spelling but rejects ambiguous or damaged name lines", () => {
+    const line = "ULGIKYZY<<AIGUL<<<<<<<<<<<<<<<<<<<<";
+    expect(extractFields(line, "identity")).toEqual({
+      lastNameLatin: "ULGIKYZY",
+      firstNameLatin: "AIGUL",
+    });
+    expect(extractFields(line + "\n" + line, "identity")).toEqual({});
+    expect(
+      extractFields("ULG1KYZY<<AIGUL<<<<<<<<<<<<<<<<<<<<", "identity"),
+    ).toEqual({});
   });
 });

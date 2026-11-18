@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
 import sharp from "sharp";
 import { recognize } from "../server/services/ocr.js";
-import { textImage, textPdf, imagePdf } from "./ocr-fixtures.js";
+import {
+  textImage,
+  textPdf,
+  imagePdf,
+  hybridIdentityPdf,
+} from "./ocr-fixtures.js";
 const receipt = [
   "SYNTHETIC RECEIPT",
   "TOTAL: 6,487.00 KZT",
@@ -109,6 +114,19 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
           "receipt",
         ),
       ).toMatchObject({ amount: 648700, paymentDate: "2026-11-18" }));
+    it("combines raster field labels with native PDF values even when MRZ is already readable", async () => {
+      expect(
+        await recognize(
+          await hybridIdentityPdf(),
+          "application/pdf",
+          "identity",
+        ),
+      ).toMatchObject({
+        lastNameLatin: "ULGIKYZY",
+        firstNameLatin: "AIGUL",
+        birthDate: "1975-04-15",
+      });
+    });
     it("leaves a blank image empty", async () =>
       expect(await recognize(textImage([""]), "image/png", "identity")).toEqual(
         {},

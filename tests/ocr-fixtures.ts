@@ -49,7 +49,7 @@ export function textPdf(lines: string[]) {
     ].map((v) => Buffer.from(v)),
   );
 }
-export async function imagePdf(png: Buffer, footer = false) {
+export async function imagePdf(png: Buffer, footer = false, overlay = "") {
   const image = await sharp(png).jpeg({ quality: 95 }).toBuffer();
   const meta = await sharp(image).metadata();
   const w = meta.width! / 2,
@@ -58,7 +58,8 @@ export async function imagePdf(png: Buffer, footer = false) {
     `q ${w} 0 0 ${h} 0 80 cm /Im1 Do Q` +
     (footer
       ? "\nBT /F1 12 Tf 20 20 Td (Synthetic scanned document for local validation without real personal data) Tj ET"
-      : "");
+      : "") +
+    overlay;
   return pdfObjects([
     Buffer.from("<< /Type /Catalog /Pages 2 0 R >>"),
     Buffer.from("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
@@ -77,4 +78,26 @@ export async function imagePdf(png: Buffer, footer = false) {
     ),
     Buffer.from("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
   ]);
+}
+
+export async function hybridIdentityPdf() {
+  const canvas = createCanvas(1700, 1000);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, 1700, 1000);
+  ctx.fillStyle = "black";
+  ctx.font = "26px Arial";
+  ["SURNAME", "GIVEN NAMES", "DATE OF BIRTH"].forEach((label, i) =>
+    ctx.fillText(label, 80, 90 + i * 220),
+  );
+  // Labels are pixels; values and the MRZ-like name line are native PDF text.
+  const overlay =
+    ["ULGIKYZY", "AIGUL", "15.04.1975"]
+      .map(
+        (value, i) =>
+          `\nBT /F1 20 Tf 40 ${580 - (160 + i * 220) / 2} Td (${value}) Tj ET`,
+      )
+      .join("") +
+    "\nBT /F1 16 Tf 40 120 Td (ULGIKYZY<<AIGUL<<<<<<<<<<<<<<<<<<<<) Tj ET";
+  return imagePdf(canvas.toBuffer("image/png"), false, overlay);
 }
