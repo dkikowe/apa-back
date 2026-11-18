@@ -1,0 +1,64 @@
+import "dotenv/config";
+import mongoose from "mongoose";
+import { connect, Document } from "./models.js";
+import { storage } from "./services/storage.js";
+import { recognize } from "./services/ocr.js";
+await connect();
+let stopped = false;
+process.on("SIGTERM", () => {
+  stopped = true;
+});
+process.on("SIGINT", () => {
+  stopped = true;
+});
+console.info("OCR worker ready (local processing)");
+while (!stopped) {
+  await Document.updateMany(
+    {
+      status: "processing",
+      startedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
+    },
+    {
+      $set: {
+        status: "failed",
+        error:
+          "Құжатты оқу аяқталмады. Қолмен толтырыңыз немесе қайталап көріңіз.",
+      },
+    },
+  );
+  const job = await Document.findOneAndUpdate(
+    { status: "queued" },
+    {
+      $set: { status: "processing", startedAt: new Date() },
+      $inc: { attempts: 1 },
+    },
+    { new: true, sort: { createdAt: 1 } },
+  );
+  if (!job) {
+    await new Promise((r) => setTimeout(r, 1500));
+    continue;
+  }
+  try {
+    const fields = await recognize(
+      await storage.read(job.key!),
+      job.mime!,
+      job.kind!,
+    );
+    await Document.updateOne(
+      { _id: job._id },
+      { $set: { status: "done", fields, completedAt: new Date() } },
+    );
+  } catch {
+    await Document.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: "failed",
+          error: "Құжат оқылмады. Мәліметтерді қолмен толтыра аласыз.",
+          completedAt: new Date(),
+        },
+      },
+    );
+  }
+}
+await mongoose.disconnect();

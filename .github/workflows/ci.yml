@@ -1,0 +1,22 @@
+name: Backend and real OCR checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      MONGOMS_VERSION: 8.0.4
+      RUN_OCR_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y fonts-liberation fonts-dejavu-core
+      - run: npm ci
+      - run: npm run ocr:models
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

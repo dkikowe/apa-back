@@ -1,0 +1,74 @@
+{
+  "name": "apa-back",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0"
+  },
+  "scripts": {
+    "worker": "tsx server/worker.ts",
+    "start": "node dist/server/index.js",
+    "start:worker": "node dist/server/worker.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "admin:create": "tsx scripts/create-admin.ts",
+    "seed": "tsx scripts/seed.ts",
+    "local:db": "tsx scripts/local-db.ts",
+    "storage:init": "tsx scripts/init-storage.ts",
+    "ocr:models": "tsx scripts/download-models.ts",
+    "local:setup": "tsx scripts/setup-local.ts",
+    "local:storage": "tsx scripts/local-storage.ts",
+    "test:integrations": "tsx scripts/verify-integrations.ts",
+    "dev": "concurrently -k -n api,ocr \"tsx watch server/index.ts\" \"tsx watch server/worker.ts\"",
+    "build": "tsc --noEmit && tsc -p tsconfig.build.json",
+    "admin:create:prod": "node dist/scripts/create-admin.js",
+    "test:ocr": "RUN_OCR_TESTS=1 vitest run tests/ocr.test.ts",
+    "format": "prettier --write server shared scripts tests"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1171.0",
+    "@aws-sdk/s3-request-presigner": "3.1171.0",
+    "@napi-rs/canvas": "1.1.1",
+    "bcryptjs": "3.0.3",
+    "connect-mongo": "5.1.0",
+    "dotenv": "17.4.2",
+    "exceljs": "4.4.0",
+    "express": "5.3.0",
+    "express-rate-limit": "8.7.4",
+    "express-session": "1.19.0",
+    "file-type": "21.3.4",
+    "helmet": "8.3.0",
+    "mongoose": "8.24.10",
+    "multer": "2.5.0",
+    "pdfjs-dist": "6.5.438",
+    "sharp": "0.35.5",
+    "tesseract.js": "6.0.1",
+    "zod": "4.6.7",
+    "mongodb": "6.22.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/express": "5.0.6",
+    "@types/express-session": "1.19.0",
+    "@types/multer": "2.3.0",
+    "@types/node": "22.20.5",
+    "@types/supertest": "6.0.3",
+    "concurrently": "9.2.5",
+    "eslint": "9.39.5",
+    "globals": "16.5.0",
+    "mongodb-memory-server": "10.4.3",
+    "prettier": "3.10.1",
+    "supertest": "7.3.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0",
+    "vitest": "5.1.1"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  }
+}

@@ -1,0 +1,703 @@
+import express from "express";
+import session from "express-session";
+import MongoStore from "connect-mongo";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
+import multer from "multer";
+import { fileTypeFromBuffer } from "file-type";
+import sharp from "sharp";
+import { randomBytes, createHash } from "node:crypto";
+import path from "node:path";
+import mongoose from "mongoose";
+import { z, ZodError } from "zod";
+import { config } from "./config.js";
+import {
+  Admin,
+  Participant,
+  Payment,
+  Finance,
+  Document,
+  Audit,
+} from "./models.js";
+import {
+  participantSchema,
+  paymentSchema,
+  financeSchema,
+} from "../shared/domain.js";
+import {
+  filtersSchema,
+  listMembers,
+  memberPipeline,
+  normalizeParticipant,
+} from "./services/members.js";
+import { statistics, makeReport, reportTypes } from "./services/reports.js";
+import { storage } from "./services/storage.js";
+declare module "express-session" {
+  interface SessionData {
+    adminId: string;
+    csrf: string;
+  }
+}
+class HttpError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+    public details?: any,
+  ) {
+    super(message);
+  }
+}
+const checkId = (id: string) => {
+  if (!mongoose.isValidObjectId(id))
+    throw new HttpError(400, "Жазба нөмірі дұрыс емес.");
+  return id;
+};
+async function audit(
+  adminId: string,
+  action: string,
+  entity: string,
+  entityId: any,
+  before: any,
+  after: any,
+  s: mongoose.ClientSession,
+) {
+  await Audit.create([{ adminId, action, entity, entityId, before, after }], {
+    session: s,
+  });
+}
+async function atomic<T>(fn: (s: mongoose.ClientSession) => Promise<T>) {
+  const s = await mongoose.startSession();
+  try {
+    return await s.withTransaction(() => fn(s));
+  } finally {
+    await s.endSession();
+  }
+}
+export function createApp() {
+  const app = express();
+  app.disable("x-powered-by");
+  if (config.production) app.set("trust proxy", 1);
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          "img-src": ["'self'", "data:", "blob:"],
+          "connect-src": ["'self'"],
+          "upgrade-insecure-requests": config.production ? [] : null,
+        },
+      },
+    }),
+  );
+  app.use(express.json({ limit: "64kb" }));
+  app.use(
+    session({
+      name: "birlik.sid",
+      secret: config.secret,
+      resave: false,
+      saveUninitialized: false,
+      rolling: true,
+      store: MongoStore.create({
+        mongoUrl: config.mongo,
+        collectionName: "sessions",
+        serialize: JSON.stringify,
+        unserialize: (data: any) => data,
+        ttl: 8 * 60 * 60,
+        crypto: {
+          secret:
+            "Aa1!" +
+            createHash("sha256").update(config.secret).digest("base64"),
+        },
+      }),
+      cookie: {
+        httpOnly: true,
+        secure: config.production,
+        sameSite: "strict",
+        maxAge: 8 * 60 * 60 * 1000,
+      },
+    }),
+  );
+  app.get("/api/health", (_req, res) =>
+    res
+      .status(mongoose.connection.readyState === 1 ? 200 : 503)
+      .json({ ok: mongoose.connection.readyState === 1 }),
+  );
+  app.use("/api", (req, _res, next) => {
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+      const origin = req.get("origin");
+      if (origin && origin !== config.origin)
+        return next(new HttpError(403, "Сұрау рұқсат етілмеген."));
+      if (
+        req.path !== "/auth/login" &&
+        (!req.session.csrf || req.get("x-csrf-token") !== req.session.csrf)
+      )
+        return next(new HttpError(403, "Бетті жаңартып, қайталап көріңіз."));
+    }
+    next();
+  });
+  app.post(
+    "/api/auth/login",
+    rateLimit({
+      windowMs: 15 * 60 * 1000,
+      limit: 8,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: {
+        message: "Көп рет қате енгізілді. 15 минуттан кейін көріңіз.",
+      },
+    }),
+    async (req, res) => {
+      const data = z
+        .object({
+          username: z.string().min(1).max(100),
+          password: z.string().min(1).max(200),
+        })
+        .parse(req.body);
+      const admin = await Admin.findOne({ username: data.username });
+      const valid = await bcrypt.compare(
+        data.password,
+        admin?.passwordHash ||
+          "$2b$12$ZVwcaEObp67z2C40c/4FYO6vVPZGK2LH3kLT4amvv5tXIRWSwzQ9e",
+      );
+      if (!admin || !valid)
+        throw new HttpError(401, "Логин немесе құпиясөз дұрыс емес.");
+      await new Promise<void>((resolve, reject) =>
+        req.session.regenerate((e) => (e ? reject(e) : resolve())),
+      );
+      req.session.adminId = String(admin._id);
+      req.session.csrf = randomBytes(32).toString("hex");
+      await new Promise<void>((resolve, reject) =>
+        req.session.save((e) => (e ? reject(e) : resolve())),
+      );
+      res.json({ username: admin.username, csrf: req.session.csrf });
+    },
+  );
+  app.use("/api", (req, res, next) => {
+    if (!req.session.adminId)
+      return res.status(401).json({ message: "Жүйеге кіріңіз." });
+    res.set("Cache-Control", "no-store");
+    next();
+  });
+  app.get("/api/auth/me", async (req, res) => {
+    const admin = await Admin.findById(req.session.adminId).select("username");
+    if (!admin) throw new HttpError(401, "Жүйеге қайта кіріңіз.");
+    res.json({ username: admin.username, csrf: req.session.csrf });
+  });
+  app.post("/api/auth/logout", async (req, res) => {
+    await new Promise<void>((resolve, reject) =>
+      req.session.destroy((e) => (e ? reject(e) : resolve())),
+    );
+    res.clearCookie("birlik.sid", {
+      httpOnly: true,
+      sameSite: "strict",
+      secure: config.production,
+    });
+    res.json({ ok: true });
+  });
+  app.get("/api/participants", async (req, res) =>
+    res.json(await listMembers(filtersSchema.parse(req.query))),
+  );
+  app.post("/api/participants", async (req, res) => {
+    const data = participantSchema.parse(req.body);
+    const result = await atomic(async (s) => {
+      if (data.identityDocumentId) {
+        const doc = await Document.findOne({
+          _id: data.identityDocumentId,
+          kind: "identity",
+          ownerId: req.session.adminId,
+          participantId: null,
+        }).session(s);
+        if (!doc)
+          throw new HttpError(
+            400,
+            "Құжат табылмады немесе басқа адамға тіркелген.",
+          );
+      }
+      const [p] = await Participant.create([normalizeParticipant(data)], {
+        session: s,
+      });
+      if (data.identityDocumentId)
+        await Document.updateOne(
+          { _id: data.identityDocumentId },
+          { $set: { participantId: p._id } },
+          { session: s },
+        );
+      await audit(
+        req.session.adminId!,
+        "create",
+        "Participant",
+        p._id,
+        null,
+        p.toObject(),
+        s,
+      );
+      return p;
+    });
+    res.status(201).json(result);
+  });
+  app.get("/api/participants/:id", async (req, res) => {
+    const [p] = await Participant.aggregate(
+      memberPipeline(
+        filtersSchema.parse({ year: req.query.year }),
+        checkId(req.params.id),
+      ),
+    );
+    if (!p) throw new HttpError(404, "Қатысушы табылмады.");
+    const payments = await Payment.find({ participantId: p._id })
+      .sort({ paymentDate: -1, createdAt: -1 })
+      .lean();
+    res.json({ ...p, payments });
+  });
+  app.patch("/api/participants/:id", async (req, res) => {
+    const id = checkId(req.params.id),
+      data = participantSchema.parse(req.body);
+    const p = await atomic(async (s) => {
+      const before = await Participant.findById(id).session(s);
+      if (!before) throw new HttpError(404, "Қатысушы табылмады.");
+      if (data.identityDocumentId) {
+        const doc = await Document.findOne({
+          _id: data.identityDocumentId,
+          kind: "identity",
+          ownerId: req.session.adminId,
+          $or: [{ participantId: null }, { participantId: id }],
+        }).session(s);
+        if (!doc) throw new HttpError(400, "Құжат табылмады.");
+        await Document.updateOne(
+          { _id: doc._id },
+          { $set: { participantId: id } },
+          { session: s },
+        );
+      }
+      const after = await Participant.findByIdAndUpdate(
+        id,
+        { $set: normalizeParticipant(data) },
+        { new: true, session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        "update",
+        "Participant",
+        id,
+        before.toObject(),
+        after?.toObject(),
+        s,
+      );
+      return after;
+    });
+    res.json(p);
+  });
+  app.post("/api/participants/:id/archive", async (req, res) => {
+    const restore = z
+      .object({ restore: z.boolean().default(false) })
+      .parse(req.body).restore;
+    const id = checkId(req.params.id);
+    await atomic(async (s) => {
+      const before = await Participant.findById(id).session(s);
+      if (!before) throw new HttpError(404, "Қатысушы табылмады.");
+      const after = await Participant.findByIdAndUpdate(
+        id,
+        { $set: { archivedAt: restore ? null : new Date() } },
+        { new: true, session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        restore ? "restore" : "archive",
+        "Participant",
+        id,
+        before.toObject(),
+        after?.toObject(),
+        s,
+      );
+    });
+    res.json({ ok: true });
+  });
+  async function savePayment(req: express.Request, res: express.Response) {
+    const data = paymentSchema.parse(req.body),
+      id = req.params.paymentId
+        ? checkId(String(req.params.paymentId))
+        : undefined;
+    const result = await atomic(async (s) => {
+      const before = id
+        ? await Payment.findOne({ _id: id, voidedAt: null }).session(s)
+        : null;
+      if (id && !before) throw new HttpError(404, "Төлем табылмады.");
+      const participantId =
+        before?.participantId || checkId(String(req.params.id));
+      const participant = await Participant.findById(participantId).session(s);
+      if (!participant || participant.archivedAt)
+        throw new HttpError(400, "Алдымен қатысушыны тізімге қайтарыңыз.");
+      let fileHash: string | undefined;
+      const receiptDocumentId =
+        data.receiptDocumentId || before?.receiptDocumentId?.toString();
+      if (receiptDocumentId) {
+        const doc = await Document.findOne({
+          _id: receiptDocumentId,
+          kind: "receipt",
+          ownerId: req.session.adminId,
+          $or: [{ participantId: null }, { participantId }],
+        }).session(s);
+        if (!doc)
+          throw new HttpError(
+            400,
+            "Чек табылмады немесе басқа қатысушыға тіркелген.",
+          );
+        fileHash = doc.hash || undefined;
+        await Document.updateOne(
+          { _id: doc._id },
+          { $set: { participantId } },
+          { session: s },
+        );
+      }
+      const fingerprint = data.receiptNumber
+        ? createHash("sha256")
+            .update(
+              [
+                data.receiptNumber.trim().toLowerCase(),
+                data.amount,
+                data.paymentDate,
+                data.recipientName.trim().toLowerCase(),
+              ].join("|"),
+            )
+            .digest("hex")
+        : undefined;
+      const candidates = [
+        ...(fileHash ? [{ fileHash }] : []),
+        ...(fingerprint ? [{ fingerprint }] : []),
+      ];
+      const duplicate = candidates.length
+        ? await Payment.findOne({
+            voidedAt: null,
+            ...(id ? { _id: { $ne: id } } : {}),
+            $or: candidates,
+          }).session(s)
+        : null;
+      if (duplicate && !data.confirmDuplicate)
+        throw new HttpError(
+          409,
+          "Бұл чек бұрын тіркелген болуы мүмкін. Қайта қоспас бұрын тексеріңіз.",
+          { duplicateId: duplicate._id },
+        );
+      const { confirmDuplicate: _confirm, ...input } = data;
+      const keys = [
+        ...(fileHash ? ["file:" + fileHash] : []),
+        ...(fingerprint ? ["receipt:" + fingerprint] : []),
+      ];
+      const values = {
+        ...input,
+        participantId,
+        ...(receiptDocumentId ? { receiptDocumentId } : {}),
+        ...(fileHash ? { fileHash } : {}),
+        ...(fingerprint ? { fingerprint } : {}),
+        duplicateConfirmed: data.confirmDuplicate,
+      };
+      let p;
+      if (before) {
+        p = await Payment.findByIdAndUpdate(
+          id,
+          {
+            $set: {
+              ...values,
+              ...(!data.confirmDuplicate && keys.length
+                ? { dedupeKeys: keys }
+                : {}),
+            },
+            $unset: {
+              ...(!fingerprint ? { fingerprint: 1 } : {}),
+              ...(!fileHash ? { fileHash: 1 } : {}),
+              ...(data.confirmDuplicate || !keys.length
+                ? { dedupeKeys: 1 }
+                : {}),
+            },
+          },
+          { new: true, session: s },
+        );
+      } else {
+        [p] = await Payment.create(
+          [
+            {
+              ...values,
+              ...(!data.confirmDuplicate && keys.length
+                ? { dedupeKeys: keys }
+                : {}),
+            },
+          ],
+          { session: s },
+        );
+      }
+      await audit(
+        req.session.adminId!,
+        before ? "update" : "create",
+        "MembershipPayment",
+        p!._id,
+        before?.toObject(),
+        p!.toObject(),
+        s,
+      );
+      return p;
+    });
+    res.status(id ? 200 : 201).json(result);
+  }
+  app.post("/api/participants/:id/payments", savePayment);
+  app.patch("/api/payments/:paymentId", savePayment);
+  app.post("/api/payments/:id/void", async (req, res) => {
+    const id = checkId(req.params.id);
+    await atomic(async (s) => {
+      const before = await Payment.findOne({ _id: id, voidedAt: null }).session(
+        s,
+      );
+      if (!before) throw new HttpError(404, "Төлем табылмады.");
+      await Payment.updateOne(
+        { _id: id },
+        { $set: { voidedAt: new Date() }, $unset: { dedupeKeys: 1 } },
+        { session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        "void",
+        "MembershipPayment",
+        id,
+        before.toObject(),
+        null,
+        s,
+      );
+    });
+    res.json({ ok: true });
+  });
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 15 * 1024 * 1024, files: 1, fields: 2 },
+  });
+  app.post(
+    "/api/documents",
+    rateLimit({
+      windowMs: 60 * 1000,
+      limit: 15,
+      message: { message: "Бір минуттан кейін қайталап көріңіз." },
+    }),
+    upload.single("file"),
+    async (req, res) => {
+      const kind = z.enum(["identity", "receipt"]).parse(req.body.kind);
+      if (!req.file) throw new HttpError(400, "Құжатты таңдаңыз.");
+      const type = await fileTypeFromBuffer(req.file.buffer);
+      if (
+        !type ||
+        !["application/pdf", "image/jpeg", "image/png"].includes(type.mime)
+      )
+        throw new HttpError(400, "Тек PDF, JPG және PNG файлдары қабылданады.");
+      if (type.mime.startsWith("image/"))
+        await sharp(req.file.buffer, { limitInputPixels: 25000000 }).metadata();
+      else {
+        const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+        const pdf = await getDocument({ data: new Uint8Array(req.file.buffer) })
+          .promise;
+        try {
+          if (pdf.numPages > 10)
+            throw new HttpError(400, "PDF 10 беттен аспауы керек.");
+        } finally {
+          await pdf.loadingTask.destroy();
+        }
+      }
+      const hash = createHash("sha256").update(req.file.buffer).digest("hex");
+      const duplicate = await Document.findOne({ hash }).select("_id");
+      const key = `${kind}/${randomBytes(24).toString("hex")}.${type.ext}`;
+      await storage.put(key, req.file.buffer, type.mime);
+      try {
+        const doc = await Document.create({
+          kind,
+          key,
+          mime: type.mime,
+          size: req.file.size,
+          hash,
+          ownerId: req.session.adminId,
+          originalName: req.file.originalname.slice(0, 200),
+          status: "queued",
+        });
+        res
+          .status(201)
+          .json({ id: doc._id, status: doc.status, duplicate: !!duplicate });
+      } catch (e) {
+        await storage.remove(key).catch(() => {});
+        throw e;
+      }
+    },
+  );
+  app.get("/api/documents/:id", async (req, res) => {
+    const d = await Document.findOne({
+      _id: checkId(req.params.id),
+      ownerId: req.session.adminId,
+    }).select("kind status fields error participantId");
+    if (!d) throw new HttpError(404, "Құжат табылмады.");
+    res.json(d);
+  });
+  app.post("/api/documents/:id/retry", async (req, res) => {
+    const doc = await Document.findOneAndUpdate(
+      {
+        _id: checkId(req.params.id),
+        ownerId: req.session.adminId,
+        status: "failed",
+        attempts: { $lt: 3 },
+      },
+      { $set: { status: "queued", error: null } },
+      { new: true },
+    );
+    if (!doc)
+      throw new HttpError(400, "Қайта оқу мүмкін емес. Қолмен толтырыңыз.");
+    res.json({ ok: true });
+  });
+  app.get("/api/documents/:id/url", async (req, res) => {
+    const d = await Document.findOne({
+      _id: checkId(req.params.id),
+      ownerId: req.session.adminId,
+    });
+    if (!d) throw new HttpError(404, "Құжат табылмады.");
+    res.json({ url: await storage.url(d.key!) });
+  });
+  app.get("/api/finance", async (req, res) => {
+    const f = filtersSchema.parse(req.query);
+    const match = {
+      voidedAt: null,
+      date: { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` },
+    };
+    const [items, total] = await Promise.all([
+      Finance.find(match)
+        .sort({ date: -1, _id: -1 })
+        .skip((f.page - 1) * f.limit)
+        .limit(f.limit)
+        .lean(),
+      Finance.countDocuments(match),
+    ]);
+    res.json({ items, total, page: f.page, limit: f.limit });
+  });
+  app.post("/api/finance", async (req, res) => {
+    const data = financeSchema.parse(req.body);
+    const result = await atomic(async (s) => {
+      const [doc] = await Finance.create([data], { session: s });
+      await audit(
+        req.session.adminId!,
+        "create",
+        "FinancialTransaction",
+        doc._id,
+        null,
+        doc.toObject(),
+        s,
+      );
+      return doc;
+    });
+    res.status(201).json(result);
+  });
+  app.patch("/api/finance/:id", async (req, res) => {
+    const data = financeSchema.parse(req.body),
+      id = checkId(req.params.id);
+    const result = await atomic(async (s) => {
+      const before = await Finance.findOne({ _id: id, voidedAt: null }).session(
+        s,
+      );
+      if (!before) throw new HttpError(404, "Жазба табылмады.");
+      const after = await Finance.findByIdAndUpdate(
+        id,
+        { $set: data },
+        { new: true, session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        "update",
+        "FinancialTransaction",
+        id,
+        before.toObject(),
+        after?.toObject(),
+        s,
+      );
+      return after;
+    });
+    res.json(result);
+  });
+  app.delete("/api/finance/:id", async (req, res) => {
+    const id = checkId(req.params.id);
+    await atomic(async (s) => {
+      const before = await Finance.findOne({ _id: id, voidedAt: null }).session(
+        s,
+      );
+      if (!before) throw new HttpError(404, "Жазба табылмады.");
+      await Finance.updateOne(
+        { _id: id },
+        { $set: { voidedAt: new Date() } },
+        { session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        "void",
+        "FinancialTransaction",
+        id,
+        before.toObject(),
+        null,
+        s,
+      );
+    });
+    res.json({ ok: true });
+  });
+  app.get("/api/statistics", async (req, res) =>
+    res.json(await statistics(filtersSchema.parse(req.query))),
+  );
+  app.get("/api/reports/:type", async (req, res) => {
+    const type = z.enum(reportTypes).parse(req.params.type),
+      f = filtersSchema.parse(req.query);
+    res.set({
+      "Content-Type":
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${type}-${f.year}.xlsx"`,
+    });
+    res.send(Buffer.from(await makeReport(type, f)));
+  });
+  app.get("/api/settings", (_req, res) =>
+    res.json({
+      annualFee: 648700,
+      timezone: "Asia/Almaty",
+      storageConfigured: !!process.env.S3_ENDPOINT || !!process.env.S3_REGION,
+      ocrLanguages: process.env.OCR_LANGUAGES || "kaz+rus+eng",
+    }),
+  );
+  app.use("/api", (_req, res) =>
+    res.status(404).json({ message: "Бет табылмады." }),
+  );
+  if (config.production && process.env.SERVE_FRONTEND === "true") {
+    app.use(express.static(path.resolve("dist/web")));
+    app.get("/{*path}", (_req, res) =>
+      res.sendFile(path.resolve("dist/web/index.html")),
+    );
+  }
+  app.use(
+    (
+      error: any,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      if (error instanceof ZodError)
+        return res.status(400).json({
+          message: "Мәліметтерді тексеріңіз.",
+          fields: error.flatten().fieldErrors,
+        });
+      if (error.code === 11000)
+        return res.status(409).json({
+          message: "Бұл чек бұрын тіркелген. Қайталап қосуды растаңыз.",
+        });
+      if (error instanceof multer.MulterError)
+        return res
+          .status(400)
+          .json({ message: "Файл 15 МБ-тан аспауы керек." });
+      if (error instanceof HttpError)
+        return res
+          .status(error.status)
+          .json({ message: error.message, ...error.details });
+      console.error("Request failed", {
+        type: error.name,
+        code: error.code,
+        ...(process.env.NODE_ENV === "test" ? { stack: error.stack } : {}),
+      });
+      res.status(500).json({
+        message: "Сақталмады. Қайта көріңіз. Қате қайталанса, көмек сұраңыз.",
+      });
+    },
+  );
+  return app;
+}
