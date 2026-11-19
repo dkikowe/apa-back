@@ -60,6 +60,7 @@ const labels = {
   ],
   paymentDate: [
     "ДАТА И ВРЕМЯ",
+    "ДАТАИ ВРЕМЯ",
     "ДАТА ПЛАТЕЖА",
     "ДАТА ПЕРЕВОДА",
     "ТӨЛЕМ КҮНІ",
@@ -71,13 +72,15 @@ const labels = {
   receiptNumber: [
     "НОМЕР ТРАНЗАКЦИИ",
     "НОМЕР ЧЕКА",
+    "№ ЧЕКА",
+    "ЧЕКТІҢ НӨМІРІ",
     "ЧЕК НӨМІРІ",
     "TRANSACTION NUMBER",
     "TRANSACTION ID",
     "RECEIPT NUMBER",
     "ЧЕК №",
   ],
-  method: ["СПОСОБ ОПЛАТЫ", "ТӨЛЕМ ТӘСІЛІ", "PAYMENT METHOD"],
+  method: ["СПОСОБ ОПЛАТЫ", "ТӨЛЕМ ТӘСІЛІ", "PAYMENT METHOD", "ОПЛАЧЕНО"],
 };
 const prefix = (values: string[]) =>
   new RegExp("^(?:" + values.join("|") + ")(?=\\s|[:/|–—-]|$)", "iu");
@@ -259,6 +262,10 @@ export function extractFields(text: string, kind: string) {
       while (expression.test(value))
         value = value.replace(expression, "").replace(/^[\s:/|]+/, "");
       if (!value) value = lines[i + 1] || "";
+      // Some receipts put timezone wording between the date label and value.
+      if (/^(?:по Астане|Астана уақыты бойынша)$/iu.test(value))
+        value = lines[i + 2] || "";
+      value = value.replace(/^по Астане\s*/iu, "");
       if (value && !anyLabel.test(value)) return value.trim();
     }
     return undefined;
@@ -315,6 +322,26 @@ export function extractFields(text: string, kind: string) {
       const parsed = receiptAmount(amount);
       if (parsed !== undefined) fields.amount = parsed;
     }
+    // Successful QR receipts show a standalone currency amount below the status.
+    // Never use the merchant IIN, a card number, or an arbitrary unlabeled number.
+    if (fields.amount === undefined) {
+      const success = lines.findIndex((line) =>
+        /^(?:Оплата совершена|Плат[её]ж выполнен|Төлем жасалды|Төлем сәтті орындалды)$/iu.test(
+          line,
+        ),
+      );
+      if (success >= 0) {
+        const candidates = lines
+          .slice(success + 1, success + 2)
+          .filter((line) =>
+            /^[\d\s.,'’]+\s*(?:₸|KZT|тенге|тг|Т|T)[.]?$/iu.test(line),
+          );
+        if (candidates.length === 1) {
+          const amount = receiptAmount(candidates[0]);
+          if (amount !== undefined) fields.amount = amount;
+        }
+      }
+    }
     const date = labeled(labels.paymentDate);
     if (date) {
       const parsed = dateValue(date);
@@ -326,13 +353,46 @@ export function extractFields(text: string, kind: string) {
         fields[key] = value.slice(0, key === "recipientName" ? 200 : 150);
     }
   }
+  if (
+    kind === "receipt" &&
+    !fields.recipientName &&
+    /Оплата совершена|Төлем жасалды/iu.test(text)
+  ) {
+    const merchants = lines
+      .map((line) => line.replace(/^[оoОO0]\s+(?=ИП|ТОО|ЖК|ЖШС)/u, ""))
+      .filter((line) => /^(?:ИП|ТОО|ЖК|ЖШС)\s+.{2,190}$/u.test(line));
+    if (merchants.length === 1) fields.recipientName = merchants[0];
+  }
   return fields;
+}
+// PDF content streams can list the left column before the right column. Rebuild
+// receipt rows by their visible position, so dates stay beside their labels.
+export function receiptTextLines(items: PositionedText[]) {
+  const rows: { y: number; items: PositionedText[] }[] = [];
+  for (const item of [...items]
+    .filter((v) => v.text.trim())
+    .sort((a, b) => a.bbox.y1 - b.bbox.y1 || a.bbox.x0 - b.bbox.x0)) {
+    const row = rows.find((r) => Math.abs(r.y - item.bbox.y1) <= 2);
+    if (row) row.items.push(item);
+    else rows.push({ y: item.bbox.y1, items: [item] });
+  }
+  return rows
+    .map((row) =>
+      row.items
+        .sort((a, b) => a.bbox.x0 - b.bbox.x0)
+        .map((v) => v.text)
+        .join(" "),
+    )
+    .join("\n");
 }
 export async function recognize(buffer: Buffer, mime: string, kind: string) {
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
   const scan = async (image: Buffer) => {
     worker ??= await createWorker(
-      (process.env.OCR_LANGUAGES || "kaz+rus+eng").split("+"),
+      (
+        process.env.OCR_LANGUAGES ||
+        (kind === "receipt" ? "eng+rus+kaz" : "kaz+rus+eng")
+      ).split("+"),
       1,
       {
         langPath: process.env.OCR_LANG_PATH || ".local/tessdata",
@@ -371,6 +431,27 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           for (const item of content.items) {
             if ("str" in item) layer += item.str + (item.hasEOL ? "\n" : " ");
           }
+          if (kind === "receipt" && page.rotate === 0) {
+            layer = receiptTextLines(
+              content.items.flatMap((item) =>
+                "str" in item &&
+                item.transform[1] === 0 &&
+                item.transform[2] === 0
+                  ? [
+                      {
+                        text: item.str,
+                        bbox: {
+                          x0: item.transform[4],
+                          x1: item.transform[4] + item.width,
+                          y0: -item.transform[5] - item.height,
+                          y1: -item.transform[5],
+                        },
+                      },
+                    ]
+                  : [],
+              ),
+            );
+          }
           const layerFields = extractFields(layer, kind);
           const layerComplete =
             kind === "identity"
@@ -379,7 +460,11 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
                   (layerFields.firstName || layerFields.firstNameLatin) &&
                   layerFields.birthDate,
                 )
-              : Object.keys(layerFields).length > 0;
+              : Boolean(
+                  layerFields.amount !== undefined &&
+                  layerFields.paymentDate &&
+                  layerFields.receiptNumber,
+                );
           if (layer.replace(/\s/g, "").length > 40 && layerComplete) {
             text += layer + "\n";
             continue;
@@ -400,6 +485,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           }).promise;
           const scanned = await scan(canvas.toBuffer("image/png"));
           text += scanned.text + "\n";
+          if (kind === "receipt") Object.assign(nativeFields, layerFields);
           if (kind === "identity") {
             const values: PositionedText[] = content.items.flatMap((item) => {
               if (

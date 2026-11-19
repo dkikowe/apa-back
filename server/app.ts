@@ -128,7 +128,8 @@ export function createApp() {
       .status(mongoose.connection.readyState === 1 ? 200 : 503)
       .json({ ok: mongoose.connection.readyState === 1 }),
   );
-  app.use("/api", (req, _res, next) => {
+  app.use("/api", (req, res, next) => {
+    res.set("Cache-Control", "private, no-store");
     if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
       const origin = req.get("origin");
       if (origin && origin !== config.origin)
@@ -550,7 +551,12 @@ export function createApp() {
       }
       const hash = createHash("sha256").update(req.file.buffer).digest("hex");
       const duplicate = await Document.findOne({ hash }).select("_id");
-      const key = `${kind}/${randomBytes(24).toString("hex")}.${type.ext}`;
+      const key = [
+        process.env.S3_KEY_PREFIX?.replace(/^\/+|\/+$/g, ""),
+        `${kind}/${randomBytes(24).toString("hex")}.${type.ext}`,
+      ]
+        .filter(Boolean)
+        .join("/");
       await storage.put(key, req.file.buffer, type.mime);
       try {
         const doc = await Document.create({
