@@ -1,7 +1,11 @@
 import ExcelJS from "exceljs";
 import { Participant, Payment, Finance } from "../models.js";
 import { memberPipeline, type Filters } from "./members.js";
-import { AGE_LABELS, STATUS_LABELS } from "../../shared/domain.js";
+import {
+  AGE_LABELS,
+  STATUS_LABELS,
+  missingParticipantFields,
+} from "../../shared/domain.js";
 export async function financialSummary(year: number) {
   const from = `${year}-01-01`,
     to = `${year + 1}-01-01`;
@@ -134,15 +138,23 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Қалды, ₸", key: "remaining", width: 18 },
       { header: "Артық төлем, ₸", key: "overpayment", width: 18 },
       { header: "Мәртебе", key: "status", width: 24 },
+      { header: "Мәліметтер", key: "completeness", width: 20 },
+      { header: "Ескертпе", key: "notes", width: 50 },
     ];
     for await (const row of Participant.aggregate(memberPipeline(f)).cursor()) {
       sheet.addRow({
         ...row,
+        completeness: missingParticipantFields(row).length
+          ? "Толық емес"
+          : "Толық",
         year: f.year,
         totalPaid: row.totalPaid / 100,
         remaining: row.remaining / 100,
         overpayment: row.overpayment / 100,
-        ageLabel: AGE_LABELS[row.ageGroup],
+        ageLabel:
+          row.ageGroup == null
+            ? "Туған күні көрсетілмеген"
+            : AGE_LABELS[row.ageGroup],
         status: STATUS_LABELS[row.status as keyof typeof STATUS_LABELS],
       });
     }

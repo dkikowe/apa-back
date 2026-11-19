@@ -38,7 +38,6 @@ import {
   commitImport,
   importTemplate,
   ImportError,
-  personKey,
 } from "./services/imports.js";
 declare module "express-session" {
   interface SessionData {
@@ -321,7 +320,6 @@ export function createApp() {
         {
           $set: {
             ...normalizeParticipant(data),
-            ...(before.importKey ? { importKey: personKey(data) } : {}),
           },
         },
         { new: true, session: s },

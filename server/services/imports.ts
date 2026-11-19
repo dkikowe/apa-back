@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Participant, Payment, Audit, ImportDraft } from "../models.js";
 import {
   participantSchema,
+  missingParticipantFields,
   paymentSchema,
   REGIONS,
   parseMoney,
@@ -14,16 +15,32 @@ import {
 import { normalizeParticipant } from "./members.js";
 
 export const IMPORT_COLUMNS = {
+  notes: ["Ескертпе", "Примечание", "notes"],
   lastName: ["Тегі", "Фамилия", "surname", "lastName"],
   firstName: ["Аты", "Имя", "name", "firstName"],
   middleName: ["Әкесінің аты", "Отчество", "middleName"],
-  fullName: ["Аты-жөні", "ФИО", "Ф.И.О.", "Фамилия имя отчество"],
+  fullName: ["Аты-жөні", "ФИО", "Ф.И.О.", "Фамилия имя отчество", "АӘТ"],
+  fullNameLatin: ["Ағылшын аты жөні", "Латынша аты-жөні"],
+  validityPeriod: [
+    "Жеке куәліктің жарамдылық мерзімі",
+    "Куәліктің мерзімі (басталуы–аяқталуы)",
+  ],
   birthDate: ["Туған күні", "Дата рождения", "birthDate"],
-  region: ["Аймақ", "Аймағы", "Регион", "Район", "region"],
+  region: [
+    "Аймақ",
+    "Аймағы",
+    "Регион",
+    "Район",
+    "region",
+    "Мекен жай",
+    "Мекенжай",
+  ],
   phone: ["Телефон", "Телефон нөмірі", "Номер телефона", "phone"],
   iin: ["ЖСН", "ИИН", "iin"],
   documentNumber: [
     "Куәлік нөмірі",
+    "Жеке куәлік номері",
+    "Жеке куәлік нөмірі",
     "Номер удостоверения",
     "Номер документа",
     "documentNumber",
@@ -46,6 +63,7 @@ type Key = keyof typeof IMPORT_COLUMNS;
 type Mapping = Partial<Record<Key, number>>;
 type ReadyRow = {
   row: number;
+  importKey: string;
   participant: ParticipantInput;
   payment?: z.infer<typeof paymentSchema>;
 };
@@ -74,7 +92,10 @@ export const personKey = (
     .digest("hex");
 function keys(p: any) {
   return [
-    "person:" + personKey(p),
+    ...(p.lastName && p.firstName && p.birthDate
+      ? ["person:" + personKey(p)]
+      : []),
+    ...(p.importKey ? ["source:" + p.importKey] : []),
     ...(p.iin ? ["iin:" + p.iin] : []),
     ...(p.documentNumber ? ["doc:" + normal(p.documentNumber)] : []),
   ];
@@ -82,7 +103,7 @@ function keys(p: any) {
 async function existingKeys(session?: mongoose.ClientSession) {
   const set = new Set<string>();
   const query = Participant.find()
-    .select("lastName firstName birthDate iin documentNumber")
+    .select("lastName firstName birthDate iin documentNumber importKey")
     .lean();
   if (session) query.session(session);
   for (const p of await query) for (const k of keys(p)) set.add(k);
@@ -162,6 +183,7 @@ function cellString(cell: ExcelJS.Cell, key: Key, date1904: boolean) {
   )
     throw new Error("формуланы мәнге ауыстырыңыз");
   if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (/^(?:[-–—]|жоқ|нет)$/i.test(cell.text.trim())) return "";
   if (key.endsWith("Date")) {
     if (typeof value === "number") {
       if (value < 1 || value > 100000) throw new Error("күнді тексеріңіз");
@@ -256,13 +278,19 @@ export async function previewImport(
           ?.index;
     if (index && index <= sheet.columnCount) mapping[key as Key] = index;
   }
-  const missing = [
-    ...(!mapping.fullName && !mapping.lastName ? ["Тегі"] : []),
-    ...(!mapping.fullName && !mapping.firstName ? ["Аты"] : []),
-    ...(!mapping.birthDate ? ["Туған күні"] : []),
-    ...(!mapping.region ? ["Аймақ"] : []),
-    ...(!mapping.phone ? ["Телефон"] : []),
-  ];
+  const missing = Object.keys(mapping).some((k) =>
+    [
+      "lastName",
+      "firstName",
+      "fullName",
+      "phone",
+      "iin",
+      "documentNumber",
+    ].includes(k),
+  )
+    ? []
+    : ["Аты-жөні, телефон немесе құжат нөмірі бар баған"];
+  const fileKey = createHash("sha256").update(buffer).digest("hex");
   const rows: ReadyRow[] = [];
   const examples: any[] = [];
   const issues: { row: number; message: string }[] = [];
@@ -294,6 +322,33 @@ export async function previewImport(
             middleName: data.middleName || rest.join(" "),
           };
         }
+        if (data.fullNameLatin) {
+          const [last, ...first] = data.fullNameLatin.trim().split(/\s+/);
+          data.lastNameLatin ||= last;
+          data.firstNameLatin ||= first.join(" ");
+        }
+        if (data.validityPeriod) {
+          const dates = data.validityPeriod.match(
+            /\d{1,2}[./]\d{1,2}[./]\d{4}/g,
+          );
+          const iso = (v: string) => {
+            const [d, m, y] = v.split(/[./]/);
+            return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+          };
+          if (dates?.length === 2) {
+            data.issueDate ||= iso(dates[0]);
+            data.expiryDate ||= iso(dates[1]);
+          } else if (dates?.length === 1) data.expiryDate ||= iso(dates[0]);
+          else {
+            data.notes = [
+              data.notes,
+              `Куәліктің мерзімі (Excel): ${data.validityPeriod}`,
+            ]
+              .filter(Boolean)
+              .join("\n");
+          }
+        }
+        data.region ||= "";
         const region = REGIONS.find(
           (r) =>
             normal(r) === normal(data.region) ||
@@ -304,6 +359,45 @@ export async function previewImport(
               normal(data.region.replace(/ район$/i, "")),
         );
         if (region) data.region = region;
+        const notes = [data.notes || ""].filter(Boolean);
+        if (
+          data.phone &&
+          !participantSchema.shape.phone.safeParse(data.phone).success
+        ) {
+          const number = data.phone.match(/^\+?[\d ()-]{10,20}/)?.[0].trim();
+          if (
+            number &&
+            participantSchema.shape.phone.safeParse(number).success
+          ) {
+            notes.push(`Телефон (Excel): ${data.phone}`);
+            data.phone = number;
+          }
+        }
+        // Preserve annotations and invalid source values instead of inventing data.
+        if (data.documentNumber && !/\d/.test(data.documentNumber)) {
+          notes.push(`Куәлік нөмірі (Excel): ${data.documentNumber}`);
+          data.documentNumber = "";
+        }
+        for (const [key, schema] of Object.entries(participantSchema.shape)) {
+          if (key === "notes" || !data[key]) continue;
+          if (!schema.safeParse(data[key]).success) {
+            notes.push(
+              `${IMPORT_COLUMNS[key as Key]?.[0] || key} (Excel): ${data[key]}`,
+            );
+            data[key] = "";
+          }
+        }
+        if (
+          data.issueDate &&
+          data.expiryDate &&
+          data.issueDate > data.expiryDate
+        ) {
+          notes.push(
+            `Куәліктің мерзімі (Excel): ${data.issueDate} — ${data.expiryDate}`,
+          );
+          data.issueDate = data.expiryDate = "";
+        }
+        data.notes = notes.join("\n");
         const participant = participantSchema.parse(data);
         let payment: ReadyRow["payment"];
         if (mapping.amount && data.amount && parseMoney(data.amount) > 0) {
@@ -315,11 +409,17 @@ export async function previewImport(
             notes: "Excel арқылы енгізілді",
           });
         }
-        const duplicate = keys(participant).some((k) => seen.has(k));
+        const importKey =
+          "row:" +
+          createHash("sha256")
+            .update(`${fileKey}|${sheet.id}|${n}`)
+            .digest("hex");
+        const rowKeys = keys({ ...participant, importKey });
+        const duplicate = rowKeys.some((k) => seen.has(k));
         if (duplicate) duplicates++;
         else {
-          rows.push({ row: n, participant, payment });
-          keys(participant).forEach((k) => seen.add(k));
+          rows.push({ row: n, importKey, participant, payment });
+          rowKeys.forEach((k) => seen.add(k));
         }
         if (examples.length < 50)
           examples.push({
@@ -337,6 +437,8 @@ export async function previewImport(
             documentNumber: participant.documentNumber,
             amount: payment?.amount || 0,
             status: duplicate ? "duplicate" : "ready",
+            missingFields: missingParticipantFields(participant),
+            notes: participant.notes,
           });
       } catch (error) {
         const message =
@@ -380,6 +482,9 @@ export async function previewImport(
     missing,
     total,
     ready: rows.length,
+    incomplete: rows.filter(
+      (r) => missingParticipantFields(r.participant).length > 0,
+    ).length,
     duplicates,
     errorCount: issues.length,
     issues: issues.slice(0, 100),
@@ -415,16 +520,18 @@ export async function commitImport(id: string, adminId: string) {
       let skipped = 0;
       for (const entry of draft.rows as ReadyRow[]) {
         const person = participantSchema.parse(entry.participant);
-        if (keys(person).some((k) => seen.has(k))) {
+        const importKey = entry.importKey || personKey(person);
+        const rowKeys = keys({ ...person, importKey });
+        if (rowKeys.some((k) => seen.has(k))) {
           skipped++;
           continue;
         }
-        keys(person).forEach((k) => seen.add(k));
+        rowKeys.forEach((k) => seen.add(k));
         const _id = new mongoose.Types.ObjectId();
         inserted.push({
           _id,
           ...normalizeParticipant(person),
-          importKey: personKey(person),
+          importKey,
         });
         if (entry.payment)
           payments.push({
@@ -476,7 +583,7 @@ export async function importTemplate() {
   help.getColumn(1).width = 110;
   [
     "Бірінші параққа өз қатысушыларыңызды енгізіңіз. Дайын мысал деректер жоқ.",
-    "Міндетті: Тегі, Аты, Туған күні, Аймақ, Телефон.",
+    "Белгісіз мәліметтерді бос қалдырыңыз: қатысушы «Толық емес» белгісімен қосылады. Кемінде аты-жөні, телефон немесе құжат нөмірі қажет.",
     "Күн пішімі: КК.АА.ЖЖЖЖ немесе Excel күні.",
     "Куәлік мәліметтері белгісіз болса, бос қалдырыңыз. ЖСН мен құжат нөмірі — мәтін.",
     "Төлем енгізсеңіз: Төленді, ₸; Жыл; Төлем күні бағандарын толтырыңыз.",

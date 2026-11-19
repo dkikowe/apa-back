@@ -640,6 +640,146 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         .status,
     ).toBe(400);
   });
+  it("imports the Aktau-style layout with missing fields and preserves source annotations", async () => {
+    const { Admin, Participant } = await import("../server/models.js");
+    const { previewImport, commitImport } =
+      await import("../server/services/imports.js");
+    const { missingParticipantFields } = await import("../shared/domain.js");
+    const { statistics } = await import("../server/services/reports.js");
+    const { filtersSchema } = await import("../server/services/members.js");
+    const admin = String((await Admin.findOne())!._id);
+    const book = new ExcelJS.Workbook();
+    const sheet = book.addWorksheet("Тізім");
+    sheet.addRow(["ҚАТЫСУШЫЛАР ТІЗІМІ"]);
+    sheet.addRow([
+      "№",
+      "АӘТ",
+      "Жеке куәлік номері",
+      "Жеке куәліктің жарамдылық мерзімі",
+      "Ағылшын аты жөні",
+      "Телефон",
+      "Мекен жай",
+    ]);
+    sheet.addRow([
+      1,
+      "ТолықЕмесСынақ Айша",
+      "ЖЕКЕ КУӘЛІК БЕРУДЕН БАС ТАРТТЫ",
+      "",
+      "",
+      "+7 000 000 0301 ватцапта жоқ",
+      "Ақтау?",
+    ]);
+    sheet.addRow([2, "АттасСынақ Айша"]);
+    sheet.addRow([3, "АттасСынақ Айша"]);
+    sheet.addRow([
+      4,
+      "МерзімСынақ Апа",
+      "TEST0302",
+      "01.02.2020-01.02.2030",
+      "MERZIMSYNAQ APA",
+      "",
+      "Ақтау",
+    ]);
+    // Formatting and blank rows must not become unnamed participants.
+    sheet.getRow(30).height = 25;
+    const bytes = Buffer.from(await book.xlsx.writeBuffer());
+    const preview = await previewImport(bytes, {}, admin);
+    expect(preview).toMatchObject({
+      headerRow: 2,
+      total: 4,
+      ready: 4,
+      incomplete: 4,
+      errorCount: 0,
+      missing: [],
+    });
+    expect(preview.examples[0]).toMatchObject({
+      birthDate: "",
+      region: "",
+      phone: "+7 000 000 0301",
+      documentNumber: "",
+    });
+    expect(preview.examples[0].notes).toContain("Ақтау?");
+    expect(preview.examples[0].notes).toContain("БАС ТАРТТЫ");
+    expect(await commitImport(preview.draftId!, admin)).toMatchObject({
+      created: 4,
+      payments: 0,
+    });
+    expect(await Participant.countDocuments({ lastName: "АттасСынақ" })).toBe(
+      2,
+    );
+    const person = (await Participant.findOne({
+      lastName: "ТолықЕмесСынақ",
+    }).lean())!;
+    const result = await agent.get(`/api/participants/${person._id}`);
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      age: null,
+      ageGroup: null,
+      birthDate: "",
+      region: "",
+      status: "unpaid",
+    });
+    const young = await agent.get("/api/participants?q=ТолықЕмесСынақ&age=0");
+    expect(young.body.total).toBe(0);
+    const stats = await statistics(
+      filtersSchema.parse({ q: "ТолықЕмесСынақ" }),
+    );
+    expect(stats.ages).toEqual([{ _id: null, count: 1 }]);
+    const period = (await Participant.findOne({
+      lastName: "МерзімСынақ",
+    }).lean())!;
+    expect(period).toMatchObject({
+      issueDate: "2020-02-01",
+      expiryDate: "2030-02-01",
+      lastNameLatin: "MERZIMSYNAQ",
+      firstNameLatin: "APA",
+      birthDate: "",
+    });
+    const changed = {
+      ...result.body,
+      birthDate: "1970-01-01",
+      region: "Ақтау",
+      iin: "000000000301",
+      documentNumber: "TEST0301",
+      issuedBy: "Сынақ органы",
+      issueDate: "2020-01-01",
+      expiryDate: "2030-01-01",
+    };
+    expect(
+      (await patch(`/api/participants/${person._id}`, changed)).status,
+    ).toBe(200);
+    const updated = await agent.get(`/api/participants/${person._id}`);
+    expect(missingParticipantFields(updated.body)).toEqual([]);
+    expect(updated.body.notes).toContain("Ақтау?");
+    // Editing a participant must retain the source key so repeat import is safe.
+    const repeated = await previewImport(bytes, {}, admin);
+    expect(repeated).toMatchObject({ ready: 0, duplicates: 4, errorCount: 0 });
+  });
+  it("allows a partial participant through the regular API but rejects an entirely empty card", async () => {
+    const added = await post("/api/participants", {
+      firstName: "ЖартылайСынақ",
+    });
+    expect(added.status).toBe(201);
+    const found = await agent.get(`/api/participants/${added.body._id}`);
+    expect(found.body).toMatchObject({
+      firstName: "ЖартылайСынақ",
+      lastName: "",
+      birthDate: "",
+      phone: "",
+      region: "",
+      age: null,
+      ageGroup: null,
+    });
+    expect(
+      (
+        await patch(`/api/participants/${added.body._id}`, {
+          ...found.body,
+          firstName: "ӨзгертілгенСынақ",
+        })
+      ).status,
+    ).toBe(200);
+    expect((await post("/api/participants", {})).status).toBe(400);
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

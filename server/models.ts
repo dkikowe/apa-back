@@ -12,6 +12,7 @@ const participant = new Schema(
     lastName: String,
     firstName: String,
     middleName: String,
+    notes: String,
     lastNameLatin: String,
     firstNameLatin: String,
     birthDate: String,

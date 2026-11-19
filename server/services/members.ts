@@ -65,7 +65,16 @@ export function memberPipeline(
             {
               $subtract: [
                 Number(today().slice(0, 4)),
-                { $toInt: { $substrBytes: ["$birthDate", 0, 4] } },
+                {
+                  $convert: {
+                    input: {
+                      $substrBytes: [{ $ifNull: ["$birthDate", ""] }, 0, 4],
+                    },
+                    to: "int",
+                    onError: null,
+                    onNull: null,
+                  },
+                },
               ],
             },
             {
@@ -89,6 +98,7 @@ export function memberPipeline(
         ageGroup: {
           $switch: {
             branches: [
+              { case: { $eq: ["$age", null] }, then: null },
               { case: { $lt: ["$age", 25] }, then: 0 },
               { case: { $lt: ["$age", 45] }, then: 1 },
               { case: { $lt: ["$age", 65] }, then: 2 },
