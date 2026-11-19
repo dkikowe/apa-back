@@ -18,6 +18,12 @@ const participant = new Schema(
     region: String,
     phone: String,
     phoneNormalized: String,
+    iin: String,
+    documentNumber: String,
+    issuedBy: String,
+    issueDate: String,
+    expiryDate: String,
+    importKey: String,
     searchTokens: [String],
     identityDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },
     archivedAt: { type: Date, default: null },
@@ -26,6 +32,7 @@ const participant = new Schema(
 );
 participant.index({ archivedAt: 1, region: 1, birthDate: 1 });
 participant.index({ searchTokens: 1 });
+participant.index({ importKey: 1 }, { unique: true, sparse: true });
 participant.index({ phoneNormalized: 1 });
 participant.index({ lastName: 1, firstName: 1 });
 const payment = new Schema(
@@ -112,11 +119,23 @@ export const Payment = mongoose.model("MembershipPayment", payment);
 export const Finance = mongoose.model("FinancialTransaction", finance);
 export const Document = mongoose.model("Document", document);
 export const Audit = mongoose.model("AuditLog", audit);
+const importDraft = new Schema(
+  {
+    adminId: { type: Schema.Types.ObjectId, required: true },
+    rows: [Schema.Types.Mixed],
+    status: { type: String, default: "preview" },
+    result: Schema.Types.Mixed,
+    expiresAt: { type: Date, required: true },
+  },
+  options,
+);
+importDraft.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+export const ImportDraft = mongoose.model("ImportDraft", importDraft);
 export async function connect() {
   await mongoose.connect((await import("./config.js")).config.mongo);
   await Promise.all(
-    [Admin, Participant, Payment, Finance, Document, Audit].map((m) =>
-      m.init(),
+    [Admin, Participant, Payment, Finance, Document, Audit, ImportDraft].map(
+      (m) => m.init(),
     ),
   );
 }

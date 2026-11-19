@@ -22,6 +22,31 @@ const labels = {
   firstName: ["АТЫ", "ИМЯ", "GIVEN NAMES", "GIVEN NAME", "FIRST NAME", "NAME"],
   middleName: ["ӘКЕСІНІҢ АТЫ", "ОТЧЕСТВО", "PATRONYMIC"],
   birthDate: ["ТУҒАН КҮНІ", "ДАТА РОЖДЕНИЯ", "DATE OF BIRTH"],
+  iin: ["ЖСН", "ИИН", "IIN"],
+  documentNumber: [
+    "КУӘЛІК НӨМІРІ",
+    "ҚҰЖАТ НӨМІРІ",
+    "НОМЕР УДОСТОВЕРЕНИЯ",
+    "НОМЕР ДОКУМЕНТА",
+    "DOCUMENT NUMBER",
+    "DOCUMENT NO",
+  ],
+  issuedBy: [
+    "БЕРГЕН ОРГАН",
+    "БЕРГЕН ОРГАНЫ",
+    "ОРГАН ВЫДАЧИ",
+    "КЕМ ВЫДАН",
+    "ISSUED BY",
+    "AUTHORITY",
+  ],
+  issueDate: ["БЕРІЛГЕН КҮНІ", "ДАТА ВЫДАЧИ", "DATE OF ISSUE"],
+  expiryDate: [
+    "ҚОЛДАНЫЛУ МЕРЗІМІ",
+    "ЖАРАМДЫЛЫҚ МЕРЗІМІ",
+    "ДЕЙСТВИТЕЛЕН ДО",
+    "СРОК ДЕЙСТВИЯ",
+    "DATE OF EXPIRY",
+  ],
   amount: [
     "ТӨЛЕМ СОМАСЫ",
     "АУДАРЫМ СОМАСЫ",
@@ -73,6 +98,11 @@ export function extractIdentityLayout(
     "firstName",
     "middleName",
     "birthDate",
+    "iin",
+    "documentNumber",
+    "issuedBy",
+    "issueDate",
+    "expiryDate",
   ] as const) {
     const found: string[] = [];
     for (const anchor of anchors) {
@@ -107,9 +137,15 @@ export function extractIdentityLayout(
         continue;
       const value = candidates[0].text.trim();
       if (
-        key === "birthDate"
+        key.endsWith("Date")
           ? Boolean(dateValue(value))
-          : /^[\p{Script=Cyrillic}A-Za-z\s’'-]{2,100}$/u.test(value)
+          : key === "iin"
+            ? /^\d{12}$/.test(value)
+            : key === "documentNumber"
+              ? /^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(value)
+              : key === "issuedBy"
+                ? value.length >= 3 && value.length <= 200
+                : /^[\p{Script=Cyrillic}A-Za-z\s’'-]{2,100}$/u.test(value)
       )
         found.push(value);
     }
@@ -173,6 +209,40 @@ export function receiptAmount(raw: string) {
     return undefined;
   }
 }
+function identityDetails(text: string) {
+  const result: Record<string, string> = {};
+  if (!/ЖЕКЕ\s+КУ[ӘА]ЛІК|УДОСТОВЕРЕНИЕ\s+ЛИЧНОСТИ/iu.test(text)) return result;
+  const lines = text.split(/\r?\n/).map((v) => v.trim());
+  for (const [key, length] of [
+    ["iin", 12],
+    ["documentNumber", 9],
+  ] as const) {
+    const values = [
+      ...new Set(
+        lines.filter((line) => new RegExp(`^\\d{${length}}$`).test(line)),
+      ),
+    ];
+    if (values.length === 1) result[key] = values[0];
+  }
+  if (/БЕРІЛГЕН\s+КҮНІ|ДАТА\s+ВЫДАЧИ/iu.test(text)) {
+    const ranges = [
+      ...text.matchAll(
+        /(\d{2}[./]\d{2}[./]\d{4})\s*[-–—]\s*(\d{2}[./]\d{2}[./]\d{4})/g,
+      ),
+    ];
+    const unique = [...new Set(ranges.map((r) => r[1] + "|" + r[2]))];
+    if (unique.length === 1) {
+      const [a, b] = unique[0].split("|");
+      const start = dateValue(a),
+        end = dateValue(b);
+      if (start && end && start <= end) {
+        result.issueDate = start;
+        result.expiryDate = end;
+      }
+    }
+  }
+  return result;
+}
 export function extractFields(text: string, kind: string) {
   const lines = text
     .normalize("NFC")
@@ -194,7 +264,7 @@ export function extractFields(text: string, kind: string) {
     return undefined;
   }
   if (kind === "identity") {
-    Object.assign(fields, machineReadableNames(text));
+    Object.assign(fields, machineReadableNames(text), identityDetails(text));
     for (const key of ["lastName", "firstName", "middleName"] as const) {
       const value = labeled(labels[key]);
       if (!value) continue;
@@ -213,6 +283,26 @@ export function extractFields(text: string, kind: string) {
     ] as const) {
       const value = labeled([...aliases]);
       if (value && /^[A-Za-z\s’'-]{2,100}$/.test(value)) fields[key] = value;
+    }
+    for (const key of [
+      "iin",
+      "documentNumber",
+      "issuedBy",
+      "issueDate",
+      "expiryDate",
+    ] as const) {
+      const value = labeled(labels[key]);
+      if (!value) continue;
+      if (key.endsWith("Date")) {
+        const date = dateValue(value);
+        if (date) fields[key] = date;
+      } else if (key === "iin") {
+        const number = value.replace(/\s/g, "");
+        if (/^\d{12}$/.test(number)) fields[key] = number;
+      } else if (key === "documentNumber") {
+        const number = value.replace(/^№\s*/, "");
+        if (/^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(number)) fields[key] = number;
+      } else if (value.length >= 3 && value.length <= 200) fields[key] = value;
     }
     const birth = labeled(labels.birthDate);
     if (birth) {
@@ -342,6 +432,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               ) || [];
             Object.assign(
               nativeFields,
+              identityDetails(layer + "\n" + scanned.text),
               extractIdentityLayout(values, anchors),
               machineReadableNames(layer),
             );

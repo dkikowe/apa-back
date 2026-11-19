@@ -384,6 +384,262 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         .status,
     ).toBe(201);
   });
+
+  it("saves optional identity details and preserves document leading zeros", async () => {
+    const identity = {
+      iin: "000123456789",
+      documentNumber: "001234567",
+      issuedBy: "Сынақ органы",
+      issueDate: "2020-01-02",
+      expiryDate: "2030-01-02",
+    };
+    const created = await post("/api/participants", {
+      ...person,
+      lastName: "ҚұжатСынақ",
+      ...identity,
+    });
+    expect(created.status).toBe(201);
+    expect(
+      (await agent.get(`/api/participants/${created.body._id}`)).body,
+    ).toMatchObject(identity);
+    const changed = await patch(`/api/participants/${created.body._id}`, {
+      ...person,
+      lastName: "ҚұжатСынақ",
+      ...identity,
+      issuedBy: "",
+    });
+    expect(changed.status).toBe(200);
+    expect(changed.body.documentNumber).toBe("001234567");
+    expect(changed.body.issuedBy).toBe("");
+    expect(
+      (
+        await post("/api/participants", {
+          ...person,
+          issueDate: "2030-01-01",
+          expiryDate: "2020-01-01",
+        })
+      ).status,
+    ).toBe(400);
+  });
+  async function workbookBytes(
+    rows: any[][],
+    headers: string[],
+    name = "Лист 1",
+  ) {
+    const book = new ExcelJS.Workbook();
+    const sheet = book.addWorksheet(name);
+    sheet.addRow(headers);
+    for (const row of rows) sheet.addRow(row);
+    return Buffer.from(await book.xlsx.writeBuffer());
+  }
+  const excelHeaders = [
+    "Фамилия",
+    "Имя",
+    "Дата рождения",
+    "Регион",
+    "Телефон",
+    "Номер удостоверения",
+    "ИИН",
+    "Кем выдан",
+    "Дата выдачи",
+    "Срок действия",
+    "Оплачено",
+    "Год взноса",
+    "Дата платежа",
+  ];
+  const excelRow = [
+    "ExcelСынақ",
+    "Айша",
+    new Date("1970-05-04T00:00:00Z"),
+    "Ақтау",
+    "+7 000 000 0101",
+    12345678,
+    1234567890,
+    "Сынақ органы",
+    "01.02.2020",
+    "01.02.2030",
+    1090,
+    2026,
+    "18.11.2026",
+  ];
+  const previewFile = (buffer: Buffer, options: unknown = {}) =>
+    agent
+      .post("/api/participants/import/preview")
+      .set("x-csrf-token", csrf)
+      .field("options", JSON.stringify(options))
+      .attach("file", buffer, "members.xlsx");
+  it("previews real XLSX without writing, commits people/payments atomically, and makes repeat clicks idempotent", async () => {
+    const { Participant, Payment } = await import("../server/models.js");
+    const before = await Participant.countDocuments();
+    const preview = await previewFile(
+      await workbookBytes([excelRow], excelHeaders),
+    );
+    expect(preview.status).toBe(200);
+    expect(preview.body).toMatchObject({ ready: 1, errorCount: 0 });
+    expect(await Participant.countDocuments()).toBe(before);
+    const url = `/api/participants/import/${preview.body.draftId}/commit`;
+    const results = await Promise.all([post(url, {}), post(url, {})]);
+    expect(results.map((r) => r.status)).toEqual([200, 200]);
+    expect(results[0].body).toMatchObject({ created: 1, payments: 1 });
+    const person = await Participant.findOne({ lastName: "ExcelСынақ" }).lean();
+    expect(person).toMatchObject({
+      birthDate: "1970-05-04",
+      documentNumber: "012345678",
+      iin: "001234567890",
+      issuedBy: "Сынақ органы",
+      issueDate: "2020-02-01",
+    });
+    expect(await Participant.countDocuments()).toBe(before + 1);
+    expect(await Payment.countDocuments({ participantId: person!._id })).toBe(
+      1,
+    );
+    expect(
+      (await agent.get(`/api/participants/${person!._id}?year=2026`)).body
+        .remaining,
+    ).toBe(539700);
+  });
+  it("skips existing and within-file duplicate identities without replacing their data", async () => {
+    const row = [...excelRow];
+    row[0] = "ЖаңаExcelСынақ";
+    row[5] = "998765432";
+    row[6] = "999123456789";
+    const preview = await previewFile(
+      await workbookBytes([excelRow, row, row], excelHeaders),
+    );
+    expect(preview.body).toMatchObject({
+      total: 3,
+      ready: 1,
+      duplicates: 2,
+      errorCount: 0,
+    });
+    expect(
+      (
+        await post(
+          `/api/participants/import/${preview.body.draftId}/commit`,
+          {},
+        )
+      ).body.created,
+    ).toBe(1);
+  });
+  it("reports row errors and requires an explicit date for imported payments", async () => {
+    const bad = [...excelRow];
+    bad[4] = "bad-phone";
+    bad[12] = "";
+    const preview = await previewFile(await workbookBytes([bad], excelHeaders));
+    expect(preview.body).toMatchObject({ errorCount: 1 });
+    expect(preview.body.draftId).toBeUndefined();
+    expect(preview.body.issues[0].row).toBe(2);
+    const noDate = [...excelRow];
+    noDate[12] = "";
+    const dates = await previewFile(
+      await workbookBytes([noDate], excelHeaders),
+    );
+    expect(dates.body.errorCount).toBe(1);
+    expect(dates.body.draftId).toBeUndefined();
+  });
+  it("supports manual column mapping and rejects spreadsheet formulas instead of trusting cached values", async () => {
+    const headers = ["A", "B", "C", "D", "E"];
+    const row = [
+      "БағанСынақ",
+      "Айгүл",
+      "15.04.1975",
+      "Ақтау",
+      "+7 000 000 0202",
+    ];
+    const bytes = await workbookBytes([row], headers);
+    const automatic = await previewFile(bytes);
+    expect(automatic.body.missing.length).toBeGreaterThan(0);
+    const mapped = await previewFile(bytes, {
+      mapping: { lastName: 1, firstName: 2, birthDate: 3, region: 4, phone: 5 },
+    });
+    expect(mapped.body).toMatchObject({ ready: 1, errorCount: 0 });
+    const formula = [...row] as any[];
+    formula[0] = { formula: '"Injected"', result: "Injected" };
+    const unsafe = await previewFile(await workbookBytes([formula], headers), {
+      mapping: { lastName: 1, firstName: 2, birthDate: 3, region: 4, phone: 5 },
+    });
+    expect(unsafe.body.errorCount).toBe(1);
+    expect(unsafe.body.draftId).toBeUndefined();
+  });
+  it("guards Excel endpoints and returns a usable empty template", async () => {
+    expect(
+      (await request(app).get("/api/participants/import/template")).status,
+    ).toBe(401);
+    const bytes = await workbookBytes([excelRow], excelHeaders);
+    expect(
+      (
+        await agent
+          .post("/api/participants/import/preview")
+          .attach("file", bytes, "test.xlsx")
+      ).status,
+    ).toBe(403);
+    expect((await previewFile(Buffer.from("not a spreadsheet"))).status).toBe(
+      400,
+    );
+    const template = await agent
+      .get("/api/participants/import/template")
+      .buffer(true)
+      .parse((res, cb) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => cb(null, Buffer.concat(chunks)));
+      });
+    const book = new ExcelJS.Workbook();
+    await book.xlsx.load(template.body);
+    expect(book.worksheets[0].rowCount).toBe(1);
+    expect(book.worksheets[0].getRow(1).values).toContain("Куәлік нөмірі");
+  });
+
+  it("detects a title row and a second worksheet, and accepts an explicit shared payment date", async () => {
+    const book = new ExcelJS.Workbook();
+    book.addWorksheet("Нұсқаулық").addRow(["Fill the second worksheet"]);
+    const sheet = book.addWorksheet("Қатысушылар");
+    sheet.addRow(["Сынақ тізім"]);
+    sheet.addRow(excelHeaders);
+    const row = [...excelRow];
+    row[0] = "ПарақСынақ";
+    row[5] = "123123123";
+    row[6] = "123123123123";
+    row[12] = "";
+    sheet.addRow(row);
+    const preview = await previewFile(
+      Buffer.from(await book.xlsx.writeBuffer()),
+      { sheet: sheet.id, paymentDate: "2026-11-20" },
+    );
+    expect(preview.body).toMatchObject({
+      sheet: sheet.id,
+      headerRow: 2,
+      ready: 1,
+      errorCount: 0,
+    });
+  });
+  it("rejects another admin's preview and expired drafts", async () => {
+    const { ImportDraft } = await import("../server/models.js");
+    const otherDraft = await ImportDraft.create({
+      adminId: new mongoose.Types.ObjectId(),
+      rows: [],
+      expiresAt: new Date(Date.now() + 60000),
+    });
+    expect(
+      (await post(`/api/participants/import/${otherDraft._id}/commit`, {}))
+        .status,
+    ).toBe(400);
+    const draft = await previewFile(
+      await workbookBytes(
+        [["МерзімСынақ", "Айша", "1975-01-01", "Ақтау", "+7 000 000 0303"]],
+        excelHeaders.slice(0, 5),
+      ),
+    );
+    expect(draft.body.ready).toBe(1);
+    await ImportDraft.updateOne(
+      { _id: draft.body.draftId },
+      { $set: { expiresAt: new Date(0) } },
+    );
+    expect(
+      (await post(`/api/participants/import/${draft.body.draftId}/commit`, {}))
+        .status,
+    ).toBe(400);
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

@@ -33,6 +33,13 @@ import {
 } from "./services/members.js";
 import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
+import {
+  previewImport,
+  commitImport,
+  importTemplate,
+  ImportError,
+  personKey,
+} from "./services/imports.js";
 declare module "express-session" {
   interface SessionData {
     adminId: string;
@@ -194,6 +201,47 @@ export function createApp() {
     });
     res.json({ ok: true });
   });
+  app.get("/api/participants/import/template", async (_req, res) => {
+    res.set({
+      "Content-Type":
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": "attachment; filename=participants-template.xlsx",
+    });
+    res.send(Buffer.from(await importTemplate()));
+  });
+  app.post(
+    "/api/participants/import/preview",
+    rateLimit({
+      windowMs: 60_000,
+      limit: 15,
+      message: { message: "Бір минуттан кейін қайталаңыз." },
+    }),
+    multer({
+      storage: multer.memoryStorage(),
+      limits: {
+        fileSize: 10 * 1024 * 1024,
+        files: 1,
+        fields: 1,
+        fieldSize: 16384,
+      },
+    }).single("file"),
+    async (req, res) => {
+      if (!req.file || !/\.xlsx$/i.test(req.file.originalname))
+        throw new ImportError("Excel .xlsx файлын таңдаңыз.");
+      let options: unknown = {};
+      try {
+        options = JSON.parse(req.body.options || "{}");
+      } catch {
+        throw new ImportError("Импорт бағандарын қайта таңдаңыз.");
+      }
+      res.json(
+        await previewImport(req.file.buffer, options, req.session.adminId!),
+      );
+    },
+  );
+  app.post("/api/participants/import/:id/commit", async (req, res) =>
+    res.json(await commitImport(req.params.id, req.session.adminId!)),
+  );
   app.get("/api/participants", async (req, res) =>
     res.json(await listMembers(filtersSchema.parse(req.query))),
   );
@@ -270,7 +318,12 @@ export function createApp() {
       }
       const after = await Participant.findByIdAndUpdate(
         id,
-        { $set: normalizeParticipant(data) },
+        {
+          $set: {
+            ...normalizeParticipant(data),
+            ...(before.importKey ? { importKey: personKey(data) } : {}),
+          },
+        },
         { new: true, session: s },
       );
       await audit(
@@ -679,16 +732,21 @@ export function createApp() {
         });
       if (error.code === 11000)
         return res.status(409).json({
-          message: "Бұл чек бұрын тіркелген. Қайталап қосуды растаңыз.",
+          message: error.keyPattern?.importKey
+            ? "Бұл қатысушы бұрын енгізілген. Файлды қайта тексеріңіз."
+            : "Бұл чек бұрын тіркелген. Қайталап қосуды растаңыз.",
         });
       if (error instanceof multer.MulterError)
-        return res
-          .status(400)
-          .json({ message: "Файл 15 МБ-тан аспауы керек." });
-      if (error instanceof HttpError)
-        return res
-          .status(error.status)
-          .json({ message: error.message, ...error.details });
+        return res.status(400).json({
+          message: _req.path.includes("/import/")
+            ? "Excel файлы 10 МБ-тан аспауы керек."
+            : "Файл 15 МБ-тан аспауы керек.",
+        });
+      if (error instanceof HttpError || error instanceof ImportError)
+        return res.status(error.status).json({
+          message: error.message,
+          ...(error instanceof HttpError ? error.details : {}),
+        });
       console.error("Request failed", {
         type: error.name,
         code: error.code,

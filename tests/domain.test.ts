@@ -185,3 +185,39 @@ describe("Hybrid PDF identity layout", () => {
     ).toEqual({});
   });
 });
+
+describe("Optional identity document details", () => {
+  it("reads separate document numbers, issuing authority and validity dates", () => {
+    expect(
+      extractFields(
+        "ЖСН / ИИН: 000123456789\nКУӘЛІК НӨМІРІ: 001234567\nБЕРГЕН ОРГАН / ОРГАН ВЫДАЧИ\nСЫНАҚ ОРГАНЫ\nБЕРІЛГЕН КҮНІ: 01.02.2020\nСРОК ДЕЙСТВИЯ: 01.02.2030",
+        "identity",
+      ),
+    ).toMatchObject({
+      iin: "000123456789",
+      documentNumber: "001234567",
+      issuedBy: "СЫНАҚ ОРГАНЫ",
+      issueDate: "2020-02-01",
+      expiryDate: "2030-02-01",
+    });
+  });
+  it("handles unlabeled numbers and a date range only within an identity document", () => {
+    const data =
+      "000123456789\n001234567\nБЕРІЛГЕН КҮНІ / ДАТА ВЫДАЧИ\n01.02.2020 - 01.02.2030";
+    expect(extractFields("ЖЕКЕ КУӘЛІК\n" + data, "identity")).toMatchObject({
+      iin: "000123456789",
+      documentNumber: "001234567",
+      issueDate: "2020-02-01",
+      expiryDate: "2030-02-01",
+    });
+    expect(extractFields("000123456789\n001234567", "identity")).toEqual({});
+  });
+  it("does not fabricate an authority or take another label for a missing authority", () => {
+    const fields = extractFields(
+      "КЕМ ВЫДАН\nДАТА ВЫДАЧИ: 01.02.2020",
+      "identity",
+    );
+    expect(fields.issuedBy).toBeUndefined();
+    expect(fields.issueDate).toBe("2020-02-01");
+  });
+});
