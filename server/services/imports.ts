@@ -16,6 +16,7 @@ import { normalizeParticipant } from "./members.js";
 
 export const IMPORT_COLUMNS = {
   notes: ["Ескертпе", "Примечание", "notes"],
+  village: ["Ауыл", "Село", "Поселок", "Населенный пункт", "village"],
   lastName: ["Тегі", "Фамилия", "surname", "lastName"],
   firstName: ["Аты", "Имя", "name", "firstName"],
   middleName: ["Әкесінің аты", "Отчество", "middleName"],
@@ -46,8 +47,14 @@ export const IMPORT_COLUMNS = {
     "documentNumber",
   ],
   issuedBy: ["Кім берді", "Кем выдан", "Орган выдачи", "issuedBy"],
-  issueDate: ["Берілген күні", "Дата выдачи", "issueDate"],
+  issueDate: [
+    "Жарамдылық мерзімінің басталуы",
+    "Берілген күні",
+    "Дата выдачи",
+    "issueDate",
+  ],
   expiryDate: [
+    "Жарамдылық мерзімінің аяқталуы",
     "Жарамдылық мерзімі",
     "Срок действия",
     "Действителен до",
@@ -58,6 +65,7 @@ export const IMPORT_COLUMNS = {
   amount: ["Төленді, ₸", "Төленді", "Оплачено", "Сумма взноса", "amount"],
   year: ["Жыл", "Жарна жылы", "Год взноса", "year"],
   paymentDate: ["Төлем күні", "Дата платежа", "paymentDate"],
+  paymentTime: ["Төлем уақыты", "Время платежа", "paymentTime"],
 } as const;
 type Key = keyof typeof IMPORT_COLUMNS;
 type Mapping = Partial<Record<Key, number>>;
@@ -182,6 +190,20 @@ function cellString(cell: ExcelJS.Cell, key: Key, date1904: boolean) {
     ("formula" in value || "sharedFormula" in value)
   )
     throw new Error("формуланы мәнге ауыстырыңыз");
+  if (key === "paymentTime") {
+    if (value instanceof Date) return value.toISOString().slice(11, 19);
+    if (typeof value === "number" && value >= 0 && value < 1) {
+      const seconds = Math.round(value * 86400) % 86400;
+      return [
+        Math.floor(seconds / 3600),
+        Math.floor(seconds / 60) % 60,
+        seconds % 60,
+      ]
+        .map((n) => String(n).padStart(2, "0"))
+        .join(":");
+    }
+    return cell.text.trim();
+  }
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   if (/^(?:[-–—]|жоқ|нет)$/i.test(cell.text.trim())) return "";
   if (key.endsWith("Date")) {
@@ -338,8 +360,11 @@ export async function previewImport(
           if (dates?.length === 2) {
             data.issueDate ||= iso(dates[0]);
             data.expiryDate ||= iso(dates[1]);
-          } else if (dates?.length === 1) data.expiryDate ||= iso(dates[0]);
-          else {
+          } else if (dates?.length === 1) {
+            if (/—\s*Көрсетілмеген$/u.test(data.validityPeriod))
+              data.issueDate ||= iso(dates[0]);
+            else data.expiryDate ||= iso(dates[0]);
+          } else {
             data.notes = [
               data.notes,
               `Куәліктің мерзімі (Excel): ${data.validityPeriod}`,
@@ -405,6 +430,7 @@ export async function previewImport(
             amount: parseMoney(data.amount),
             year: Number(data.year || options.year),
             paymentDate: data.paymentDate || options.paymentDate,
+            paymentTime: data.paymentTime || "",
             method: "Excel",
             notes: "Excel арқылы енгізілді",
           });

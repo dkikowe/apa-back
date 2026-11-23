@@ -49,3 +49,102 @@ describe("QR receipt layout", () => {
     });
   });
 });
+
+describe("bank transfer receipt variants", () => {
+  it("reads Halyk's wrapped receipt label and never takes the commission as amount", () => {
+    expect(
+      extractFields(
+        [
+          "Перевод по номеру телефона",
+          "Перевод выполнен успешно",
+          "5 000 ₸",
+          "Комиссия: 0 ₸",
+          "№",
+          "3503000001",
+          "квитанции",
+          "Дата 16.10.2026 15:08",
+          "Отправитель Сынақ А.",
+          "Откуда • 1111",
+          "Получатель Үлгі Б.",
+          "Куда +7 (000) 000-00-01",
+        ].join("\n"),
+        "receipt",
+      ),
+    ).toEqual({
+      amount: 500000,
+      paymentDate: "2026-10-16",
+      paymentTime: "15:08",
+      receiptNumber: "3503000001",
+      recipientName: "Үлгі Б.",
+    });
+  });
+  it("reads a screenshot transfer with a wrapped long number, date and time", () => {
+    expect(
+      extractFields(
+        [
+          "Перевод успешно совер...",
+          "175 000 т",
+          "Үлгі Б.",
+          "Тип перевода",
+          "Перевод...",
+          "№ квитанции",
+          "895900000000",
+          "000001",
+          "Дата и время",
+          "08.10.2026",
+          "по Астане",
+          "10:34",
+          "Комиссия",
+          "0 т",
+          "Отправитель",
+          "Сынақ А.",
+          "Откуда",
+          "Kaspi Gold",
+        ].join("\n"),
+        "receipt",
+      ),
+    ).toEqual({
+      amount: 17500000,
+      paymentDate: "2026-10-08",
+      paymentTime: "10:34",
+      receiptNumber: "895900000000000001",
+      recipientName: "Үлгі Б.",
+      method: "Kaspi Gold",
+    });
+  });
+  it("keeps the complete multiline organization name", () => {
+    expect(
+      extractFields(
+        'Оплата совершена\n6 500 ₸\nОО Сынақ ұйымы\nШеберлер "TEST"\n№ чека QR-TEST\nДата и время 15.09.2026 12:55:09',
+        "receipt",
+      ),
+    ).toMatchObject({
+      amount: 650000,
+      recipientName: 'ОО Сынақ ұйымы Шеберлер "TEST"',
+      receiptNumber: "QR-TEST",
+      paymentTime: "12:55:09",
+    });
+  });
+  it("does not invent payment time or take a time from a later field", () => {
+    expect(
+      extractFields(
+        "Дата 15.09.2026\nПолучатель Сынақ\nСообщение 13:22",
+        "receipt",
+      ).paymentTime,
+    ).toBeUndefined();
+    expect(
+      extractFields("Дата 15.09.2026 25:08", "receipt").paymentTime,
+    ).toBeUndefined();
+  });
+  it("reads both validity dates without overwriting the end with the start", () => {
+    for (const label of [
+      "ЖАРАМДЫЛЫҚ МЕРЗІМІ",
+      "ДАТА ВЫДАЧИ",
+      "СРОК ДЕЙСТВИЯ",
+    ]) {
+      expect(
+        extractFields(`${label}\n01.02.2020 — 01.02.2030`, "identity"),
+      ).toMatchObject({ issueDate: "2020-02-01", expiryDate: "2030-02-01" });
+    }
+  });
+});

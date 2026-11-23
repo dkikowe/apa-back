@@ -5,6 +5,7 @@ import {
   AGE_LABELS,
   STATUS_LABELS,
   missingParticipantFields,
+  validityPeriod,
 } from "../../shared/domain.js";
 export async function financialSummary(year: number) {
   const from = `${year}-01-01`,
@@ -127,12 +128,16 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Жасы", key: "age", width: 10 },
       { header: "Жас санаты", key: "ageLabel", width: 30 },
       { header: "Аймақ", key: "region", width: 25 },
+      { header: "Ауыл", key: "village", width: 25 },
       { header: "Телефон", key: "phone", width: 20 },
       { header: "ЖСН", key: "iin", width: 18 },
       { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
       { header: "Кім берді", key: "issuedBy", width: 40 },
-      { header: "Берілген күні", key: "issueDate", width: 18 },
-      { header: "Жарамдылық мерзімі", key: "expiryDate", width: 22 },
+      {
+        header: "Жеке куәліктің жарамдылық мерзімі",
+        key: "validityPeriod",
+        width: 35,
+      },
       { header: "Жыл", key: "year", width: 12 },
       { header: "Төленді, ₸", key: "totalPaid", width: 18 },
       { header: "Қалды, ₸", key: "remaining", width: 18 },
@@ -144,6 +149,7 @@ export async function makeReport(type: string, f: Filters) {
     for await (const row of Participant.aggregate(memberPipeline(f)).cursor()) {
       sheet.addRow({
         ...row,
+        validityPeriod: validityPeriod(row.issueDate, row.expiryDate),
         completeness: missingParticipantFields(row).length
           ? "Толық емес"
           : "Толық",
@@ -163,6 +169,7 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Қатысушы", key: "name", width: 35 },
       { header: "Жарна жылы", key: "year", width: 16 },
       { header: "Төлем күні", key: "paymentDate", width: 18 },
+      { header: "Төлем уақыты", key: "paymentTime", width: 18 },
       { header: "Сома, ₸", key: "amount", width: 20 },
       { header: "Алушы", key: "recipientName", width: 30 },
       { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
@@ -176,6 +183,7 @@ export async function makeReport(type: string, f: Filters) {
       voidedAt: null,
       participantId: { $in: members.map((m) => m._id) },
     })
+      .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
       .populate("participantId")
       .lean()
       .cursor()) {
@@ -204,6 +212,7 @@ export async function makeReport(type: string, f: Filters) {
   } else {
     sheet.columns = [
       { header: "Күні", key: "date", width: 18 },
+      { header: "Төлем уақыты", key: "paymentTime", width: 18 },
       { header: "Санат", key: "category", width: 28 },
       { header: "Сома, ₸", key: "amount", width: 20 },
       { header: "Түсініктеме", key: "description", width: 50 },
@@ -213,11 +222,12 @@ export async function makeReport(type: string, f: Filters) {
         voidedAt: null,
         paymentDate: { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` },
       })
-        .sort({ paymentDate: -1 })
+        .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
         .lean()
         .cursor()) {
         sheet.addRow({
           date: row.paymentDate,
+          paymentTime: row.paymentTime || "",
           category: "Мүшелік жарна",
           amount: row.amount! / 100,
           description: row.recipientName || "",

@@ -292,7 +292,7 @@ export function createApp() {
     );
     if (!p) throw new HttpError(404, "Қатысушы табылмады.");
     const payments = await Payment.find({ participantId: p._id })
-      .sort({ paymentDate: -1, createdAt: -1 })
+      .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
       .lean();
     res.json({ ...p, payments });
   });

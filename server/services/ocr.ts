@@ -70,6 +70,8 @@ const labels = {
   ],
   recipientName: ["ПОЛУЧАТЕЛЬ", "АЛУШЫ", "RECIPIENT"],
   receiptNumber: [
+    "№ КВИТАНЦИИ",
+    "НОМЕР КВИТАНЦИИ",
     "НОМЕР ТРАНЗАКЦИИ",
     "НОМЕР ЧЕКА",
     "№ ЧЕКА",
@@ -227,7 +229,11 @@ function identityDetails(text: string) {
     ];
     if (values.length === 1) result[key] = values[0];
   }
-  if (/БЕРІЛГЕН\s+КҮНІ|ДАТА\s+ВЫДАЧИ/iu.test(text)) {
+  if (
+    /БЕРІЛГЕН\s+КҮНІ|ДАТА\s+ВЫДАЧИ|ЖАРАМДЫЛЫҚ\s+МЕРЗІМІ|СРОК\s+ДЕЙСТВИЯ/iu.test(
+      text,
+    )
+  ) {
     const ranges = [
       ...text.matchAll(
         /(\d{2}[./]\d{2}[./]\d{4})\s*[-–—]\s*(\d{2}[./]\d{2}[./]\d{4})/g,
@@ -249,6 +255,8 @@ function identityDetails(text: string) {
 export function extractFields(text: string, kind: string) {
   const lines = text
     .normalize("NFC")
+    // Halyk wraps the label around the value in narrow receipt columns.
+    .replace(/№\s*\n\s*(\d+)\s*\n\s*квитанции/giu, "№ квитанции $1")
     .split(/\r?\n/)
     .map((v) => v.trim())
     .filter(Boolean);
@@ -301,8 +309,19 @@ export function extractFields(text: string, kind: string) {
       const value = labeled(labels[key]);
       if (!value) continue;
       if (key.endsWith("Date")) {
-        const date = dateValue(value);
-        if (date) fields[key] = date;
+        const dates =
+          value.match(/\d{2}[./]\d{2}[./]\d{4}|\d{4}-\d{2}-\d{2}/g) || [];
+        if (dates.length === 2) {
+          const start = dateValue(dates[0]),
+            end = dateValue(dates[1]);
+          if (start && end && start <= end) {
+            fields.issueDate = start;
+            fields.expiryDate = end;
+          }
+        } else {
+          const date = dateValue(value);
+          if (date && !fields[key]) fields[key] = date;
+        }
       } else if (key === "iin") {
         const number = value.replace(/\s/g, "");
         if (/^\d{12}$/.test(number)) fields[key] = number;
@@ -326,7 +345,7 @@ export function extractFields(text: string, kind: string) {
     // Never use the merchant IIN, a card number, or an arbitrary unlabeled number.
     if (fields.amount === undefined) {
       const success = lines.findIndex((line) =>
-        /^(?:Оплата совершена|Плат[её]ж выполнен|Төлем жасалды|Төлем сәтті орындалды)$/iu.test(
+        /^(?:Оплата совершена|Плат[её]ж выполнен|Перевод выполнен успешно|Перевод успешно соверш[её]н|Перевод успешно совер\.{3}|Төлем жасалды|Төлем сәтті орындалды)$/iu.test(
           line,
         ),
       );
@@ -347,10 +366,84 @@ export function extractFields(text: string, kind: string) {
       const parsed = dateValue(date);
       if (parsed) fields.paymentDate = parsed;
     }
+    // Bind time to the date block, including Kaspi's wrapped timezone line.
+    for (let i = 0; i < lines.length; i++) {
+      if (!prefix(labels.paymentDate).test(lines[i])) continue;
+      const block = [lines[i]];
+      for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {
+        if (
+          anyLabel.test(lines[j]) ||
+          /^(?:Комиссия|Отправитель|Куда|Откуда|Сообщение)(?=\s|:|$)/iu.test(lines[j])
+        )
+          break;
+        block.push(lines[j]);
+      }
+      const value = block.join(" ");
+      const parsed = dateValue(value);
+      if (!parsed) continue;
+      fields.paymentDate = parsed;
+      const time = value.match(/\b([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b/);
+      if (time) fields.paymentTime = time[0];
+      break;
+    }
     for (const key of ["recipientName", "receiptNumber", "method"] as const) {
       const value = labeled(labels[key]);
       if (value)
         fields[key] = value.slice(0, key === "recipientName" ? 200 : 150);
+    }
+    // Long transfer numbers wrap onto a second line; retain them as strings.
+    for (let i = 0; i < lines.length; i++) {
+      if (!prefix(labels.receiptNumber).test(lines[i])) continue;
+      let number = lines[i]
+        .replace(prefix(labels.receiptNumber), "")
+        .replace(/^[\s:]+/, "");
+      let next = i + 1;
+      if (!number) number = lines[next++] || "";
+      if (/^\d+$/.test(number)) {
+        while (
+          next < lines.length &&
+          /^\d+$/.test(lines[next]) &&
+          number.length + lines[next].length <= 40
+        )
+          number += lines[next++];
+        fields.receiptNumber = number;
+      }
+    }
+    if (!fields.method) {
+      const source = labeled(["ОТКУДА"]);
+      if (source && /^(?:с\s+)?(?:Kaspi Gold|Halyk)(?:\s|$)/iu.test(source))
+        fields.method = source;
+    }
+    if (!fields.recipientName && fields.amount !== undefined) {
+      const amountIndex = lines.findIndex(
+        (line) =>
+          /^[\d\s.,'’]+\s*(?:₸|KZT|тенге|тг|Т|T)[.]?$/iu.test(line) &&
+          receiptAmount(line) === fields.amount,
+      );
+      const next = lines[amountIndex + 1] || "";
+      if (amountIndex >= 0 && /^(?:ОО|ИП|ТОО|ЖК|ЖШС)\s/iu.test(next)) {
+        const parts = [next];
+        for (
+          let i = amountIndex + 2;
+          i < Math.min(lines.length, amountIndex + 4);
+          i++
+        ) {
+          if (
+            anyLabel.test(lines[i]) ||
+            /^(?:№|ИИН|БИН|Комиссия|Тип перевода)/iu.test(lines[i])
+          )
+            break;
+          parts.push(lines[i]);
+        }
+        fields.recipientName = parts.join(" ").slice(0, 200);
+      } else if (
+        amountIndex >= 0 &&
+        /^[\p{L}’'-]+(?:\s+[\p{L}’'-]+)*\s+[\p{L}]\.(?:\s*[\p{L}]\.)?$/u.test(
+          next,
+        )
+      ) {
+        fields.recipientName = next;
+      }
     }
   }
   if (
@@ -403,7 +496,9 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       },
     );
     await worker.setParameters({
-      tessedit_pageseg_mode: kind === "identity" ? PSM.SPARSE_TEXT : PSM.AUTO,
+      // Sparse mode keeps transfer label/value pairs in reading order instead
+      // of concatenating the entire left column before the right column.
+      tessedit_pageseg_mode: PSM.SPARSE_TEXT,
     });
     return (
       await worker.recognize(

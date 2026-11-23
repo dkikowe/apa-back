@@ -780,6 +780,72 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     ).toBe(200);
     expect((await post("/api/participants", {})).status).toBe(400);
   });
+  it("persists village and sorts payment history by actual date/time, including export", async () => {
+    const added = await post("/api/participants", {
+      firstName: "УақытСынақ",
+      region: "Мұнайлы ауданы",
+      village: "Басқұдық",
+    });
+    expect(added.status).toBe(201);
+    const id = added.body._id;
+    for (const [day, time] of [
+      ["2026-10-16", "15:08"],
+      ["2026-10-16", "09:30"],
+      ["2026-10-15", "23:59:59"],
+      ["2026-10-16", ""],
+      ["2026-10-16", "15:08:03"],
+    ]) {
+      expect(
+        (
+          await post(`/api/participants/${id}/payments`, {
+            year: 2026,
+            amount: 100,
+            paymentDate: day,
+            paymentTime: time,
+          })
+        ).status,
+      ).toBe(201);
+    }
+    const found = await agent.get(`/api/participants/${id}?year=2026`);
+    expect(found.body.village).toBe("Басқұдық");
+    expect(
+      found.body.payments.map((p: any) => [p.paymentDate, p.paymentTime]),
+    ).toEqual([
+      ["2026-10-16", "15:08:03"],
+      ["2026-10-16", "15:08"],
+      ["2026-10-16", "09:30"],
+      ["2026-10-16", ""],
+      ["2026-10-15", "23:59:59"],
+    ]);
+    expect(
+      (
+        await post(`/api/participants/${id}/payments`, {
+          year: 2026,
+          amount: 100,
+          paymentDate: "2026-10-16",
+          paymentTime: "24:01",
+        })
+      ).status,
+    ).toBe(400);
+    const { makeReport } = await import("../server/services/reports.js");
+    const { filtersSchema } = await import("../server/services/members.js");
+    const book = new ExcelJS.Workbook();
+    await book.xlsx.load(
+      (await makeReport(
+        "payments",
+        filtersSchema.parse({ year: 2026, q: "УақытСынақ" }),
+      )) as any,
+    );
+    const sheet = book.worksheets[0];
+    expect(sheet.getRow(1).values).toContain("Төлем уақыты");
+    expect(sheet.getColumn(4).values.slice(2)).toEqual([
+      "15:08:03",
+      "15:08",
+      "09:30",
+      "",
+      "23:59:59",
+    ]);
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);
