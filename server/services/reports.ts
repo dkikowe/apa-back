@@ -124,6 +124,8 @@ export async function makeReport(type: string, f: Filters) {
     sheet.columns = [
       { header: "Тегі", key: "lastName", width: 24 },
       { header: "Аты", key: "firstName", width: 24 },
+      { header: "Латынша тегі", key: "lastNameLatin", width: 24 },
+      { header: "Латынша аты", key: "firstNameLatin", width: 24 },
       { header: "Әкесінің аты", key: "middleName", width: 24 },
       { header: "Туған күні", key: "birthDate", width: 16 },
       { header: "Жасы", key: "age", width: 10 },

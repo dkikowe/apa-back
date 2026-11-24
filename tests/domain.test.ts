@@ -221,3 +221,28 @@ describe("Optional identity document details", () => {
     expect(fields.issueDate).toBe("2020-02-01");
   });
 });
+
+it("reads adjacent Cyrillic and original Latin name lines under bilingual labels", () => {
+  expect(
+    extractFields(
+      "ТЕГІ / SURNAME\nҮЛГІҚЫЗЫ\nULGIKYZY\nАТЫ / NAME\nАЙГҮЛ\nAIGUL\nТУҒАН КҮНІ\n15.04.1975",
+      "identity",
+    ),
+  ).toMatchObject({
+    lastName: "ҮЛГІҚЫЗЫ",
+    lastNameLatin: "ULGIKYZY",
+    firstName: "АЙГҮЛ",
+    firstNameLatin: "AIGUL",
+  });
+  expect(
+    extractFields("ТЕГІ ҮЛГІҚЫЗЫ\nULGIKYZY\nАТЫ АЙГҮЛ\nAIGUL", "identity"),
+  ).toMatchObject({ lastNameLatin: "ULGIKYZY", firstNameLatin: "AIGUL" });
+  expect(
+    extractFields("ТЕГІ ҮЛГІҚЫЗЫ\nАТЫ АЙГҮЛ", "identity").lastNameLatin,
+  ).toBeUndefined();
+});
+it("retains original Latin spelling when OCR inserts spaces in an MRZ line", () => {
+  expect(
+    extractFields("ULGIKYZY << AIGUL <<<<<<<<<<<<<<<<<<<<", "identity"),
+  ).toMatchObject({ lastNameLatin: "ULGIKYZY", firstNameLatin: "AIGUL" });
+});

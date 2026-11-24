@@ -110,6 +110,8 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               ? Boolean(
                   (layerFields.lastName || layerFields.lastNameLatin) &&
                   (layerFields.firstName || layerFields.firstNameLatin) &&
+                  layerFields.lastNameLatin &&
+                  layerFields.firstNameLatin &&
                   layerFields.birthDate,
                 )
               : Boolean(
@@ -170,6 +172,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               ) || [];
             Object.assign(
               nativeFields,
+              layerFields,
               identityDetails(layer + "\n" + scanned.text),
               extractIdentityLayout(values, anchors),
               machineReadableNames(layer),

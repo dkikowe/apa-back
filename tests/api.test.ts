@@ -946,15 +946,13 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       status: "done",
     });
     const bytes = Buffer.from("%PDF-1.7\nsynthetic");
-    const open = vi
-      .spyOn(storage, "open")
-      .mockImplementation(
-        async () =>
-          ({
-            Body: Readable.from([bytes]),
-            ContentLength: bytes.length,
-          }) as any,
-      );
+    const open = vi.spyOn(storage, "open").mockImplementation(
+      async () =>
+        ({
+          Body: Readable.from([bytes]),
+          ContentLength: bytes.length,
+        }) as any,
+    );
     try {
       const meta = await agent.get(`/api/documents/${doc._id}`);
       expect(meta.body).toMatchObject({
@@ -989,6 +987,87 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(open).toHaveBeenCalledTimes(1);
     } finally {
       open.mockRestore();
+    }
+  });
+  it("sorts participants by their latest active payment before pagination and leaves unpaid participants last", async () => {
+    const { Payment } = await import("../server/models.js");
+    const ids: string[] = [];
+    for (const firstName of ["А", "Б", "В", "Г"]) {
+      const r = await post("/api/participants", {
+        lastName: "УақытРетіСынақ",
+        firstName,
+        lastNameLatin: "ORDERTEST",
+        firstNameLatin: "TEST",
+      });
+      expect(r.status).toBe(201);
+      ids.push(r.body._id);
+    }
+    const entries = [
+      {
+        participantId: ids[0],
+        year: 2026,
+        amount: 100,
+        paymentDate: "2026-10-02",
+        paymentTime: "12:45",
+      },
+      {
+        participantId: ids[1],
+        year: 2026,
+        amount: 100,
+        paymentDate: "2026-10-02",
+        paymentTime: "09:30",
+      },
+      {
+        participantId: ids[1],
+        year: 2026,
+        amount: 100,
+        paymentDate: "2026-10-01",
+        paymentTime: "23:59",
+      },
+      {
+        participantId: ids[2],
+        year: 2026,
+        amount: 100,
+        paymentDate: "2026-10-01",
+        paymentTime: "20:00",
+      },
+      {
+        participantId: ids[2],
+        year: 2026,
+        amount: 100,
+        paymentDate: "2026-12-31",
+        paymentTime: "23:59",
+        voidedAt: new Date(),
+      },
+      {
+        participantId: ids[3],
+        year: 2027,
+        amount: 100,
+        paymentDate: "2026-12-31",
+        paymentTime: "23:59",
+      },
+    ];
+    await Payment.insertMany(entries);
+    for (const [direction, expected] of [
+      ["desc", ids],
+      ["asc", [ids[2], ids[1], ids[0], ids[3]]],
+    ] as const) {
+      for (let page = 1; page <= 4; page++) {
+        const result = await agent
+          .get("/api/participants")
+          .query({
+            year: 2026,
+            q: "УақытРетіСынақ",
+            sort: "paymentTime",
+            direction,
+            page,
+            limit: 1,
+          });
+        expect(result.status).toBe(200);
+        expect(result.body.total).toBe(4);
+        expect(result.body.items[0]._id).toBe(expected[page - 1]);
+        expect(result.body.items[0].lastNameLatin).toBe("ORDERTEST");
+      }
     }
   });
   it("writes audit logs and invalidates the session on logout", async () => {

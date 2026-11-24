@@ -16,7 +16,7 @@ export const filtersSchema = z.object({
   archived: z.enum(["true", "false"]).default("false"),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
-  sort: z.enum(["name", "age", "paid"]).default("name"),
+  sort: z.enum(["name", "age", "paid", "paymentTime"]).default("name"),
   direction: z.enum(["asc", "desc"]).default("asc"),
 });
 export type Filters = z.infer<typeof filtersSchema>;
@@ -127,7 +127,21 @@ export function memberPipeline(
               },
             },
           },
-          { $group: { _id: null, total: { $sum: "$amount" } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: "$amount" },
+              lastPaymentAt: {
+                $max: {
+                  $concat: [
+                    "$paymentDate",
+                    "T",
+                    { $ifNull: ["$paymentTime", ""] },
+                  ],
+                },
+              },
+            },
+          },
         ],
         as: "paymentTotals",
       },
@@ -135,6 +149,9 @@ export function memberPipeline(
     {
       $addFields: {
         totalPaid: { $ifNull: [{ $first: "$paymentTotals.total" }, 0] },
+        lastPaymentAt: {
+          $ifNull: [{ $first: "$paymentTotals.lastPaymentAt" }, ""],
+        },
       },
     },
     {
@@ -158,9 +175,19 @@ export function memberPipeline(
   return stages;
 }
 export async function listMembers(f: Filters) {
-  const field = { name: "lastName", age: "age", paid: "totalPaid" }[f.sort];
+  const field = {
+    name: "lastName",
+    age: "age",
+    paid: "totalPaid",
+    paymentTime: "lastPaymentAt",
+  }[f.sort];
   const pipeline = memberPipeline(f);
+  if (f.sort === "paymentTime")
+    pipeline.push({
+      $addFields: { hasPayment: { $ne: ["$lastPaymentAt", ""] } },
+    });
   const sort: Record<string, 1 | -1> = {
+    ...(f.sort === "paymentTime" ? { hasPayment: -1 as const } : {}),
     [field]: f.direction === "asc" ? 1 : -1,
     ...(f.sort === "name"
       ? { firstName: f.direction === "asc" ? (1 as const) : (-1 as const) }
@@ -169,7 +196,7 @@ export async function listMembers(f: Filters) {
   };
   // Without a payment filter/sort, only look up payments for the visible page.
   const split =
-    !f.status && f.sort !== "paid"
+    !f.status && f.sort !== "paid" && f.sort !== "paymentTime"
       ? pipeline.findIndex((stage) => "$lookup" in stage)
       : pipeline.length;
   const [result] = await Participant.aggregate([
@@ -181,6 +208,7 @@ export async function listMembers(f: Filters) {
           { $skip: (f.page - 1) * f.limit },
           { $limit: f.limit },
           ...pipeline.slice(split),
+          { $project: { hasPayment: 0 } },
         ],
         count: [{ $count: "total" }],
       },

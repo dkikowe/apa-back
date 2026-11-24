@@ -172,7 +172,9 @@ export function extractIdentityLayout(
 export function machineReadableNames(text: string) {
   const matches = text
     .split(/\r?\n/)
-    .map((line) => line.trim())
+    .map((line) =>
+      line.includes("<<") ? line.replace(/\s/g, "") : line.trim(),
+    )
     .filter((line) => line.length >= 25)
     .map((line) =>
       line.match(/^([A-Z]+(?:<[A-Z]+)*)<<([A-Z]+(?:<[A-Z]+)*)<{2,}$/),
@@ -290,6 +292,21 @@ export function extractFields(text: string, kind: string) {
       const value = labeled(labels[key]);
       if (!value) continue;
       const chunks = value.split(/\s*[/|]\s*/);
+      // Some IDs print the Cyrillic and Latin spelling on adjacent lines
+      // under one bilingual heading rather than separating them with a slash.
+      const valueIndex = lines.findIndex(
+        (line) =>
+          line === value ||
+          (prefix(labels[key]).test(line) && line.endsWith(value)),
+      );
+      const next = valueIndex >= 0 ? lines[valueIndex + 1] : undefined;
+      if (
+        next &&
+        !anyLabel.test(next) &&
+        /^[\p{Script=Cyrillic}\s’'-]{2,100}$/u.test(value) &&
+        /^[A-Za-z\s’'-]{2,100}$/.test(next)
+      )
+        chunks.push(next);
       const cyrillic = chunks.find((v) =>
         /^[\p{Script=Cyrillic}\s’'-]{2,100}$/u.test(v),
       );
