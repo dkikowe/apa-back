@@ -846,6 +846,68 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "23:59:59",
     ]);
   });
+  it("recognizes pasted receipts without writes, saves the source and detects duplicates", async () => {
+    const { Payment, Document } = await import("../server/models.js");
+    const before = [
+      await Payment.countDocuments(),
+      await Document.countDocuments(),
+    ];
+    const text =
+      "➕ Сынақ 1956 +7 000 000 0001 — Оплата совершена 6 437 ₸ ОО Сынақ ұйымы № чека QR-PASTED-API ИИН/БИН продавца 000000000001 ФИО покупателя Үлгі А. Дата и время по Астане 01.08.2026 16:00 Оплачено с Kaspi Gold Адрес г. Астана";
+    expect(
+      (await request(app).post("/api/receipts/recognize-text").send({ text }))
+        .status,
+    ).toBe(403);
+    expect(
+      (await agent.post("/api/receipts/recognize-text").send({ text })).status,
+    ).toBe(403);
+    const read = await post("/api/receipts/recognize-text", { text });
+    expect(read.status).toBe(200);
+    expect(read.body.fields).toMatchObject({
+      amount: 643700,
+      paymentDate: "2026-08-01",
+      paymentTime: "16:00",
+      receiptNumber: "QR-PASTED-API",
+      recipientName: "ОО Сынақ ұйымы",
+    });
+    expect([
+      await Payment.countDocuments(),
+      await Document.countDocuments(),
+    ]).toEqual(before);
+    expect(
+      (await post("/api/receipts/recognize-text", { text: "" })).status,
+    ).toBe(400);
+    expect(
+      (await post("/api/receipts/recognize-text", { text: "a".repeat(20001) }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await post("/api/receipts/recognize-text", { text: text + text }))
+        .status,
+    ).toBe(400);
+    const person = await post("/api/participants", {
+      firstName: "МәтінСынақ",
+      region: "Ақтау",
+      village: "Өмірзақ",
+    });
+    const input = { ...read.body.fields, year: 2026, receiptText: text };
+    expect(
+      (await post(`/api/participants/${person.body._id}/payments`, input))
+        .status,
+    ).toBe(201);
+    const found = await agent.get(
+      `/api/participants/${person.body._id}?year=2026`,
+    );
+    expect(found.body.village).toBe("Өмірзақ");
+    expect(found.body.payments[0]).toMatchObject({
+      receiptText: text,
+      paymentTime: "16:00",
+    });
+    expect(
+      (await post(`/api/participants/${person.body._id}/payments`, input))
+        .status,
+    ).toBe(409);
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

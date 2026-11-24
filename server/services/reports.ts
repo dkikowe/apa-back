@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import { regionLabel } from "../../shared/locations.js";
 import { Participant, Payment, Finance } from "../models.js";
 import { memberPipeline, type Filters } from "./members.js";
 import {
@@ -128,7 +129,7 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Жасы", key: "age", width: 10 },
       { header: "Жас санаты", key: "ageLabel", width: 30 },
       { header: "Аймақ", key: "region", width: 25 },
-      { header: "Ауыл", key: "village", width: 25 },
+      { header: "Елді мекен", key: "village", width: 25 },
       { header: "Телефон", key: "phone", width: 20 },
       { header: "ЖСН", key: "iin", width: 18 },
       { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
@@ -150,6 +151,7 @@ export async function makeReport(type: string, f: Filters) {
       sheet.addRow({
         ...row,
         validityPeriod: validityPeriod(row.issueDate, row.expiryDate),
+        region: regionLabel(row.region),
         completeness: missingParticipantFields(row).length
           ? "Толық емес"
           : "Толық",

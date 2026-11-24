@@ -48,6 +48,7 @@ const payment = new Schema(
     amount: Number,
     paymentDate: String,
     paymentTime: { type: String, default: "" },
+    receiptText: { type: String, default: "" },
     recipientName: String,
     receiptNumber: String,
     method: String,

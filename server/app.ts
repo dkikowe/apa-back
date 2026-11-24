@@ -33,6 +33,7 @@ import {
 } from "./services/members.js";
 import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
+import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
   commitImport,
@@ -185,6 +186,20 @@ export function createApp() {
     res.set("Cache-Control", "no-store");
     next();
   });
+  app.post(
+    "/api/receipts/recognize-text",
+    rateLimit({ windowMs: 60_000, limit: 30 }),
+    (req, res) => {
+      const { text } = z
+        .object({ text: z.string().trim().min(1).max(20000) })
+        .parse(req.body);
+      try {
+        res.json({ fields: extractReceiptText(text) });
+      } catch (error) {
+        throw new HttpError(400, (error as Error).message);
+      }
+    },
+  );
   app.get("/api/auth/me", async (req, res) => {
     const admin = await Admin.findById(req.session.adminId).select("username");
     if (!admin) throw new HttpError(401, "Жүйеге қайта кіріңіз.");

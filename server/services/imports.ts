@@ -13,10 +13,18 @@ import {
   type ParticipantInput,
 } from "../../shared/domain.js";
 import { normalizeParticipant } from "./members.js";
+import { regionLabel } from "../../shared/locations.js";
 
 export const IMPORT_COLUMNS = {
   notes: ["Ескертпе", "Примечание", "notes"],
-  village: ["Ауыл", "Село", "Поселок", "Населенный пункт", "village"],
+  village: [
+    "Елді мекен",
+    "Ауыл",
+    "Село",
+    "Поселок",
+    "Населенный пункт",
+    "village",
+  ],
   lastName: ["Тегі", "Фамилия", "surname", "lastName"],
   firstName: ["Аты", "Имя", "name", "firstName"],
   middleName: ["Әкесінің аты", "Отчество", "middleName"],
@@ -377,6 +385,7 @@ export async function previewImport(
         const region = REGIONS.find(
           (r) =>
             normal(r) === normal(data.region) ||
+            normal(regionLabel(r)) === normal(data.region) ||
             REGION_ALIASES[r]?.some(
               (alias) => normal(alias) === normal(data.region),
             ) ||
