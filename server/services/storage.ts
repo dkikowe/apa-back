@@ -41,6 +41,11 @@ export const storage = {
     );
     return Buffer.from(await object.Body!.transformToByteArray());
   },
+  async open(key: string, signal?: AbortSignal) {
+    return s3.send(new GetObjectCommand({ Bucket: config.bucket, Key: key }), {
+      abortSignal: signal,
+    });
+  },
   async remove(key: string) {
     await s3.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: key }));
   },

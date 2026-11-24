@@ -9,6 +9,8 @@ import { fileTypeFromBuffer } from "file-type";
 import sharp from "sharp";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import mongoose from "mongoose";
 import { z, ZodError } from "zod";
 import { config } from "./config.js";
@@ -91,6 +93,7 @@ export function createApp() {
         directives: {
           "img-src": ["'self'", "data:", "blob:"],
           "connect-src": ["'self'"],
+          "frame-src": ["'self'", "blob:"],
           "upgrade-insecure-requests": config.production ? [] : null,
         },
       },
@@ -597,7 +600,7 @@ export function createApp() {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
       ownerId: req.session.adminId,
-    }).select("kind status fields error participantId");
+    }).select("kind status fields error participantId mime originalName size");
     if (!d) throw new HttpError(404, "Құжат табылмады.");
     res.json(d);
   });
@@ -615,6 +618,36 @@ export function createApp() {
     if (!doc)
       throw new HttpError(400, "Қайта оқу мүмкін емес. Қолмен толтырыңыз.");
     res.json({ ok: true });
+  });
+  app.get("/api/documents/:id/content", async (req, res) => {
+    const d = await Document.findOne({
+      _id: checkId(req.params.id),
+      ownerId: req.session.adminId,
+    });
+    if (!d) throw new HttpError(404, "Құжат табылмады.");
+    if (
+      !d.mime ||
+      !["application/pdf", "image/jpeg", "image/png"].includes(d.mime)
+    )
+      throw new HttpError(415, "Құжаттың бұл түрін көрсету мүмкін емес.");
+    const controller = new AbortController();
+    const disconnected = () => controller.abort();
+    res.on("close", disconnected);
+    try {
+      const object = await storage.open(d.key!, controller.signal);
+      if (!(object.Body instanceof Readable))
+        throw new Error("Document stream unavailable");
+      res.type(d.mime);
+      if (object.ContentLength !== undefined)
+        res.set("Content-Length", String(object.ContentLength));
+      // The browser requests this stream only when the document viewer opens.
+      await pipeline(object.Body, res, { signal: controller.signal });
+    } catch (error) {
+      if (!controller.signal.aborted && !res.headersSent) throw error;
+      if (!res.destroyed) res.destroy();
+    } finally {
+      res.off("close", disconnected);
+    }
   });
   app.get("/api/documents/:id/url", async (req, res) => {
     const d = await Document.findOne({

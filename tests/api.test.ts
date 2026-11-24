@@ -1,4 +1,5 @@
-import { beforeAll, afterAll, describe, it, expect } from "vitest";
+import { Readable } from "node:stream";
+import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
@@ -900,10 +901,13 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       `/api/participants/${person.body._id}?year=2026`,
     );
     expect(found.body.village).toBe("Өмірзақ");
-    const corrected = await patch(`/api/payments/${found.body.payments[0]._id}`, {
-      ...input,
-      payerName: "Үлгі Ә.",
-    });
+    const corrected = await patch(
+      `/api/payments/${found.body.payments[0]._id}`,
+      {
+        ...input,
+        payerName: "Үлгі Ә.",
+      },
+    );
     expect(corrected.status).toBe(200);
     expect(corrected.body.payerName).toBe("Үлгі Ә.");
     const { makeReport } = await import("../server/services/reports.js");
@@ -927,6 +931,65 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       (await post(`/api/participants/${person.body._id}/payments`, input))
         .status,
     ).toBe(409);
+  });
+  it("loads document bytes only on request and enforces ownership without caching", async () => {
+    const { Admin, Document } = await import("../server/models.js");
+    const { storage } = await import("../server/services/storage.js");
+    const owner = await Admin.findOne();
+    const doc = await Document.create({
+      kind: "receipt",
+      ownerId: owner!._id,
+      mime: "application/pdf",
+      originalName: "Сынақ.pdf",
+      key: "test/view",
+      size: 12,
+      status: "done",
+    });
+    const bytes = Buffer.from("%PDF-1.7\nsynthetic");
+    const open = vi
+      .spyOn(storage, "open")
+      .mockImplementation(
+        async () =>
+          ({
+            Body: Readable.from([bytes]),
+            ContentLength: bytes.length,
+          }) as any,
+      );
+    try {
+      const meta = await agent.get(`/api/documents/${doc._id}`);
+      expect(meta.body).toMatchObject({
+        mime: "application/pdf",
+        originalName: "Сынақ.pdf",
+      });
+      expect(open).not.toHaveBeenCalled();
+      const file = await agent
+        .get(`/api/documents/${doc._id}/content`)
+        .buffer(true)
+        .parse((res, cb) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          res.on("end", () => cb(null, Buffer.concat(chunks)));
+          res.on("error", cb);
+        });
+      expect(file.status).toBe(200);
+      expect(file.body).toEqual(bytes);
+      expect(file.headers["content-type"]).toContain("application/pdf");
+      expect(file.headers["cache-control"]).toContain("no-store");
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(
+        (await request(app).get(`/api/documents/${doc._id}/content`)).status,
+      ).toBe(401);
+      await Document.updateOne(
+        { _id: doc._id },
+        { $set: { ownerId: new mongoose.Types.ObjectId() } },
+      );
+      expect(
+        (await agent.get(`/api/documents/${doc._id}/content`)).status,
+      ).toBe(404);
+      expect(open).toHaveBeenCalledTimes(1);
+    } finally {
+      open.mockRestore();
+    }
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
