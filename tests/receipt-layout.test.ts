@@ -19,6 +19,7 @@ describe("QR receipt layout", () => {
       paymentDate: "2026-11-14",
       receiptNumber: "QR-TEST-2026",
       recipientName: "ИП СЫНАҚ ДҮКЕН",
+      payerName: "Сынақ А.",
       method: "с Kaspi Gold",
     });
   });
@@ -76,6 +77,7 @@ describe("bank transfer receipt variants", () => {
       paymentTime: "15:08",
       receiptNumber: "3503000001",
       recipientName: "Үлгі Б.",
+      payerName: "Сынақ А.",
     });
   });
   it("reads a screenshot transfer with a wrapped long number, date and time", () => {
@@ -109,6 +111,7 @@ describe("bank transfer receipt variants", () => {
       paymentTime: "10:34",
       receiptNumber: "895900000000000001",
       recipientName: "Үлгі Б.",
+      payerName: "Сынақ А.",
       method: "Kaspi Gold",
     });
   });
@@ -147,4 +150,14 @@ describe("bank transfer receipt variants", () => {
       ).toMatchObject({ issueDate: "2020-02-01", expiryDate: "2030-02-01" });
     }
   });
+});
+
+it("does not substitute the recipient or metadata for a missing payer", () => {
+  for (const text of ["Получатель Үлгі А.", "Отправитель\nОткуда\nKaspi Gold"])
+    expect(extractFields(text, "receipt").payerName).toBeUndefined();
+});
+it("reads a full payer name with Kazakh letters", () => {
+  expect(
+    extractFields("Төлеуші: Сынақ Үлгі Айгүлқызы", "receipt").payerName,
+  ).toBe("Сынақ Үлгі Айгүлқызы");
 });

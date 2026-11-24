@@ -174,6 +174,7 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Төлем уақыты", key: "paymentTime", width: 18 },
       { header: "Сома, ₸", key: "amount", width: 20 },
       { header: "Алушы", key: "recipientName", width: 30 },
+      { header: "Төлеген адам", key: "payerName", width: 30 },
       { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
     ];
     const members = await Participant.aggregate([

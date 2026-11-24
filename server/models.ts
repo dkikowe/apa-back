@@ -50,6 +50,7 @@ const payment = new Schema(
     paymentTime: { type: String, default: "" },
     receiptText: { type: String, default: "" },
     recipientName: String,
+    payerName: { type: String, default: "" },
     receiptNumber: String,
     method: String,
     receiptDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },

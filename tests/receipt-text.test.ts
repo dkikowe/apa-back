@@ -15,6 +15,7 @@ describe("WhatsApp receipt text", () => {
         paymentDate: "2026-08-01",
         paymentTime: "16:00",
         receiptNumber: "QR-TEXT-001",
+        payerName: "Үлгі А.",
         recipientName: 'ОО Сынақ ұйымы "TEST"',
         method: "с Kaspi Gold",
       });

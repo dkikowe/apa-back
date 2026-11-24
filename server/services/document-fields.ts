@@ -65,6 +65,16 @@ const labels = {
     "DATE",
   ],
   recipientName: ["ПОЛУЧАТЕЛЬ", "АЛУШЫ", "RECIPIENT"],
+  payerName: [
+    "ФИО ПОКУПАТЕЛЯ",
+    "ОТПРАВИТЕЛЬ",
+    "ПЛАТЕЛЬЩИК",
+    "ТӨЛЕГЕН АДАМ",
+    "ТӨЛЕУШІ",
+    "ЖІБЕРУШІ",
+    "PAYER",
+    "SENDER",
+  ],
   receiptNumber: [
     "№ КВИТАНЦИИ",
     "НОМЕР КВИТАНЦИИ",
@@ -389,6 +399,20 @@ export function extractFields(text: string, kind: string) {
       if (value)
         fields[key] = value.slice(0, key === "recipientName" ? 200 : 150);
     }
+    const payer = labeled(labels.payerName);
+    if (
+      payer &&
+      !/^(?:Комиссия|Откуда|Куда|Адрес|Сообщение|ИИН|БИН)(?=\s|:|$)/iu.test(
+        payer,
+      )
+    ) {
+      // Forwarded messages may append a comment after the printed initials.
+      const name =
+        payer.match(
+          /^([\p{L}’'-]+(?:\s+[\p{L}’'-]+)*\s+[\p{L}]\.(?:\s*[\p{L}]\.)?)(?=\s|$)/u,
+        )?.[1] || payer;
+      if (/^[\p{L}\s.’'-]{2,200}$/u.test(name)) fields.payerName = name;
+    }
     // Long transfer numbers wrap onto a second line; retain them as strings.
     for (let i = 0; i < lines.length; i++) {
       if (!prefix(labels.receiptNumber).test(lines[i])) continue;
@@ -474,6 +498,7 @@ export function extractReceiptText(message: string) {
     ...labels.paymentDate,
     ...labels.receiptNumber,
     ...labels.recipientName,
+    ...labels.payerName,
     ...labels.method,
     "ИИН/БИН продавца",
     "ФИО покупателя",

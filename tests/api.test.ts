@@ -868,6 +868,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       paymentDate: "2026-08-01",
       paymentTime: "16:00",
       receiptNumber: "QR-PASTED-API",
+      payerName: "Үлгі А.",
       recipientName: "ОО Сынақ ұйымы",
     });
     expect([
@@ -899,8 +900,27 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       `/api/participants/${person.body._id}?year=2026`,
     );
     expect(found.body.village).toBe("Өмірзақ");
+    const corrected = await patch(`/api/payments/${found.body.payments[0]._id}`, {
+      ...input,
+      payerName: "Үлгі Ә.",
+    });
+    expect(corrected.status).toBe(200);
+    expect(corrected.body.payerName).toBe("Үлгі Ә.");
+    const { makeReport } = await import("../server/services/reports.js");
+    const { filtersSchema } = await import("../server/services/members.js");
+    const book = new ExcelJS.Workbook();
+    await book.xlsx.load(
+      (await makeReport(
+        "payments",
+        filtersSchema.parse({ year: 2026, q: "МәтінСынақ" }),
+      )) as any,
+    );
+    expect(book.worksheets[0].getRow(1).values).toContain("Төлеген адам");
+    expect(book.worksheets[0].getRow(2).values).toContain("Үлгі Ә.");
+
     expect(found.body.payments[0]).toMatchObject({
       receiptText: text,
+      payerName: "Үлгі А.",
       paymentTime: "16:00",
     });
     expect(
