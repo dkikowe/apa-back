@@ -21,6 +21,7 @@ const participant = new Schema(
     phone: String,
     phoneNormalized: String,
     iin: String,
+    iinKey: String,
     documentNumber: String,
     issuedBy: String,
     issueDate: String,
@@ -32,6 +33,7 @@ const participant = new Schema(
   },
   options,
 );
+participant.index({ iinKey: 1 }, { unique: true, sparse: true });
 participant.index({ archivedAt: 1, region: 1, birthDate: 1 });
 participant.index({ searchTokens: 1 });
 participant.index({ importKey: 1 }, { unique: true, sparse: true });
@@ -57,6 +59,7 @@ const payment = new Schema(
     recipientName: String,
     payerName: { type: String, default: "" },
     receiptNumber: String,
+    receiptNumberKey: String,
     method: String,
     receiptDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },
     fileHash: String,
@@ -68,6 +71,7 @@ const payment = new Schema(
   },
   options,
 );
+payment.index({ receiptNumberKey: 1 }, { unique: true, sparse: true });
 payment.index({ participantId: 1, year: 1, voidedAt: 1 });
 payment.index({ paymentDate: 1, voidedAt: 1 });
 payment.index({ year: 1, voidedAt: 1 });
@@ -93,12 +97,15 @@ const document = new Schema(
     mime: String,
     size: Number,
     hash: String,
+    uploadHash: String,
+    recognitionKey: String,
+    duplicate: Schema.Types.Mixed,
     ownerId: Schema.Types.ObjectId,
     participantId: Schema.Types.ObjectId,
     originalName: String,
     status: {
       type: String,
-      enum: ["queued", "processing", "done", "failed"],
+      enum: ["queued", "processing", "done", "failed", "duplicate"],
       default: "queued",
     },
     fields: Schema.Types.Mixed,
@@ -109,6 +116,8 @@ const document = new Schema(
   },
   options,
 );
+document.index({ uploadHash: 1 }, { unique: true, sparse: true });
+document.index({ recognitionKey: 1 }, { unique: true, sparse: true });
 document.index({ status: 1, createdAt: 1 });
 document.index({ hash: 1 });
 const audit = new Schema(

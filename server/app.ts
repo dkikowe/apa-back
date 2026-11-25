@@ -35,6 +35,13 @@ import {
 } from "./services/members.js";
 import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
+import {
+  DuplicateError,
+  participantConflict,
+  paymentConflict,
+  receiptKey,
+  documentConflictInfo,
+} from "./services/duplicates.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
@@ -192,13 +199,27 @@ export function createApp() {
   app.post(
     "/api/receipts/recognize-text",
     rateLimit({ windowMs: 60_000, limit: 30 }),
-    (req, res) => {
-      const { text } = z
-        .object({ text: z.string().trim().min(1).max(20000) })
+    async (req, res) => {
+      const { text, paymentId } = z
+        .object({
+          text: z.string().trim().min(1).max(20000),
+          paymentId: z
+            .string()
+            .regex(/^[a-f\d]{24}$/i)
+            .optional(),
+        })
         .parse(req.body);
       try {
-        res.json({ fields: extractReceiptText(text) });
+        const fields = extractReceiptText(text);
+        const duplicate = await paymentConflict(
+          String(fields.receiptNumber || ""),
+          undefined,
+          paymentId,
+        );
+        if (duplicate) throw new DuplicateError(duplicate);
+        res.json({ fields });
       } catch (error) {
+        if (error instanceof DuplicateError) throw error;
         throw new HttpError(400, (error as Error).message);
       }
     },
@@ -266,7 +287,14 @@ export function createApp() {
   app.post("/api/participants", async (req, res) => {
     const data = participantSchema.parse(req.body);
     const result = await atomic(async (s) => {
+      const conflict = await participantConflict(data.iin, undefined, s);
+      if (conflict) throw new DuplicateError(conflict);
       if (data.identityDocumentId) {
+        if (!data.iin)
+          throw new HttpError(
+            400,
+            "Қайталануын тексеру үшін куәліктегі ЖСН-ді (12 сан) енгізіңіз.",
+          );
         const doc = await Document.findOne({
           _id: data.identityDocumentId,
           kind: "identity",
@@ -278,6 +306,9 @@ export function createApp() {
             400,
             "Құжат табылмады немесе басқа адамға тіркелген.",
           );
+        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        if (["queued", "processing"].includes(doc.status!))
+          throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
       }
       const [p] = await Participant.create([normalizeParticipant(data)], {
         session: s,
@@ -320,7 +351,17 @@ export function createApp() {
     const p = await atomic(async (s) => {
       const before = await Participant.findById(id).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
+      const conflict = await participantConflict(data.iin, id, s);
+      if (conflict && before.iin !== data.iin)
+        throw new DuplicateError(conflict);
+      const normalized = normalizeParticipant(data);
+      if (conflict) delete normalized.iinKey;
       if (data.identityDocumentId) {
+        if (!data.iin)
+          throw new HttpError(
+            400,
+            "Қайталануын тексеру үшін куәліктегі ЖСН-ді (12 сан) енгізіңіз.",
+          );
         const doc = await Document.findOne({
           _id: data.identityDocumentId,
           kind: "identity",
@@ -328,6 +369,9 @@ export function createApp() {
           $or: [{ participantId: null }, { participantId: id }],
         }).session(s);
         if (!doc) throw new HttpError(400, "Құжат табылмады.");
+        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        if (["queued", "processing"].includes(doc.status!))
+          throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
         await Document.updateOne(
           { _id: doc._id },
           { $set: { participantId: id } },
@@ -338,8 +382,9 @@ export function createApp() {
         id,
         {
           $set: {
-            ...normalizeParticipant(data),
+            ...normalized,
           },
+          ...(!data.iin ? { $unset: { iinKey: 1 } } : {}),
         },
         { new: true, session: s },
       );
@@ -399,6 +444,14 @@ export function createApp() {
       let fileHash: string | undefined;
       const receiptDocumentId =
         data.receiptDocumentId || before?.receiptDocumentId?.toString();
+      if (
+        (receiptDocumentId || data.receiptText) &&
+        !receiptKey(data.receiptNumber)
+      )
+        throw new HttpError(
+          400,
+          "Қайталануын тексеру үшін чек нөмірін енгізіңіз.",
+        );
       if (receiptDocumentId) {
         const doc = await Document.findOne({
           _id: receiptDocumentId,
@@ -411,6 +464,21 @@ export function createApp() {
             400,
             "Чек табылмады немесе басқа қатысушыға тіркелген.",
           );
+        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        if (["queued", "processing"].includes(doc.status!))
+          throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
+        const attachedPayment = await Payment.findOne({
+          receiptDocumentId: doc._id,
+          ...(id ? { _id: { $ne: id } } : {}),
+        })
+          .session(s)
+          .lean();
+        if (attachedPayment)
+          throw new DuplicateError({
+            message: "Бұл чек бұрын тіркелген. Қайта қосуға болмайды.",
+            participantId: String(attachedPayment.participantId),
+            paymentId: String(attachedPayment._id),
+          });
         fileHash = doc.hash || undefined;
         await Document.updateOne(
           { _id: doc._id },
@@ -418,82 +486,47 @@ export function createApp() {
           { session: s },
         );
       }
-      const fingerprint = data.receiptNumber
-        ? createHash("sha256")
-            .update(
-              [
-                data.receiptNumber.trim().toLowerCase(),
-                data.amount,
-                data.paymentDate,
-                data.recipientName.trim().toLowerCase(),
-              ].join("|"),
-            )
-            .digest("hex")
-        : undefined;
-      const candidates = [
-        ...(fileHash ? [{ fileHash }] : []),
-        ...(fingerprint ? [{ fingerprint }] : []),
-      ];
-      const duplicate = candidates.length
-        ? await Payment.findOne({
-            voidedAt: null,
-            ...(id ? { _id: { $ne: id } } : {}),
-            $or: candidates,
-          }).session(s)
-        : null;
-      if (duplicate && !data.confirmDuplicate)
-        throw new HttpError(
-          409,
-          "Бұл чек бұрын тіркелген болуы мүмкін. Қайта қоспас бұрын тексеріңіз.",
-          { duplicateId: duplicate._id },
-        );
-      const { confirmDuplicate: _confirm, ...input } = data;
+      const numberKey = receiptKey(data.receiptNumber);
+      const duplicate = await paymentConflict(
+        data.receiptNumber,
+        fileHash,
+        id,
+        s,
+      );
+      const unchangedLegacy =
+        before &&
+        receiptKey(before.receiptNumber) === numberKey &&
+        before.fileHash === fileHash;
+      if (duplicate && !unchangedLegacy) throw new DuplicateError(duplicate);
       const keys = [
         ...(fileHash ? ["file:" + fileHash] : []),
-        ...(fingerprint ? ["receipt:" + fingerprint] : []),
+        ...(numberKey ? ["receipt-number:" + numberKey] : []),
       ];
       const values = {
-        ...input,
+        ...data,
         participantId,
         ...(receiptDocumentId ? { receiptDocumentId } : {}),
         ...(fileHash ? { fileHash } : {}),
-        ...(fingerprint ? { fingerprint } : {}),
-        duplicateConfirmed: data.confirmDuplicate,
+        ...(!duplicate && numberKey ? { receiptNumberKey: numberKey } : {}),
+        ...(!duplicate && keys.length ? { dedupeKeys: keys } : {}),
       };
       let p;
       if (before) {
         p = await Payment.findByIdAndUpdate(
           id,
           {
-            $set: {
-              ...values,
-              ...(!data.confirmDuplicate && keys.length
-                ? { dedupeKeys: keys }
-                : {}),
-            },
+            $set: values,
             $unset: {
-              ...(!fingerprint ? { fingerprint: 1 } : {}),
+              fingerprint: 1,
+              duplicateConfirmed: 1,
+              ...(!numberKey ? { receiptNumberKey: 1 } : {}),
               ...(!fileHash ? { fileHash: 1 } : {}),
-              ...(data.confirmDuplicate || !keys.length
-                ? { dedupeKeys: 1 }
-                : {}),
+              ...(!keys.length ? { dedupeKeys: 1 } : {}),
             },
           },
           { new: true, session: s },
         );
-      } else {
-        [p] = await Payment.create(
-          [
-            {
-              ...values,
-              ...(!data.confirmDuplicate && keys.length
-                ? { dedupeKeys: keys }
-                : {}),
-            },
-          ],
-          { session: s },
-        );
-      }
+      } else [p] = await Payment.create([values], { session: s });
       await audit(
         req.session.adminId!,
         before ? "update" : "create",
@@ -568,7 +601,13 @@ export function createApp() {
         }
       }
       const hash = createHash("sha256").update(req.file.buffer).digest("hex");
-      const duplicate = await Document.findOne({ hash }).select("_id");
+      const duplicate = await Document.findOne({ hash, kind })
+        .sort({ createdAt: 1 })
+        .lean();
+      if (duplicate)
+        throw new DuplicateError(
+          await documentConflictInfo(duplicate, req.session.adminId),
+        );
       const key = [
         process.env.S3_KEY_PREFIX?.replace(/^\/+|\/+$/g, ""),
         `${kind}/${randomBytes(24).toString("hex")}.${type.ext}`,
@@ -583,15 +622,21 @@ export function createApp() {
           mime: type.mime,
           size: req.file.size,
           hash,
+          uploadHash: kind + ":" + hash,
           ownerId: req.session.adminId,
           originalName: req.file.originalname.slice(0, 200),
           status: "queued",
         });
-        res
-          .status(201)
-          .json({ id: doc._id, status: doc.status, duplicate: !!duplicate });
+        res.status(201).json({ id: doc._id, status: doc.status });
       } catch (e) {
         await storage.remove(key).catch(() => {});
+        if ((e as any).code === 11000) {
+          const original = await Document.findOne({ hash, kind }).lean();
+          if (original)
+            throw new DuplicateError(
+              await documentConflictInfo(original, req.session.adminId),
+            );
+        }
         throw e;
       }
     },
@@ -601,7 +646,7 @@ export function createApp() {
       _id: checkId(req.params.id),
       ownerId: req.session.adminId,
     }).select(
-      "kind status fields error participantId mime originalName size attempts",
+      "kind status fields error duplicate participantId mime originalName size attempts",
     );
     if (!d) throw new HttpError(404, "Құжат табылмады.");
     res.json(d);
@@ -786,9 +831,10 @@ export function createApp() {
         });
       if (error.code === 11000)
         return res.status(409).json({
-          message: error.keyPattern?.importKey
-            ? "Бұл қатысушы бұрын енгізілген. Файлды қайта тексеріңіз."
-            : "Бұл чек бұрын тіркелген. Қайталап қосуды растаңыз.",
+          message:
+            error.keyPattern?.importKey || error.keyPattern?.iinKey
+              ? "Бұл қатысушы бұрын енгізілген. Қайта қосуға болмайды."
+              : "Бұл құжат немесе чек бұрын тіркелген. Қайта қосуға болмайды.",
         });
       if (error instanceof multer.MulterError)
         return res.status(400).json({
@@ -796,10 +842,16 @@ export function createApp() {
             ? "Excel файлы 10 МБ-тан аспауы керек."
             : "Файл 15 МБ-тан аспауы керек.",
         });
-      if (error instanceof HttpError || error instanceof ImportError)
+      if (
+        error instanceof HttpError ||
+        error instanceof ImportError ||
+        error instanceof DuplicateError
+      )
         return res.status(error.status).json({
           message: error.message,
-          ...(error instanceof HttpError ? error.details : {}),
+          ...(error instanceof HttpError || error instanceof DuplicateError
+            ? error.details
+            : {}),
         });
       console.error("Request failed", {
         type: error.name,

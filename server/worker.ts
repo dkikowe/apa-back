@@ -1,6 +1,7 @@
 import "dotenv/config";
 import mongoose from "mongoose";
 import { connect, Document } from "./models.js";
+import { completeRecognition } from "./services/duplicates.js";
 import { storage } from "./services/storage.js";
 import { recognize, WrongDocumentKindError } from "./services/ocr.js";
 await connect();
@@ -44,10 +45,7 @@ while (!stopped) {
       job.mime!,
       job.kind!,
     );
-    await Document.updateOne(
-      { _id: job._id },
-      { $set: { status: "done", fields, completedAt: new Date() } },
-    );
+    await completeRecognition(job, fields);
   } catch (error) {
     await Document.updateOne(
       { _id: job._id },

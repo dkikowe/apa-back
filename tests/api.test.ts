@@ -118,7 +118,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       status: "partial",
     });
   });
-  it("detects duplicate receipts and requires explicit confirmation", async () => {
+  it("blocks duplicate receipts even with the former confirmation flag", async () => {
     expect(
       (await post(`/api/participants/${participantId}/payments`, base)).status,
     ).toBe(409);
@@ -126,8 +126,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       ...base,
       confirmDuplicate: true,
     });
-    expect(r.status).toBe(201);
-    await post(`/api/payments/${r.body._id}/void`, {});
+    expect(r.status).toBe(409);
   });
   it("second payment completes annual fee and next year stays separate", async () => {
     expect(
@@ -281,6 +280,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const created = await post("/api/participants", {
       ...person,
       firstName: "Қолмен түзетілген",
+      iin: "000123456780",
       identityDocumentId: String(doc._id),
     });
     expect(created.status).toBe(201);
@@ -1167,6 +1167,339 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
       400,
     );
+  });
+  it("blocks IIN duplicates including archived participants and concurrent requests", async () => {
+    const iin = "000123456791";
+    const results = await Promise.all(
+      [1, 2].map(() => post("/api/participants", { ...person, iin })),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    const saved = results.find((r) => r.status === 201)!;
+    expect(
+      (
+        await patch(`/api/participants/${saved.body._id}`, {
+          ...person,
+          iin,
+          notes: "Edit original",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await patch(`/api/participants/${participantId}`, { ...person, iin }))
+        .status,
+    ).toBe(409);
+    await post(`/api/participants/${saved.body._id}/archive`, {});
+    const duplicate = await post("/api/participants", { ...person, iin });
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.participantId).toBe(saved.body._id);
+  });
+  it("blocks receipt numbers regardless of case, spaces, amount, date, recipient or voiding", async () => {
+    const p = await post("/api/participants", {
+      ...person,
+      firstName: "Қайталау",
+    });
+    const pay = await post(`/api/participants/${p.body._id}/payments`, {
+      ...base,
+      receiptNumber: "QR-DUP-410",
+    });
+    expect(pay.status).toBe(201);
+    const repeat = {
+      ...base,
+      receiptNumber: " q r - d u p - 4 1 0 ",
+      amount: 12300,
+      year: 2027,
+      paymentDate: "2027-01-01",
+      recipientName: "Different",
+      confirmDuplicate: true,
+    };
+    const duplicate = await post(
+      `/api/participants/${participantId}/payments`,
+      repeat,
+    );
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.paymentId).toBe(pay.body._id);
+    expect(
+      (
+        await patch(`/api/payments/${pay.body._id}`, {
+          ...base,
+          receiptNumber: "QR-DUP-410",
+          amount: 45600,
+        })
+      ).status,
+    ).toBe(200);
+    await post(`/api/payments/${pay.body._id}/void`, {});
+    expect(
+      (await post(`/api/participants/${participantId}/payments`, repeat))
+        .status,
+    ).toBe(409);
+  });
+  it("keeps one payment when two tabs submit the same number simultaneously", async () => {
+    const results = await Promise.all(
+      [1, 2].map(() =>
+        post(`/api/participants/${participantId}/payments`, {
+          ...base,
+          receiptNumber: "QR-CONCURRENT-411",
+        }),
+      ),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    const { Payment } = await import("../server/models.js");
+    expect(
+      await Payment.countDocuments({ receiptNumberKey: "QR-CONCURRENT-411" }),
+    ).toBe(1);
+  });
+  it("recognizes duplicate receipt numbers in pasted text", async () => {
+    const number = "QR16813534981";
+    const pay = await post(`/api/participants/${participantId}/payments`, {
+      ...base,
+      receiptNumber: number,
+    });
+    expect(pay.status).toBe(201);
+    const text = `Оплата совершена 6 437 ₸ ОО Ремесленников URSHYK № чека ${number} Дата и время по Астане 01.08.2026 16:00 Оплачено с Kaspi Gold`;
+    expect((await post("/api/receipts/recognize-text", { text })).status).toBe(
+      409,
+    );
+    expect(
+      (
+        await post("/api/receipts/recognize-text", {
+          text,
+          paymentId: pay.body._id,
+        })
+      ).status,
+    ).toBe(200);
+  });
+  it("requires an identifier for document-backed records but allows partial manual records", async () => {
+    const { Document, Admin } = await import("../server/models.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const identity = await Document.create({
+      kind: "identity",
+      ownerId: owner!._id,
+      status: "failed",
+    });
+    const receipt = await Document.create({
+      kind: "receipt",
+      ownerId: owner!._id,
+      status: "failed",
+    });
+    expect(
+      (
+        await post("/api/participants", {
+          ...person,
+          identityDocumentId: String(identity._id),
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await post(`/api/participants/${participantId}/payments`, {
+          ...base,
+          receiptNumber: "",
+          receiptDocumentId: String(receipt._id),
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await post(`/api/participants/${participantId}/payments`, {
+          ...base,
+          receiptNumber: "",
+          receiptText: "unreadable receipt",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (await post("/api/participants", { firstName: "ТолықЕмес" })).status,
+    ).toBe(201);
+  });
+  it("rejects an already uploaded file before storage, even if the filename changes", async () => {
+    const sharp = (await import("sharp")).default;
+    const { storage } = await import("../server/services/storage.js");
+    const put = vi.spyOn(storage, "put").mockResolvedValue();
+    const remove = vi.spyOn(storage, "remove").mockResolvedValue();
+    try {
+      const bytes = await sharp({
+        create: { width: 20, height: 20, channels: 3, background: "white" },
+      })
+        .png()
+        .toBuffer();
+      const upload = (name: string) =>
+        agent
+          .post("/api/documents")
+          .set("x-csrf-token", csrf)
+          .field("kind", "identity")
+          .attach("file", bytes, name);
+      const original = await upload("original.png");
+      expect(original.status).toBe(201);
+      const again = await upload("renamed.png");
+      expect(again.status).toBe(409);
+      expect(again.body).toMatchObject({
+        duplicateDocumentId: original.body.id,
+        canReuse: true,
+      });
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      put.mockRestore();
+      remove.mockRestore();
+    }
+  });
+  it("blocks different files with the same recognized IIN, while allowing reuse and rereading the original", async () => {
+    const { Document, Admin } = await import("../server/models.js");
+    const { completeRecognition } =
+      await import("../server/services/duplicates.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const make = () =>
+      Document.create({
+        kind: "identity",
+        ownerId: owner!._id,
+        status: "processing",
+      });
+    const original = await make(),
+      copy = await make();
+    const fields = {
+      iin: "000123456792",
+      firstName: "Тексеру",
+      lastName: "Сынақ",
+    };
+    await completeRecognition(original, fields);
+    await completeRecognition(copy, fields);
+    const checked = await Document.findById(copy._id).lean();
+    expect(checked).toMatchObject({
+      status: "duplicate",
+      duplicate: { duplicateDocumentId: String(original._id), canReuse: true },
+    });
+    expect(
+      (
+        await post("/api/participants", {
+          ...person,
+          iin: fields.iin,
+          identityDocumentId: String(copy._id),
+        })
+      ).status,
+    ).toBe(409);
+    const saved = await post("/api/participants", {
+      ...person,
+      iin: fields.iin,
+      identityDocumentId: String(original._id),
+    });
+    expect(saved.status).toBe(201);
+    await completeRecognition(await Document.findById(original._id), fields);
+    expect((await Document.findById(original._id))?.status).toBe("done");
+    const another = await make();
+    await completeRecognition(another, fields);
+    expect((await Document.findById(another._id))?.duplicate).toMatchObject({
+      participantId: saved.body._id,
+    });
+  });
+  it("blocks recognized receipt duplicates of saved payments and competing unfinished uploads", async () => {
+    const { Document, Admin } = await import("../server/models.js");
+    const { completeRecognition } =
+      await import("../server/services/duplicates.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const make = () =>
+      Document.create({
+        kind: "receipt",
+        ownerId: owner!._id,
+        status: "processing",
+      });
+    const a = await make(),
+      b = await make();
+    await Promise.all([
+      completeRecognition(a, { receiptNumber: "QR-RACE-412" }),
+      completeRecognition(b, { receiptNumber: "qr-race-412" }),
+    ]);
+    const docs = await Document.find({ _id: { $in: [a._id, b._id] } });
+    expect(docs.map((d) => d.status).sort()).toEqual(["done", "duplicate"]);
+    const loser = docs.find((d) => d.status === "duplicate")!;
+    expect(
+      (
+        await post(`/api/participants/${participantId}/payments`, {
+          ...base,
+          receiptNumber: "QR-RACE-412",
+          receiptDocumentId: String(loser._id),
+        })
+      ).status,
+    ).toBe(409);
+    const winner = docs.find((d) => d.status === "done")!;
+    const saved = await post(`/api/participants/${participantId}/payments`, {
+      ...base,
+      receiptNumber: "QR-RACE-412",
+      receiptDocumentId: String(winner._id),
+    });
+    expect(saved.status).toBe(201);
+    const c = await make();
+    await completeRecognition(c, { receiptNumber: "QR-RACE-412" });
+    expect((await Document.findById(c._id))?.duplicate).toMatchObject({
+      paymentId: saved.body._id,
+    });
+  });
+  it("blocks reuse of a legacy receipt attachment even if its hash is absent and number changed", async () => {
+    const { Document, Admin } = await import("../server/models.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const doc = await Document.create({
+      kind: "receipt",
+      ownerId: owner!._id,
+      status: "done",
+    });
+    const first = await post(`/api/participants/${participantId}/payments`, {
+      ...base,
+      receiptNumber: "LEGACY-DOC-1",
+      receiptDocumentId: String(doc._id),
+    });
+    expect(first.status).toBe(201);
+    const second = await post(`/api/participants/${participantId}/payments`, {
+      ...base,
+      receiptNumber: "LEGACY-DOC-2",
+      receiptDocumentId: String(doc._id),
+    });
+    expect(second.status).toBe(409);
+    expect(second.body.paymentId).toBe(first.body._id);
+  });
+  it("keeps one stored document and removes the losing blob for concurrent identical uploads", async () => {
+    const sharp = (await import("sharp")).default;
+    const { storage } = await import("../server/services/storage.js");
+    const { Document } = await import("../server/models.js");
+    let arrived = 0,
+      release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const put = vi.spyOn(storage, "put").mockImplementation(async () => {
+      if (++arrived === 2) release();
+      await barrier;
+    });
+    const remove = vi.spyOn(storage, "remove").mockResolvedValue();
+    try {
+      const bytes = await sharp({
+        create: { width: 21, height: 21, channels: 3, background: "blue" },
+      })
+        .png()
+        .toBuffer();
+      const results = await Promise.all(
+        [1, 2].map((i) =>
+          agent
+            .post("/api/documents")
+            .set("x-csrf-token", csrf)
+            .field("kind", "receipt")
+            .attach("file", bytes, `race-${i}.png`),
+        ),
+      );
+      expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+      const original = results.find((r) => r.status === 201)!;
+      expect(
+        results.find((r) => r.status === 409)!.body.duplicateDocumentId,
+      ).toBe(original.body.id);
+      const doc = await Document.findById(original.body.id);
+      expect(
+        await Document.countDocuments({ hash: doc!.hash, kind: "receipt" }),
+      ).toBe(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove).not.toHaveBeenCalledWith(doc!.key);
+    } finally {
+      release();
+      put.mockRestore();
+      remove.mockRestore();
+    }
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");

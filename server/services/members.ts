@@ -23,6 +23,7 @@ export type Filters = z.infer<typeof filtersSchema>;
 export function normalizeParticipant(data: any) {
   return {
     ...data,
+    ...(data.iin ? { iinKey: data.iin } : {}),
     phoneNormalized: data.phone.replace(/\D/g, ""),
     searchTokens: [data.lastName, data.firstName, data.middleName]
       .filter(Boolean)
