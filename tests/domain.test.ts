@@ -281,3 +281,48 @@ describe("Identity IIN evidence", () => {
     expect(extractFields(text, "identity").iin).toBeUndefined();
   });
 });
+
+describe("Empty identity patronymic", () => {
+  it.each([
+    "УРАН КҮНІ / ДАТА РОЖДЕНИЯ",
+    "ТУҒАН КҮНІ / ДАТА РОЖДЕНИЯ",
+    "УРАН КҮНІ",
+    "МЕСТО РОЖДЕНИЯ",
+    "-",
+  ])(
+    "does not turn the following heading or blank marker into a patronymic: %s",
+    (next) => {
+      const fields = extractFields(
+        `ӘКЕСІНІҢ АТЫ / ОТЧЕСТВО\n${next}\n15.04.1975`,
+        "identity",
+      );
+      expect(fields.middleName).toBe("");
+    },
+  );
+  it("keeps a real patronymic and does not infer one from a name or MRZ", () => {
+    expect(
+      extractFields(
+        "ӘКЕСІНІҢ АТЫ / ОТЧЕСТВО\nСЫНАҚҰЛЫ\nТУҒАН КҮНІ / ДАТА РОЖДЕНИЯ\n15.04.1975",
+        "identity",
+      ).middleName,
+    ).toBe("СЫНАҚҰЛЫ");
+    expect(
+      extractFields(
+        "SURNAME: TEST\nGIVEN NAMES: EXAMPLE\nTEST<<EXAMPLE<<<<<<<<<<<<",
+        "identity",
+      ).middleName,
+    ).toBeUndefined();
+  });
+  it("treats a bilingual next heading as a boundary in hybrid PDF layout", () => {
+    const at = (text: string, y: number): PositionedText => ({
+      text,
+      bbox: { x0: 100, x1: 400, y0: y, y1: y + 10 },
+    });
+    expect(
+      extractIdentityLayout(
+        [at("УРАН КҮНІ / ДАТА РОЖДЕНИЯ", 125)],
+        [at("ӘКЕСІНІҢ АТЫ / ОТЧЕСТВО", 100)],
+      ),
+    ).not.toHaveProperty("middleName");
+  });
+});

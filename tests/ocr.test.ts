@@ -199,6 +199,28 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
         birthDate: "1975-04-15",
       });
     });
+    it("leaves an empty patronymic empty in a scanned identity PDF", async () => {
+      const fields = await recognize(
+        await imagePdf(
+          textImage([
+            "ЖЕКЕ КУӘЛІК / УДОСТОВЕРЕНИЕ ЛИЧНОСТИ",
+            "ТЕГІ / ФАМИЛИЯ",
+            "ҮЛГІҚЫЗЫ",
+            "АТЫ / ИМЯ",
+            "АЙГҮЛ",
+            "ӘКЕСІНІҢ АТЫ / ОТЧЕСТВО",
+            "",
+            "УРАН КҮНІ / ДАТА РОЖДЕНИЯ",
+            "15.04.1975",
+            "ЖСН / ИИН: 000123456789",
+          ]),
+        ),
+        "application/pdf",
+        "identity",
+      );
+      expect(fields.middleName).toBe("");
+      expect(fields.iin).toBe("000123456789");
+    });
     it("leaves a blank image empty", async () =>
       expect(await recognize(textImage([""]), "image/png", "identity")).toEqual(
         {},

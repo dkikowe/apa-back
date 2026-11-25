@@ -107,6 +107,29 @@ const labels = {
 const prefix = (values: string[]) =>
   new RegExp("^(?:" + values.join("|") + ")(?=\\s|[:/|–—-]|$)", "iu");
 const anyLabel = prefix(Object.values(labels).flat());
+// Either language can remain readable when OCR damages the other half of a
+// bilingual heading. Never use such a heading as the value of an empty name.
+const identityExtraLabel = prefix([
+  "ТУҒАН ЖЕРІ",
+  "МЕСТО РОЖДЕНИЯ",
+  "PLACE OF BIRTH",
+  "ҰЛТЫ",
+  "НАЦИОНАЛЬНОСТЬ",
+  "NATIONALITY",
+  "ЖЫНЫСЫ",
+  "ПОЛ",
+  "SEX",
+]);
+function isIdentityFieldLabel(value: string) {
+  return value.split(/[/|]/).some((part) => {
+    const text = part.trim();
+    return (
+      anyLabel.test(text) ||
+      identityExtraLabel.test(text) ||
+      /(?:^|\s)(?:КҮНІ|РОЖДЕНИЯ|МЕРЗІМІ)(?:\s|$)/iu.test(text)
+    );
+  });
+}
 export type PositionedText = {
   text: string;
   bbox: { x0: number; y0: number; x1: number; y1: number };
@@ -138,14 +161,14 @@ export function extractIdentityLayout(
           const gap = value.bbox.y0 - anchor.bbox.y1;
           return (
             value.text.trim() &&
-            !anyLabel.test(value.text.trim()) &&
+            !isIdentityFieldLabel(value.text.trim()) &&
             gap >= -height * 0.3 &&
             gap <= height * 5 &&
             Math.abs(value.bbox.x0 - anchor.bbox.x0) <= height * 2 &&
             ![...anchors, ...values].some(
               (other) =>
                 other !== anchor &&
-                anyLabel.test(other.text.trim()) &&
+                isIdentityFieldLabel(other.text.trim()) &&
                 other.bbox.y0 >= anchor.bbox.y1 &&
                 other.bbox.y0 < value.bbox.y0 &&
                 Math.abs(other.bbox.x0 - anchor.bbox.x0) <= height * 2,
@@ -359,7 +382,8 @@ export function extractFields(text: string, kind: string) {
     .map((v) => v.trim())
     .filter(Boolean);
   const fields: Record<string, string | number> = {};
-  function labeled(aliases: string[]) {
+  function labeled(aliases: string[], allowEmpty = false) {
+    let foundEmpty = false;
     const expression = prefix(aliases);
     for (let i = 0; i < lines.length; i++) {
       if (!expression.test(lines[i])) continue;
@@ -372,14 +396,23 @@ export function extractFields(text: string, kind: string) {
       if (/^(?:по Астане|Астана уақыты бойынша|\(Астана\))$/iu.test(value))
         value = lines[i + 2] || "";
       value = value.replace(/^по Астане\s*/iu, "");
-      if (value && !anyLabel.test(value)) return value.trim();
+      const isLabel =
+        kind === "identity"
+          ? isIdentityFieldLabel(value)
+          : anyLabel.test(value);
+      if (allowEmpty && (isLabel || /^[-–—]+$/.test(value))) {
+        foundEmpty = true;
+        continue;
+      }
+      if (value && !isLabel) return value.trim();
     }
-    return undefined;
+    return foundEmpty ? "" : undefined;
   }
   if (kind === "identity") {
     Object.assign(fields, machineReadableNames(text), identityDetails(text));
     for (const key of ["lastName", "firstName", "middleName"] as const) {
-      const value = labeled(labels[key]);
+      const value = labeled(labels[key], key === "middleName");
+      if (key === "middleName" && value === "") fields.middleName = "";
       if (!value) continue;
       const chunks = value.split(/\s*[/|]\s*/);
       // Some IDs print the Cyrillic and Latin spelling on adjacent lines
@@ -392,7 +425,7 @@ export function extractFields(text: string, kind: string) {
       const next = valueIndex >= 0 ? lines[valueIndex + 1] : undefined;
       if (
         next &&
-        !anyLabel.test(next) &&
+        !isIdentityFieldLabel(next) &&
         /^[\p{Script=Cyrillic}\s’'-]{2,100}$/u.test(value) &&
         /^[A-Za-z\s’'-]{2,100}$/.test(next)
       )
