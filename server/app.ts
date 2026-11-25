@@ -600,7 +600,9 @@ export function createApp() {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
       ownerId: req.session.adminId,
-    }).select("kind status fields error participantId mime originalName size");
+    }).select(
+      "kind status fields error participantId mime originalName size attempts",
+    );
     if (!d) throw new HttpError(404, "Құжат табылмады.");
     res.json(d);
   });
@@ -609,7 +611,7 @@ export function createApp() {
       {
         _id: checkId(req.params.id),
         ownerId: req.session.adminId,
-        status: "failed",
+        status: { $in: ["failed", "done"] },
         attempts: { $lt: 3 },
       },
       { $set: { status: "queued", error: null } },

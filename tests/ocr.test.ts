@@ -80,6 +80,29 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
         receiptNumber: "2026100",
       });
     });
+    it("reads a Kazakh receipt screenshot including number and payment source", async () => {
+      const result = await recognize(
+        textImage([
+          "Төлем жасалды",
+          "6 487 KZT",
+          'ОО Ремесленников "URSHYK"',
+          "Түбіртек № QR123456789",
+          "Сатып алушының аты-жөні Сынақ А.",
+          "Күні мен уақыты 06.08.2026 16:49",
+          "Төленді Kaspi Gold",
+        ]),
+        "image/png",
+        "receipt",
+      );
+      expect(result).toMatchObject({
+        amount: 648700,
+        receiptNumber: "QR123456789",
+        paymentDate: "2026-08-06",
+        paymentTime: "16:49",
+        method: "Kaspi Gold",
+        receiptType: "urshyk",
+      });
+    });
     it("reads Kazakh identity fields", async () => {
       expect(
         await recognize(

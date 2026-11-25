@@ -5,6 +5,7 @@ const receipt =
 describe("WhatsApp receipt text", () => {
   it.each([
     receipt,
+    receipt.replace("№ чека", "№чека"),
     "➕ Сынақ Үлгі-1956 TEST NAME 5 23 ҮЙ +7 000 000 0001 ——————————" + receipt,
     receipt.replaceAll(" ", "\n"),
   ])(

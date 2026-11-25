@@ -4,6 +4,7 @@ import { Participant, Payment, Finance } from "../models.js";
 import { memberPipeline, type Filters } from "./members.js";
 import {
   AGE_LABELS,
+  RECEIPT_TYPES,
   STATUS_LABELS,
   missingParticipantFields,
   validityPeriod,
@@ -177,6 +178,8 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Сома, ₸", key: "amount", width: 20 },
       { header: "Алушы", key: "recipientName", width: 30 },
       { header: "Төлеген адам", key: "payerName", width: 30 },
+      { header: "Чек түрі", key: "receiptTypeLabel", width: 35 },
+      { header: "Төлем тәсілі", key: "method", width: 24 },
       { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
     ];
     const members = await Participant.aggregate([
@@ -195,6 +198,9 @@ export async function makeReport(type: string, f: Filters) {
       const p: any = row.participantId;
       sheet.addRow({
         ...row,
+        receiptTypeLabel:
+          RECEIPT_TYPES[row.receiptType as keyof typeof RECEIPT_TYPES] ||
+          "Көрсетілмеген",
         name: [p.lastName, p.firstName, p.middleName].filter(Boolean).join(" "),
         amount: row.amount! / 100,
       });

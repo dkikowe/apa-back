@@ -37,7 +37,7 @@ export function receiptTextLines(items: PositionedText[]) {
 }
 export async function recognize(buffer: Buffer, mime: string, kind: string) {
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
-  const scan = async (image: Buffer) => {
+  const scan = async (image: Buffer, mode = PSM.SPARSE_TEXT) => {
     worker ??= await createWorker(
       (
         process.env.OCR_LANGUAGES ||
@@ -55,7 +55,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     await worker.setParameters({
       // Sparse mode keeps transfer label/value pairs in reading order instead
       // of concatenating the entire left column before the right column.
-      tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+      tessedit_pageseg_mode: mode,
     });
     return (
       await worker.recognize(
@@ -64,6 +64,33 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         { text: true, blocks: kind === "identity" },
       )
     ).data;
+  };
+  const scanReceipt = async (image: Buffer) => {
+    const first = await scan(image);
+    const fields = extractFields(first.text, "receipt");
+    if (
+      [
+        "amount",
+        "paymentDate",
+        "paymentTime",
+        "receiptNumber",
+        "recipientName",
+        "method",
+      ].some((key) => fields[key] === undefined)
+    ) {
+      // A second layout handles receipts whose labels and values form columns.
+      // Keep the first pass's values; only fill fields it could not read.
+      try {
+        const second = await scan(image, PSM.AUTO);
+        for (const [key, value] of Object.entries(
+          extractFields(second.text, "receipt"),
+        ))
+          if (fields[key] === undefined) fields[key] = value;
+      } catch {
+        // A failed fallback must not discard fields already read successfully.
+      }
+    }
+    return { ...first, fields };
   };
   try {
     let text = "";
@@ -117,7 +144,12 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               : Boolean(
                   layerFields.amount !== undefined &&
                   layerFields.paymentDate &&
-                  layerFields.receiptNumber,
+                  layerFields.receiptNumber &&
+                  layerFields.recipientName &&
+                  (!/Оплачено|Откуда|Төленді|Списано с|Төлем тәсілі|Payment method/iu.test(
+                    layer,
+                  ) ||
+                    layerFields.method),
                 );
           if (layer.replace(/\s/g, "").length > 40 && layerComplete) {
             text += layer + "\n";
@@ -137,9 +169,31 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             canvasContext: canvas.getContext("2d") as any,
             viewport,
           }).promise;
-          const scanned = await scan(canvas.toBuffer("image/png"));
+          const rendered = canvas.toBuffer("image/png");
+          let scanned;
+          try {
+            scanned =
+              kind === "receipt"
+                ? await scanReceipt(rendered)
+                : await scan(rendered);
+          } catch (error) {
+            if (
+              kind !== "receipt" ||
+              layerFields.amount === undefined ||
+              !layerFields.paymentDate
+            )
+              throw error;
+            text += layer + "\n";
+            Object.assign(nativeFields, layerFields);
+            continue;
+          }
           text += scanned.text + "\n";
-          if (kind === "receipt") Object.assign(nativeFields, layerFields);
+          if (kind === "receipt")
+            Object.assign(
+              nativeFields,
+              "fields" in scanned ? scanned.fields : {},
+              layerFields,
+            );
           if (kind === "identity") {
             const values: PositionedText[] = content.items.flatMap((item) => {
               if (
@@ -183,17 +237,18 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         await pdf.loadingTask.destroy();
       }
     } else {
-      text = (
-        await scan(
-          await sharp(buffer, { limitInputPixels: 25000000 })
-            .rotate()
-            .resize({ width: 2400, withoutEnlargement: true })
-            .grayscale()
-            .normalize()
-            .png()
-            .toBuffer(),
-        )
-      ).text;
+      const image = await sharp(buffer, { limitInputPixels: 25000000 })
+        .rotate()
+        .resize({ width: 2400, height: 3200, fit: "inside" })
+        .grayscale()
+        .normalize()
+        .png()
+        .toBuffer();
+      if (kind === "receipt") {
+        const scanned = await scanReceipt(image);
+        text = scanned.text;
+        Object.assign(nativeFields, scanned.fields);
+      } else text = (await scan(image)).text;
     }
     return { ...extractFields(text, kind), ...nativeFields };
   } finally {

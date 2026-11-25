@@ -48,6 +48,11 @@ const payment = new Schema(
     amount: Number,
     paymentDate: String,
     paymentTime: { type: String, default: "" },
+    receiptType: {
+      type: String,
+      enum: ["", "personal", "urshyk"],
+      default: "",
+    },
     receiptText: { type: String, default: "" },
     recipientName: String,
     payerName: { type: String, default: "" },

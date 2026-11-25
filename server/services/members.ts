@@ -99,9 +99,9 @@ export function memberPipeline(
           $switch: {
             branches: [
               { case: { $eq: ["$age", null] }, then: null },
-              { case: { $lt: ["$age", 25] }, then: 0 },
-              { case: { $lt: ["$age", 45] }, then: 1 },
-              { case: { $lt: ["$age", 65] }, then: 2 },
+              { case: { $lt: ["$age", 26] }, then: 0 },
+              { case: { $lt: ["$age", 46] }, then: 1 },
+              { case: { $lt: ["$age", 66] }, then: 2 },
             ],
             default: 3,
           },
@@ -128,8 +128,13 @@ export function memberPipeline(
             },
           },
           {
+            $sort: { paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 },
+          },
+          {
             $group: {
               _id: null,
+              lastRecipientName: { $first: "$recipientName" },
+              lastReceiptType: { $first: "$receiptType" },
               total: { $sum: "$amount" },
               lastPaymentAt: {
                 $max: {
@@ -148,6 +153,12 @@ export function memberPipeline(
     },
     {
       $addFields: {
+        lastRecipientName: {
+          $ifNull: [{ $first: "$paymentTotals.lastRecipientName" }, ""],
+        },
+        lastReceiptType: {
+          $ifNull: [{ $first: "$paymentTotals.lastReceiptType" }, ""],
+        },
         totalPaid: { $ifNull: [{ $first: "$paymentTotals.total" }, 0] },
         lastPaymentAt: {
           $ifNull: [{ $first: "$paymentTotals.lastPaymentAt" }, ""],

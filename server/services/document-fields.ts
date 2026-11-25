@@ -55,6 +55,7 @@ const labels = {
     "AMOUNT",
   ],
   paymentDate: [
+    "КҮНІ МЕН УАҚЫТЫ",
     "ДАТА И ВРЕМЯ",
     "ДАТАИ ВРЕМЯ",
     "ДАТА ПЛАТЕЖА",
@@ -66,6 +67,8 @@ const labels = {
   ],
   recipientName: ["ПОЛУЧАТЕЛЬ", "АЛУШЫ", "RECIPIENT"],
   payerName: [
+    "САТЫП АЛУШЫНЫҢ АТЫ-ЖӨНІ",
+    "САТЫП АЛУШЫНЫҢ АТЫ ЖӨНІ",
     "ФИО ПОКУПАТЕЛЯ",
     "ОТПРАВИТЕЛЬ",
     "ПЛАТЕЛЬЩИК",
@@ -87,8 +90,19 @@ const labels = {
     "TRANSACTION ID",
     "RECEIPT NUMBER",
     "ЧЕК №",
+    "КВИТАНЦИЯ №",
+    "ТҮБІРТЕК НӨМІРІ",
+    "ТҮБІРТЕК №",
   ],
-  method: ["СПОСОБ ОПЛАТЫ", "ТӨЛЕМ ТӘСІЛІ", "PAYMENT METHOD", "ОПЛАЧЕНО"],
+  method: [
+    "СПОСОБ ОПЛАТЫ",
+    "ТӨЛЕМ ТӘСІЛІ",
+    "PAYMENT METHOD",
+    "ОПЛАЧЕНО",
+    "ОТКУДА",
+    "ТӨЛЕНДІ",
+    "СПИСАНО С",
+  ],
 };
 const prefix = (values: string[]) =>
   new RegExp("^(?:" + values.join("|") + ")(?=\\s|[:/|–—-]|$)", "iu");
@@ -260,7 +274,13 @@ export function identityDetails(text: string) {
   }
   return result;
 }
+function normalizeReceiptLabels(text: string) {
+  return text
+    .replace(/(?:№|N[oо°]?\.?)[ \t]*(чека|квитанции)/giu, "№ $1")
+    .replace(/№[ \t]*\n[ \t]*(чека|квитанции)/giu, "№ $1");
+}
 export function extractFields(text: string, kind: string) {
+  if (kind === "receipt") text = normalizeReceiptLabels(text);
   const lines = text
     .normalize("NFC")
     // Halyk wraps the label around the value in narrow receipt columns.
@@ -279,7 +299,7 @@ export function extractFields(text: string, kind: string) {
         value = value.replace(expression, "").replace(/^[\s:/|]+/, "");
       if (!value) value = lines[i + 1] || "";
       // Some receipts put timezone wording between the date label and value.
-      if (/^(?:по Астане|Астана уақыты бойынша)$/iu.test(value))
+      if (/^(?:по Астане|Астана уақыты бойынша|\(Астана\))$/iu.test(value))
         value = lines[i + 2] || "";
       value = value.replace(/^по Астане\s*/iu, "");
       if (value && !anyLabel.test(value)) return value.trim();
@@ -368,7 +388,7 @@ export function extractFields(text: string, kind: string) {
     // Never use the merchant IIN, a card number, or an arbitrary unlabeled number.
     if (fields.amount === undefined) {
       const success = lines.findIndex((line) =>
-        /^(?:Оплата совершена|Плат[её]ж выполнен|Перевод выполнен успешно|Перевод успешно соверш[её]н|Перевод успешно совер\.{3}|Төлем жасалды|Төлем сәтті орындалды)$/iu.test(
+        /^(?:Оплата совершена|Плат[её]ж выполнен|Перевод выполнен успешно|Перевод успешно соверш[её]н|Перевод успешно совер\.{3}|Т[өео]лем жасалды|Төлем сәтті орындалды)$/iu.test(
           line,
         ),
       );
@@ -411,7 +431,7 @@ export function extractFields(text: string, kind: string) {
       if (time) fields.paymentTime = time[0];
       break;
     }
-    for (const key of ["recipientName", "receiptNumber", "method"] as const) {
+    for (const key of ["recipientName"] as const) {
       const value = labeled(labels[key]);
       if (value)
         fields[key] = value.slice(0, key === "recipientName" ? 200 : 150);
@@ -430,28 +450,68 @@ export function extractFields(text: string, kind: string) {
         )?.[1] || payer;
       if (/^[\p{L}\s.’'-]{2,200}$/u.test(name)) fields.payerName = name;
     }
-    // Long transfer numbers wrap onto a second line; retain them as strings.
+    // Receipt identifiers are strings, including QR prefixes and leading zeros.
+    // Join wrapped fragments only within the labelled number block.
     for (let i = 0; i < lines.length; i++) {
       if (!prefix(labels.receiptNumber).test(lines[i])) continue;
       let number = lines[i]
         .replace(prefix(labels.receiptNumber), "")
-        .replace(/^[\s:]+/, "");
+        .replace(/^[\s:#№]+/, "");
       let next = i + 1;
       if (!number) number = lines[next++] || "";
-      if (/^\d+$/.test(number)) {
+      if (/^(?:QR\s*)?[\d\s]+$/i.test(number) || /^QR$/i.test(number)) {
+        number = number.replace(/\s/g, "");
         while (
           next < lines.length &&
-          /^\d+$/.test(lines[next]) &&
-          number.length + lines[next].length <= 40
+          /^\d[\d ]*$/.test(lines[next]) &&
+          number.length + lines[next].replace(/ /g, "").length <= 40
         )
-          number += lines[next++];
-        fields.receiptNumber = number;
+          number += lines[next++].replace(/ /g, "");
       }
+      if (
+        /^[A-Za-z0-9][A-Za-z0-9_/-]{2,149}$/.test(number) &&
+        /[\d_/-]/.test(number)
+      )
+        fields.receiptNumber = number;
+      if (fields.receiptNumber) break;
     }
-    if (!fields.method) {
-      const source = labeled(["ОТКУДА"]);
-      if (source && /^(?:с\s+)?(?:Kaspi Gold|Halyk)(?:\s|$)/iu.test(source))
-        fields.method = source;
+    if (!fields.receiptNumber) {
+      const candidates = lines.filter((line) =>
+        /^QR\s*\d[\d ]{5,39}$/i.test(line),
+      );
+      if (candidates.length === 1)
+        fields.receiptNumber = candidates[0].replace(/\s/g, "").toUpperCase();
+    }
+    const source = labeled(labels.method);
+    if (
+      source &&
+      /[\p{L}]/u.test(source) &&
+      !/^(?:Адрес|Комиссия|Сообщение|ИИН|БИН)(?=\s|:|$)/iu.test(source)
+    ) {
+      let method = source;
+      const sourceIndex = lines.findIndex(
+        (line) =>
+          line === source ||
+          (prefix(labels.method).test(line) && line.endsWith(source)),
+      );
+      let next = sourceIndex + 1;
+      if (
+        /^с$/iu.test(method) &&
+        /^(?:Kaspi|Каспи|Halyk)/iu.test(lines[next] || "")
+      )
+        method += " " + lines[next++];
+      if (
+        /^(?:с\s+)?(?:Kaspi|Каспи)$/iu.test(method) &&
+        /^(?:Gold|GoId|Голд|Red|Ред|Pay|Депозит|Депозита)$/iu.test(
+          lines[next] || "",
+        )
+      )
+        method += " " + lines[next];
+      method = method.replace(
+        /(?:Kaspi|Каспи|Каspi)\s+(?:Gold|GoId|Gоld|Голд)/giu,
+        "Kaspi Gold",
+      );
+      fields.method = method.slice(0, 100);
     }
     if (!fields.recipientName && fields.amount !== undefined) {
       const amountIndex = lines.findIndex(
@@ -488,12 +548,22 @@ export function extractFields(text: string, kind: string) {
   if (
     kind === "receipt" &&
     !fields.recipientName &&
-    /Оплата совершена|Төлем жасалды/iu.test(text)
+    /Оплата совершена|Т[өео]лем жасалды/iu.test(text)
   ) {
     const merchants = lines
       .map((line) => line.replace(/^[оoОO0]\s+(?=ИП|ТОО|ЖК|ЖШС)/u, ""))
       .filter((line) => /^(?:ИП|ТОО|ЖК|ЖШС)\s+.{2,190}$/u.test(line));
     if (merchants.length === 1) fields.recipientName = merchants[0];
+  }
+  if (kind === "receipt") {
+    const recipient = String(fields.recipientName || "");
+    if (/URSHYK|ҰРШЫҚ|УРШЫК/iu.test(recipient)) fields.receiptType = "urshyk";
+    else if (
+      /^[\p{L}’'-]+(?:\s+[\p{L}’'-]+)*\s+[\p{L}]\.(?:\s*[\p{L}]\.)?$/u.test(
+        recipient,
+      )
+    )
+      fields.receiptType = "personal";
   }
   return fields;
 }
@@ -501,9 +571,12 @@ export function extractFields(text: string, kind: string) {
 // WhatsApp can flatten a receipt into one line and prepend unrelated profile
 // details. Rebuild labeled receipt lines without treating that preamble as money.
 export function extractReceiptText(message: string) {
-  message = message.normalize("NFC").replace(/\s+/g, " ").trim();
+  message = normalizeReceiptLabels(message)
+    .normalize("NFC")
+    .replace(/\s+/g, " ")
+    .trim();
   const success =
-    /Оплата совершена|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Төлем жасалды|Төлем сәтті орындалды/giu;
+    /Оплата совершена|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Т[өео]лем жасалды|Төлем сәтті орындалды/giu;
   const matches = [...message.matchAll(success)];
   if (matches.length > 1)
     throw new Error("Бір уақытта бір чектің мәтінін ғана қойыңыз.");

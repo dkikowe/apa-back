@@ -77,6 +77,7 @@ describe("bank transfer receipt variants", () => {
       paymentTime: "15:08",
       receiptNumber: "3503000001",
       recipientName: "Үлгі Б.",
+      receiptType: "personal",
       payerName: "Сынақ А.",
     });
   });
@@ -111,6 +112,7 @@ describe("bank transfer receipt variants", () => {
       paymentTime: "10:34",
       receiptNumber: "895900000000000001",
       recipientName: "Үлгі Б.",
+      receiptType: "personal",
       payerName: "Сынақ А.",
       method: "Kaspi Gold",
     });
@@ -160,4 +162,72 @@ it("reads a full payer name with Kazakh letters", () => {
   expect(
     extractFields("Төлеуші: Сынақ Үлгі Айгүлқызы", "receipt").payerName,
   ).toBe("Сынақ Үлгі Айгүлқызы");
+});
+
+describe("receipt number and payment source variants", () => {
+  it.each([
+    ["№чека: QR 123456789", "QR123456789"],
+    ["№\nчека\nQR\n123456789", "QR123456789"],
+    ["№ квитанции\n001 234 567\n890", "001234567890"],
+    ["QR123456789", "QR123456789"],
+    ["Чек нөмірі: 001234567", "001234567"],
+  ])("reads %s", (text, expected) => {
+    expect(extractFields(text, "receipt").receiptNumber).toBe(expected);
+  });
+  it.each([
+    ["Оплачено с\nKaspi\nGold", "с Kaspi Gold"],
+    ["Откуда\nKaspi\nGold", "Kaspi Gold"],
+    ["Оплачено с Kaspi Red", "с Kaspi Red"],
+    ["Откуда Halyk Bonus", "Halyk Bonus"],
+    ["Төлем тәсілі Қолма-қол", "Қолма-қол"],
+    ["Откуда Kaspi GoId", "Kaspi Gold"],
+  ])("keeps the printed source for %s", (text, expected) => {
+    expect(extractFields(text, "receipt").method).toBe(expected);
+  });
+  it("does not use a seller IIN, masked card or a later field as a receipt number", () => {
+    for (const text of [
+      "№ чека\nИИН/БИН продавца 000000000001",
+      "ИИН 000000000001",
+      "№ чека\n**** 1234",
+      "№ чека\nОплачено с Kaspi Gold",
+    ])
+      expect(extractFields(text, "receipt").receiptNumber).toBeUndefined();
+  });
+  it("classifies URSHYK only from the printed recipient", () => {
+    expect(
+      extractFields('Получатель ОО Ремесленников "URSHYK"', "receipt")
+        .receiptType,
+    ).toBe("urshyk");
+    expect(
+      extractFields("Сообщение URSHYK", "receipt").receiptType,
+    ).toBeUndefined();
+  });
+});
+
+it("reads the Kazakh Kaspi labels for the receipt, buyer and source", () => {
+  expect(
+    extractFields(
+      [
+        "Төлем жасалды",
+        "6 487 ₸",
+        'ОО Ремесленников "URSHYK"',
+        "Түбіртек № QR123456789",
+        "Сатушының ЖСН/БСН 000000000001",
+        "Сатып алушының аты-жөні Сынақ А.",
+        "Күні мен уақыты",
+        "(Астана)",
+        "06.08.2026 16:49",
+        "Төленді Kaspi Gold",
+      ].join("\n"),
+      "receipt",
+    ),
+  ).toMatchObject({
+    amount: 648700,
+    receiptNumber: "QR123456789",
+    payerName: "Сынақ А.",
+    paymentDate: "2026-08-06",
+    paymentTime: "16:49",
+    method: "Kaspi Gold",
+    receiptType: "urshyk",
+  });
 });

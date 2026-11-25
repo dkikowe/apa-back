@@ -1053,22 +1053,120 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       ["asc", [ids[2], ids[1], ids[0], ids[3]]],
     ] as const) {
       for (let page = 1; page <= 4; page++) {
-        const result = await agent
-          .get("/api/participants")
-          .query({
-            year: 2026,
-            q: "УақытРетіСынақ",
-            sort: "paymentTime",
-            direction,
-            page,
-            limit: 1,
-          });
+        const result = await agent.get("/api/participants").query({
+          year: 2026,
+          q: "УақытРетіСынақ",
+          sort: "paymentTime",
+          direction,
+          page,
+          limit: 1,
+        });
         expect(result.status).toBe(200);
         expect(result.body.total).toBe(4);
         expect(result.body.items[0]._id).toBe(expected[page - 1]);
         expect(result.body.items[0].lastNameLatin).toBe("ORDERTEST");
       }
     }
+  });
+  it("uses the new inclusive age boundaries in list filters", async () => {
+    const { today } = await import("../shared/domain.js");
+    const year = Number(today().slice(0, 4));
+    for (const [age, group] of [
+      [25, 0],
+      [26, 1],
+      [45, 1],
+      [46, 2],
+      [65, 2],
+      [66, 3],
+    ]) {
+      const r = await post("/api/participants", {
+        lastName: "ЖасШекараСынақ",
+        firstName: String(age),
+        birthDate: `${year - age}-01-01`,
+      });
+      expect(r.status).toBe(201);
+      const result = await agent
+        .get("/api/participants")
+        .query({ q: "ЖасШекараСынақ", age: String(group) });
+      expect(
+        result.body.items.some(
+          (p: any) => p._id === r.body._id && p.ageGroup === group,
+        ),
+      ).toBe(true);
+    }
+  });
+  it("stores receipt type and exposes the latest active recipient for the selected year", async () => {
+    const p = await post("/api/participants", {
+      lastName: "АлушыСынақ",
+      firstName: "Үлгі",
+    });
+    const first = await post(`/api/participants/${p.body._id}/payments`, {
+      ...base,
+      receiptNumber: "RECIPIENT-OLD",
+      paymentDate: "2026-01-01",
+      recipientName: "Ескі алушы",
+      receiptType: "personal",
+      method: "Kaspi Gold",
+    });
+    expect(first.status).toBe(201);
+    expect(first.body.receiptType).toBe("personal");
+    const newer = await post(`/api/participants/${p.body._id}/payments`, {
+      ...base,
+      receiptNumber: "RECIPIENT-NEW",
+      paymentDate: "2026-02-01",
+      recipientName: "Жаңа алушы",
+      receiptType: "urshyk",
+    });
+    expect(newer.status).toBe(201);
+    const query = () =>
+      agent.get("/api/participants").query({ q: "АлушыСынақ", year: 2026 });
+    expect((await query()).body.items[0]).toMatchObject({
+      lastRecipientName: "Жаңа алушы",
+      lastReceiptType: "urshyk",
+    });
+    await post(`/api/payments/${newer.body._id}/void`, {});
+    expect((await query()).body.items[0]).toMatchObject({
+      lastRecipientName: "Ескі алушы",
+      lastReceiptType: "personal",
+    });
+    expect(
+      (
+        await agent
+          .get("/api/participants")
+          .query({ q: "АлушыСынақ", year: 2027 })
+      ).body.items[0].lastRecipientName,
+    ).toBe("");
+  });
+  it("allows retrying incomplete recognition, but not concurrent or unauthorized jobs", async () => {
+    const { Document, Admin } = await import("../server/models.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const doc = await Document.create({
+      kind: "receipt",
+      status: "done",
+      ownerId: owner!._id,
+      attempts: 1,
+      fields: { amount: 100 },
+    });
+    expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
+      200,
+    );
+    expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
+      400,
+    );
+    await Document.updateOne(
+      { _id: doc._id },
+      { $set: { status: "done", attempts: 3 } },
+    );
+    expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
+      400,
+    );
+    await Document.updateOne(
+      { _id: doc._id },
+      { $set: { attempts: 1, ownerId: new mongoose.Types.ObjectId() } },
+    );
+    expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
+      400,
+    );
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
