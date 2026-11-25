@@ -249,3 +249,35 @@ it("retains original Latin spelling when OCR inserts spaces in an MRZ line", () 
     extractFields("ULGIKYZY << AIGUL <<<<<<<<<<<<<<<<<<<<", "identity"),
   ).toMatchObject({ lastNameLatin: "ULGIKYZY", firstNameLatin: "AIGUL" });
 });
+
+describe("Identity IIN evidence", () => {
+  it("reads the printed IIN when a faded title is missing but the birth label and machine row remain", () => {
+    expect(
+      extractFields(
+        "Дата рождения\n15.04.1975\n000123456789\n000001KAZ7504150F3001010123456<0",
+        "identity",
+      ).iin,
+    ).toBe("000123456789");
+  });
+  it.each([
+    "ЖСН / ИИН: 000 123 456 789",
+    "IIN\n000123\n456789",
+    "ЖЕКЕ КУӘЛІК\n000 123 456 789",
+    "SURNAME: TEST\nDATE OF BIRTH: 15.04.1975\n000123456789",
+    "SURNAME: TEST\nDATE OF BIRTH: 15.04.1975\nІМ: 000123456789",
+  ])("reads spacing and labelled line breaks: %s", (text) => {
+    expect(extractFields(text, "identity").iin).toBe("000123456789");
+  });
+  it.each([
+    "IIN: 000123456789\nIIN: 999123456789",
+    "ЖЕКЕ КУӘЛІК\n000123456789\n999123456789",
+    "IIN: 0001234567890",
+    "IIN: 00012345O789",
+    "ІМ: 000123456789",
+    "SURNAME: TEST\nDATE OF BIRTH: 15.04.1975\nТелефон: 000123456789",
+    "000123456789\n001234567",
+    "Оплата совершена\n6 487 ₸\n№ чека QR123456789\nИИН/БИН продавца 000123456789",
+  ])("does not guess or use conflicting/non-identity digits: %s", (text) => {
+    expect(extractFields(text, "identity").iin).toBeUndefined();
+  });
+});

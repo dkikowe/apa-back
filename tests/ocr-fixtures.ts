@@ -101,3 +101,14 @@ export async function hybridIdentityPdf() {
     "\nBT /F1 16 Tf 40 120 Td (ULGIKYZY<<AIGUL<<<<<<<<<<<<<<<<<<<<) Tj ET";
   return imagePdf(canvas.toBuffer("image/png"), false, overlay);
 }
+
+// The PDF text layer has complete names/date, but the IIN exists only as pixels.
+export async function mixedIdentityIinPdf() {
+  return imagePdf(
+    textImage(["IIN: 000123456789"]),
+    false,
+    "\nBT /F1 16 Tf 40 65 Td (SURNAME: ULGIKYZY) Tj ET" +
+      "\nBT /F1 16 Tf 40 45 Td (GIVEN NAMES: AIGUL) Tj ET" +
+      "\nBT /F1 16 Tf 40 25 Td (DATE OF BIRTH: 15.04.1975) Tj ET",
+  );
+}

@@ -236,14 +236,84 @@ export function receiptAmount(raw: string) {
     return undefined;
   }
 }
+function hasIdentityContext(text: string) {
+  if (
+    /ЖЕКЕ\s+КУ[ӘА]ЛІК|УДОСТОВЕРЕНИЕ\s+ЛИЧНОСТИ|IDENTITY\s+(?:CARD|DOCUMENT)/iu.test(
+      text,
+    )
+  )
+    return true;
+  const hasBirthLabel = /ДАТА\s+РОЖДЕНИЯ|ТУҒАН\s+КҮНІ|DATE\s+OF\s+BIRTH/iu.test(
+    text,
+  );
+  const hasNameLabel = /ТЕГІ|ФАМИЛИЯ|SURNAME|GIVEN\s+NAMES/iu.test(text);
+  // Older cards have an unlabelled IIN above the machine-readable zone.
+  // OCR can miss the faded title while retaining the birth label and KAZ row.
+  const hasMachineRow = text
+    .split(/\r?\n/)
+    .some((line) =>
+      /[A-Z0-9<]{5,}KAZ[A-Z0-9<]{10,}/.test(line.replace(/\s/g, "")),
+    );
+  return hasBirthLabel && (hasNameLabel || hasMachineRow);
+}
+export function isReceiptInsteadOfIdentity(text: string) {
+  return (
+    !hasIdentityContext(text) &&
+    /Оплата совершена|Т[өео]лем жасалды|Перевод (?:успешно|выполнен)|Плат[её]ж выполнен/iu.test(
+      text,
+    ) &&
+    /№\s*(?:чека|квитанции)|Түбіртек\s*№|ФИО\s+покупателя|ИИН\s*[/]\s*БИН/iu.test(
+      text,
+    )
+  );
+}
+export function identityIinCandidates(text: string) {
+  if (isReceiptInsteadOfIdentity(text)) return [];
+  const lines = text
+    .normalize("NFC")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const candidates = new Set<string>();
+  const accept = (value: string) => {
+    // Only printed digits and spaces. Never repair letters or invent digits.
+    if (/^\d[\d \t\u00a0]*$/.test(value)) {
+      const digits = value.replace(/\s/g, "");
+      if (/^\d{12}$/.test(digits)) candidates.add(digits);
+    }
+  };
+  // Mixed Kazakh/Latin OCR can read the IIN heading as «ІМ» or «ІІН».
+  // Accept those heading shapes only within an established identity context.
+  const label = hasIdentityContext(text)
+    ? /^(?:ЖСН|ИИН|IIN|[IІl1|И]{1,3}[NИHМMН])(?=\s|[:/|–—-]|$)/iu
+    : prefix(labels.iin);
+  for (let i = 0; i < lines.length; i++) {
+    if (!label.test(lines[i])) continue;
+    let value = lines[i];
+    while (label.test(value))
+      value = value.replace(label, "").replace(/^[\s:/|]+/, "");
+    let next = i + 1;
+    if (!value) value = lines[next++] || "";
+    if (/^\d[\d \t]*$/.test(value)) {
+      while (
+        value.replace(/\s/g, "").length < 12 &&
+        next < lines.length &&
+        /^\d[\d \t]*$/.test(lines[next])
+      )
+        value += " " + lines[next++];
+    }
+    accept(value);
+  }
+  if (hasIdentityContext(text)) for (const line of lines) accept(line);
+  return [...candidates];
+}
 export function identityDetails(text: string) {
   const result: Record<string, string> = {};
-  if (!/ЖЕКЕ\s+КУ[ӘА]ЛІК|УДОСТОВЕРЕНИЕ\s+ЛИЧНОСТИ/iu.test(text)) return result;
+  const iins = identityIinCandidates(text);
+  if (iins.length === 1) result.iin = iins[0];
+  if (!hasIdentityContext(text)) return result;
   const lines = text.split(/\r?\n/).map((v) => v.trim());
-  for (const [key, length] of [
-    ["iin", 12],
-    ["documentNumber", 9],
-  ] as const) {
+  for (const [key, length] of [["documentNumber", 9]] as const) {
     const values = [
       ...new Set(
         lines.filter((line) => new RegExp(`^\\d{${length}}$`).test(line)),
@@ -343,7 +413,6 @@ export function extractFields(text: string, kind: string) {
       if (value && /^[A-Za-z\s’'-]{2,100}$/.test(value)) fields[key] = value;
     }
     for (const key of [
-      "iin",
       "documentNumber",
       "issuedBy",
       "issueDate",
@@ -365,9 +434,6 @@ export function extractFields(text: string, kind: string) {
           const date = dateValue(value);
           if (date && !fields[key]) fields[key] = date;
         }
-      } else if (key === "iin") {
-        const number = value.replace(/\s/g, "");
-        if (/^\d{12}$/.test(number)) fields[key] = number;
       } else if (key === "documentNumber") {
         const number = value.replace(/^№\s*/, "");
         if (/^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(number)) fields[key] = number;

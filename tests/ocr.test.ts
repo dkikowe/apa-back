@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
 import sharp from "sharp";
-import { recognize } from "../server/services/ocr.js";
+import { recognize, WrongDocumentKindError } from "../server/services/ocr.js";
 import {
   textImage,
   textPdf,
   imagePdf,
   hybridIdentityPdf,
+  mixedIdentityIinPdf,
 } from "./ocr-fixtures.js";
 const receipt = [
   "SYNTHETIC RECEIPT",
@@ -19,6 +20,7 @@ const identity = [
   "SURNAME: ULGIKYZY",
   "GIVEN NAMES: AIGUL",
   "DATE OF BIRTH: 15.04.1975",
+  "IIN: 000123456789",
 ];
 describe("PDF text extraction", () => {
   it("reads a receipt without image OCR", async () =>
@@ -47,6 +49,53 @@ describe("PDF text extraction", () => {
 describe.runIf(process.env.RUN_OCR_TESTS === "1")(
   "Real local Tesseract, synthetic documents only",
   () => {
+    it("does not merge conflicting IINs from a text layer", async () => {
+      const fields = await recognize(
+        textPdf([...identity, "IIN: 999123456789"]),
+        "application/pdf",
+        "identity",
+      );
+      expect(fields.iin).toBeUndefined();
+    });
+    it("reads a raster IIN even when native names and date are complete", async () => {
+      expect(
+        await recognize(
+          await mixedIdentityIinPdf(),
+          "application/pdf",
+          "identity",
+        ),
+      ).toMatchObject({
+        iin: "000123456789",
+        lastNameLatin: "ULGIKYZY",
+        firstNameLatin: "AIGUL",
+        birthDate: "1975-04-15",
+      });
+    });
+    it("reads an unlabelled IIN with faded title context in a photo", async () => {
+      const photo = textImage([
+        "Дата рождения",
+        "15.04.1975",
+        "000123456789",
+        "000001KAZ7504150F3001010123456<0",
+      ]);
+      expect((await recognize(photo, "image/png", "identity")).iin).toBe(
+        "000123456789",
+      );
+    });
+    it("explains when a receipt is uploaded as an identity document", async () => {
+      await expect(
+        recognize(
+          textImage([
+            "Оплата совершена",
+            "6 487 KZT",
+            "№ чека QR123456789",
+            "ИИН/БИН продавца 000123456789",
+          ]),
+          "image/png",
+          "identity",
+        ),
+      ).rejects.toBeInstanceOf(WrongDocumentKindError);
+    });
     it("reads PNG receipt with grouped money", async () =>
       expect(
         await recognize(textImage(receipt), "image/png", "receipt"),

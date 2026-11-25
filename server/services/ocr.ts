@@ -5,6 +5,8 @@ import {
   extractFields,
   extractIdentityLayout,
   identityDetails,
+  identityIinCandidates,
+  isReceiptInsteadOfIdentity,
   machineReadableNames,
   type PositionedText,
 } from "./document-fields.js";
@@ -34,6 +36,14 @@ export function receiptTextLines(items: PositionedText[]) {
         .join(" "),
     )
     .join("\n");
+}
+export class WrongDocumentKindError extends Error {
+  constructor() {
+    super(
+      "Куәліктің орнына чек жүктелген. Жеке куәлікті таңдаңыз. Чекті «Төлем қосу» бөлімінде жүктеңіз.",
+    );
+    this.name = "WrongDocumentKindError";
+  }
 }
 export async function recognize(buffer: Buffer, mime: string, kind: string) {
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
@@ -92,9 +102,42 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     }
     return { ...first, fields };
   };
+  const scanIdentity = async (image: Buffer) => {
+    const first = await scan(image);
+    if (isReceiptInsteadOfIdentity(first.text))
+      throw new WrongDocumentKindError();
+    const fields = extractFields(first.text, "identity");
+    let text = first.text;
+    let blocks = first.blocks;
+    if (
+      !fields.iin ||
+      !(fields.lastName || fields.lastNameLatin) ||
+      !(fields.firstName || fields.firstNameLatin) ||
+      !fields.birthDate
+    ) {
+      try {
+        const second = await scan(image, PSM.AUTO);
+        if (isReceiptInsteadOfIdentity(second.text))
+          throw new WrongDocumentKindError();
+        text += "\n" + second.text;
+        blocks = [...(blocks || []), ...(second.blocks || [])];
+        for (const [key, value] of Object.entries(
+          extractFields(second.text, "identity"),
+        ))
+          if (fields[key] === undefined) fields[key] = value;
+      } catch (error) {
+        if (error instanceof WrongDocumentKindError) throw error;
+      }
+    }
+    const iins = identityIinCandidates(text);
+    delete fields.iin;
+    if (iins.length === 1) fields.iin = iins[0];
+    return { ...first, text, blocks, fields };
+  };
   try {
     let text = "";
     const nativeFields: Record<string, string | number> = {};
+    const identitySources: string[] = [];
     if (mime === "application/pdf") {
       const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
       const pdf = await getDocument({
@@ -131,6 +174,11 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               ),
             );
           }
+          if (kind === "identity") {
+            if (isReceiptInsteadOfIdentity(layer))
+              throw new WrongDocumentKindError();
+            identitySources.push(layer);
+          }
           const layerFields = extractFields(layer, kind);
           const layerComplete =
             kind === "identity"
@@ -139,7 +187,8 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
                   (layerFields.firstName || layerFields.firstNameLatin) &&
                   layerFields.lastNameLatin &&
                   layerFields.firstNameLatin &&
-                  layerFields.birthDate,
+                  layerFields.birthDate &&
+                  layerFields.iin,
                 )
               : Boolean(
                   layerFields.amount !== undefined &&
@@ -175,14 +224,14 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             scanned =
               kind === "receipt"
                 ? await scanReceipt(rendered)
-                : await scan(rendered);
+                : await scanIdentity(rendered);
           } catch (error) {
-            if (
-              kind !== "receipt" ||
-              layerFields.amount === undefined ||
-              !layerFields.paymentDate
-            )
-              throw error;
+            if (error instanceof WrongDocumentKindError) throw error;
+            const usableLayer =
+              kind === "identity"
+                ? Object.keys(layerFields).length > 0
+                : layerFields.amount !== undefined && !!layerFields.paymentDate;
+            if (!usableLayer) throw error;
             text += layer + "\n";
             Object.assign(nativeFields, layerFields);
             continue;
@@ -195,6 +244,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               layerFields,
             );
           if (kind === "identity") {
+            identitySources.push(scanned.text);
             const values: PositionedText[] = content.items.flatMap((item) => {
               if (
                 !("str" in item) ||
@@ -226,6 +276,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               ) || [];
             Object.assign(
               nativeFields,
+              "fields" in scanned ? scanned.fields : {},
               layerFields,
               identityDetails(layer + "\n" + scanned.text),
               extractIdentityLayout(values, anchors),
@@ -248,9 +299,23 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         const scanned = await scanReceipt(image);
         text = scanned.text;
         Object.assign(nativeFields, scanned.fields);
-      } else text = (await scan(image)).text;
+      } else {
+        const scanned = await scanIdentity(image);
+        text = scanned.text;
+        identitySources.push(text);
+        Object.assign(nativeFields, scanned.fields);
+      }
     }
-    return { ...extractFields(text, kind), ...nativeFields };
+    const result = { ...extractFields(text, kind), ...nativeFields };
+    if (kind === "identity") {
+      const candidates = new Set(
+        identityIinCandidates(identitySources.join("\n")),
+      );
+      if (typeof result.iin === "string") candidates.add(result.iin);
+      delete result.iin;
+      if (candidates.size === 1) result.iin = [...candidates][0];
+    }
+    return result;
   } finally {
     await worker?.terminate();
   }

@@ -2,7 +2,7 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import { connect, Document } from "./models.js";
 import { storage } from "./services/storage.js";
-import { recognize } from "./services/ocr.js";
+import { recognize, WrongDocumentKindError } from "./services/ocr.js";
 await connect();
 let stopped = false;
 process.on("SIGTERM", () => {
@@ -48,13 +48,16 @@ while (!stopped) {
       { _id: job._id },
       { $set: { status: "done", fields, completedAt: new Date() } },
     );
-  } catch {
+  } catch (error) {
     await Document.updateOne(
       { _id: job._id },
       {
         $set: {
           status: "failed",
-          error: "Құжат оқылмады. Мәліметтерді қолмен толтыра аласыз.",
+          error:
+            error instanceof WrongDocumentKindError
+              ? error.message
+              : "Құжат оқылмады. Мәліметтерді қолмен толтыра аласыз.",
           completedAt: new Date(),
         },
       },
