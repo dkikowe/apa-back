@@ -1311,7 +1311,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       (await post("/api/participants", { firstName: "ТолықЕмес" })).status,
     ).toBe(201);
   });
-  it("rejects an already uploaded file before storage, even if the filename changes", async () => {
+  it("automatically reuses an unfinished upload without another storage write", async () => {
     const sharp = (await import("sharp")).default;
     const { storage } = await import("../server/services/storage.js");
     const put = vi.spyOn(storage, "put").mockResolvedValue();
@@ -1331,10 +1331,11 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       const original = await upload("original.png");
       expect(original.status).toBe(201);
       const again = await upload("renamed.png");
-      expect(again.status).toBe(409);
+      expect(again.status).toBe(200);
       expect(again.body).toMatchObject({
-        duplicateDocumentId: original.body.id,
-        canReuse: true,
+        id: original.body.id,
+        status: "queued",
+        reused: true,
       });
       expect(put).toHaveBeenCalledTimes(1);
       expect(remove).not.toHaveBeenCalled();
@@ -1364,10 +1365,13 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     await completeRecognition(original, fields);
     await completeRecognition(copy, fields);
     const checked = await Document.findById(copy._id).lean();
-    expect(checked).toMatchObject({
-      status: "duplicate",
-      duplicate: { duplicateDocumentId: String(original._id), canReuse: true },
+    expect(checked).toMatchObject({ status: "done", fields });
+    const saved = await post("/api/participants", {
+      ...person,
+      iin: fields.iin,
+      identityDocumentId: String(original._id),
     });
+    expect(saved.status).toBe(201);
     expect(
       (
         await post("/api/participants", {
@@ -1377,12 +1381,6 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         })
       ).status,
     ).toBe(409);
-    const saved = await post("/api/participants", {
-      ...person,
-      iin: fields.iin,
-      identityDocumentId: String(original._id),
-    });
-    expect(saved.status).toBe(201);
     await completeRecognition(await Document.findById(original._id), fields);
     expect((await Document.findById(original._id))?.status).toBe("done");
     const another = await make();
@@ -1391,7 +1389,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       participantId: saved.body._id,
     });
   });
-  it("blocks recognized receipt duplicates of saved payments and competing unfinished uploads", async () => {
+  it("allows competing drafts but saves the receipt only once", async () => {
     const { Document, Admin } = await import("../server/models.js");
     const { completeRecognition } =
       await import("../server/services/duplicates.js");
@@ -1409,24 +1407,18 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       completeRecognition(b, { receiptNumber: "qr-race-412" }),
     ]);
     const docs = await Document.find({ _id: { $in: [a._id, b._id] } });
-    expect(docs.map((d) => d.status).sort()).toEqual(["done", "duplicate"]);
-    const loser = docs.find((d) => d.status === "duplicate")!;
-    expect(
-      (
-        await post(`/api/participants/${participantId}/payments`, {
+    expect(docs.map((d) => d.status)).toEqual(["done", "done"]);
+    const attempts = await Promise.all(
+      docs.map((doc) =>
+        post(`/api/participants/${participantId}/payments`, {
           ...base,
           receiptNumber: "QR-RACE-412",
-          receiptDocumentId: String(loser._id),
-        })
-      ).status,
-    ).toBe(409);
-    const winner = docs.find((d) => d.status === "done")!;
-    const saved = await post(`/api/participants/${participantId}/payments`, {
-      ...base,
-      receiptNumber: "QR-RACE-412",
-      receiptDocumentId: String(winner._id),
-    });
-    expect(saved.status).toBe(201);
+          receiptDocumentId: String(doc._id),
+        }),
+      ),
+    );
+    expect(attempts.map((r) => r.status).sort()).toEqual([201, 409]);
+    const saved = attempts.find((r) => r.status === 201)!;
     const c = await make();
     await completeRecognition(c, { receiptNumber: "QR-RACE-412" });
     expect((await Document.findById(c._id))?.duplicate).toMatchObject({
@@ -1484,11 +1476,12 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
             .attach("file", bytes, `race-${i}.png`),
         ),
       );
-      expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+      expect(results.map((r) => r.status).sort()).toEqual([200, 201]);
       const original = results.find((r) => r.status === 201)!;
-      expect(
-        results.find((r) => r.status === 409)!.body.duplicateDocumentId,
-      ).toBe(original.body.id);
+      expect(results.find((r) => r.status === 200)!.body).toMatchObject({
+        id: original.body.id,
+        reused: true,
+      });
       const doc = await Document.findById(original.body.id);
       expect(
         await Document.countDocuments({ hash: doc!.hash, kind: "receipt" }),
@@ -1684,6 +1677,169 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(
       (await agent.get("/api/statistics?year=2038")).body.finance,
     ).toMatchObject({ membership: 350000, additional: 0, totalIncome: 350000 });
+  });
+  it("upload, cancel, reupload for another participant succeeds; a saved receipt still blocks repeats", async () => {
+    const sharp = (await import("sharp")).default;
+    const { storage } = await import("../server/services/storage.js");
+    const { Document, Payment } = await import("../server/models.js");
+    const { completeRecognition } =
+      await import("../server/services/duplicates.js");
+    const put = vi.spyOn(storage, "put").mockResolvedValue();
+    try {
+      const wrong = (
+        await post("/api/participants", { firstName: "ҚатеТаңдау" })
+      ).body;
+      const right = (
+        await post("/api/participants", { firstName: "ДұрысТаңдау" })
+      ).body;
+      const bytes = await sharp({
+        create: { width: 23, height: 23, channels: 3, background: "green" },
+      })
+        .png()
+        .toBuffer();
+      const upload = () =>
+        agent
+          .post("/api/documents")
+          .set("x-csrf-token", csrf)
+          .field("kind", "receipt")
+          .attach("file", bytes, "cancelled.png");
+      const first = await upload();
+      expect(first.status).toBe(201);
+      const fields = {
+        receiptNumber: "CANCEL-THEN-SAVE",
+        amount: 120000,
+        paymentDate: "2026-11-26",
+      };
+      await completeRecognition(await Document.findById(first.body.id), fields);
+      // Closing/cancelling the form sends no payment and leaves a reusable draft.
+      expect(await Payment.countDocuments({ participantId: wrong._id })).toBe(
+        0,
+      );
+      const resumed = await upload();
+      expect(resumed.status).toBe(200);
+      expect(resumed.body).toMatchObject({
+        id: first.body.id,
+        status: "done",
+        reused: true,
+        fields,
+      });
+      const pay = await post(`/api/participants/${right._id}/payments`, {
+        ...base,
+        ...fields,
+        receiptDocumentId: resumed.body.id,
+      });
+      expect(pay.status).toBe(201);
+      expect(
+        String((await Document.findById(first.body.id))!.participantId),
+      ).toBe(right._id);
+      expect(await Payment.countDocuments({ participantId: wrong._id })).toBe(
+        0,
+      );
+      const blocked = await upload();
+      expect(blocked.status).toBe(409);
+      expect(blocked.body).toMatchObject({
+        paymentId: pay.body._id,
+        participantId: right._id,
+      });
+      expect(
+        (
+          await post(`/api/participants/${wrong._id}/payments`, {
+            ...base,
+            ...fields,
+            receiptDocumentId: resumed.body.id,
+          })
+        ).status,
+      ).toBe(400);
+      expect(put).toHaveBeenCalledTimes(1);
+    } finally {
+      put.mockRestore();
+    }
+  });
+  it("recovers legacy drafts marked duplicate of another unsaved upload", async () => {
+    const sharp = (await import("sharp")).default;
+    const { createHash } = await import("node:crypto");
+    const { Document, Admin } = await import("../server/models.js");
+    const { storage } = await import("../server/services/storage.js");
+    const put = vi.spyOn(storage, "put").mockResolvedValue();
+    try {
+      const owner = await Admin.findOne({ username: "test-admin" });
+      const bytes = await sharp({
+        create: { width: 24, height: 24, channels: 3, background: "yellow" },
+      })
+        .png()
+        .toBuffer();
+      const fields = { receiptNumber: "UNSAVED-LEGACY-RECEIPT", amount: 50000 };
+      await Document.create({
+        kind: "receipt",
+        ownerId: owner!._id,
+        status: "done",
+        fields,
+        recognitionKey: "receipt:UNSAVED-LEGACY-RECEIPT",
+      });
+      const old = await Document.create({
+        kind: "receipt",
+        ownerId: owner!._id,
+        hash: createHash("sha256").update(bytes).digest("hex"),
+        status: "duplicate",
+        fields,
+        error: "old duplicate warning",
+        duplicate: { canReuse: true },
+      });
+      const result = await agent
+        .post("/api/documents")
+        .set("x-csrf-token", csrf)
+        .field("kind", "receipt")
+        .attach("file", bytes, "old.png");
+      expect(result.status).toBe(200);
+      expect(result.body).toMatchObject({
+        id: String(old._id),
+        status: "done",
+        fields,
+        reused: true,
+      });
+      const updated = await Document.findById(old._id).lean();
+      expect(updated?.duplicate).toBeUndefined();
+      expect(updated?.error).toBeUndefined();
+      expect(put).not.toHaveBeenCalled();
+    } finally {
+      put.mockRestore();
+    }
+  });
+  it("does not expose another administrator's unfinished document when uploading identical bytes", async () => {
+    const sharp = (await import("sharp")).default;
+    const { createHash } = await import("node:crypto");
+    const { Document, Admin } = await import("../server/models.js");
+    const { storage } = await import("../server/services/storage.js");
+    const put = vi.spyOn(storage, "put").mockResolvedValue();
+    try {
+      const bytes = await sharp({
+        create: { width: 25, height: 25, channels: 3, background: "purple" },
+      })
+        .png()
+        .toBuffer();
+      const hash = createHash("sha256").update(bytes).digest("hex");
+      const other = await Document.create({
+        kind: "receipt",
+        ownerId: new mongoose.Types.ObjectId(),
+        hash,
+        uploadHash: "receipt:" + hash,
+        status: "queued",
+      });
+      const result = await agent
+        .post("/api/documents")
+        .set("x-csrf-token", csrf)
+        .field("kind", "receipt")
+        .attach("file", bytes, "own-copy.png");
+      expect(result.status).toBe(201);
+      expect(result.body.id).not.toBe(String(other._id));
+      const owner = await Admin.findOne({ username: "test-admin" });
+      expect(String((await Document.findById(result.body.id))!.ownerId)).toBe(
+        String(owner!._id),
+      );
+      expect((await agent.get(`/api/documents/${other._id}`)).status).toBe(404);
+    } finally {
+      put.mockRestore();
+    }
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");

@@ -43,7 +43,9 @@ import {
   participantConflict,
   paymentConflict,
   receiptKey,
-  documentConflictInfo,
+  savedDocumentConflict,
+  resumeDraft,
+  uploadResult,
 } from "./services/duplicates.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
@@ -654,13 +656,20 @@ export function createApp() {
         }
       }
       const hash = createHash("sha256").update(req.file.buffer).digest("hex");
-      const duplicate = await Document.findOne({ hash, kind })
+      const previous = await Document.find({ hash, kind })
         .sort({ createdAt: 1 })
         .lean();
-      if (duplicate)
-        throw new DuplicateError(
-          await documentConflictInfo(duplicate, req.session.adminId),
-        );
+      for (const doc of previous) {
+        const conflict = await savedDocumentConflict(doc);
+        if (conflict) throw new DuplicateError(conflict);
+      }
+      const draft = previous.find(
+        (doc) => String(doc.ownerId) === req.session.adminId,
+      );
+      if (draft) {
+        res.json(uploadResult(await resumeDraft(draft), true));
+        return;
+      }
       const key = [
         process.env.S3_KEY_PREFIX?.replace(/^\/+|\/+$/g, ""),
         `${kind}/${randomBytes(24).toString("hex")}.${type.ext}`,
@@ -675,20 +684,24 @@ export function createApp() {
           mime: type.mime,
           size: req.file.size,
           hash,
-          uploadHash: kind + ":" + hash,
+          uploadHash: req.session.adminId + ":" + kind + ":" + hash,
           ownerId: req.session.adminId,
           originalName: req.file.originalname.slice(0, 200),
           status: "queued",
         });
-        res.status(201).json({ id: doc._id, status: doc.status });
+        res.status(201).json(uploadResult(doc));
       } catch (e) {
         await storage.remove(key).catch(() => {});
         if ((e as any).code === 11000) {
-          const original = await Document.findOne({ hash, kind }).lean();
-          if (original)
-            throw new DuplicateError(
-              await documentConflictInfo(original, req.session.adminId),
-            );
+          const original = await Document.findOne({
+            hash,
+            kind,
+            ownerId: req.session.adminId,
+          }).lean();
+          if (original) {
+            res.json(uploadResult(await resumeDraft(original), true));
+            return;
+          }
         }
         throw e;
       }

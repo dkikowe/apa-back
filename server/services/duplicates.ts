@@ -77,18 +77,58 @@ export async function paymentConflict(
     paymentId: String(pay._id),
   };
 }
-export async function documentConflictInfo(
+// Uploads are drafts until a participant/payment actually references them.
+// Merely reading a document must not reserve its IIN or receipt number.
+export async function savedDocumentConflict(
   doc: any,
-  ownerId?: unknown,
-): Promise<DuplicateInfo> {
+): Promise<DuplicateInfo | null> {
+  const bound =
+    doc.kind === "receipt"
+      ? await Payment.findOne({ receiptDocumentId: doc._id }).lean()
+      : await Participant.findOne({ identityDocumentId: doc._id }).lean();
+  if (bound)
+    return {
+      message: "Бұл құжат сақталған жазбаға тіркелген. Қайта қосуға болмайды.",
+      participantId: String(
+        doc.kind === "receipt" ? (bound as any).participantId : bound._id,
+      ),
+      ...(doc.kind === "receipt" ? { paymentId: String(bound._id) } : {}),
+    };
+  return doc.kind === "receipt"
+    ? paymentConflict(String(doc.fields?.receiptNumber || ""), doc.hash)
+    : participantConflict(String(doc.fields?.iin || ""));
+}
+export async function resumeDraft(doc: any) {
+  const conflict = await savedDocumentConflict(doc);
+  if (conflict) throw new DuplicateError(conflict);
+  // Recover old drafts incorrectly marked duplicate of another unsaved upload.
+  if (doc.status === "duplicate" && !doc.participantId) {
+    const updated = await Document.findOneAndUpdate(
+      { _id: doc._id, participantId: null, status: "duplicate" },
+      {
+        $set: { status: "done" },
+        $unset: { duplicate: 1, error: 1, recognitionKey: 1 },
+      },
+      { new: true },
+    ).lean();
+    if (updated) return updated;
+    const current = await Document.findById(doc._id).lean();
+    if (current) {
+      const conflict = await savedDocumentConflict(current);
+      if (conflict) throw new DuplicateError(conflict);
+      return current;
+    }
+  }
+  return doc;
+}
+export function uploadResult(doc: any, reused = false) {
   return {
-    message: "Бұл құжат бұрын жүктелген. Қайта жүктеуге болмайды.",
-    duplicateDocumentId: String(doc._id),
-    ...(doc.participantId ? { participantId: String(doc.participantId) } : {}),
-    canReuse:
-      !doc.participantId &&
-      doc.status !== "duplicate" &&
-      (!ownerId || String(doc.ownerId) === String(ownerId)),
+    id: doc._id,
+    status: doc.status,
+    fields: doc.fields || {},
+    error: doc.error,
+    attempts: doc.attempts,
+    reused,
   };
 }
 export async function recognitionConflict(
@@ -118,20 +158,9 @@ export async function recognitionConflict(
           doc.hash,
           boundPayment ? String(boundPayment._id) : undefined,
         );
-  if (conflict) return conflict;
-  // Re-reading an attachment of its existing record does not create a new upload.
-  if (boundParticipant || boundPayment || !number) return null;
-  const other = await Document.findOne({
-    kind: doc.kind,
-    status: "done",
-    _id: { $ne: doc._id },
-    [doc.kind === "identity" ? "fields.iin" : "fields.receiptNumber"]:
-      doc.kind === "identity" ? number : receiptPattern(number),
-  })
-    .sort({ createdAt: 1 })
-    .lean();
-  return other ? documentConflictInfo(other, doc.ownerId) : null;
+  return conflict;
 }
+
 export async function completeRecognition(
   doc: any,
   fields: Record<string, unknown>,
@@ -153,50 +182,11 @@ export async function completeRecognition(
     );
     return;
   }
-  const identifier =
-    doc.kind === "identity"
-      ? String(fields.iin || "")
-      : receiptKey(fields.receiptNumber);
-  try {
-    await Document.updateOne(
-      { _id: doc._id },
-      {
-        $set: {
-          status: "done",
-          fields,
-          completedAt: new Date(),
-          ...(!doc.participantId && identifier
-            ? { recognitionKey: doc.kind + ":" + identifier }
-            : {}),
-        },
-        $unset: {
-          error: 1,
-          duplicate: 1,
-          ...(!identifier || doc.participantId ? { recognitionKey: 1 } : {}),
-        },
-      },
-    );
-  } catch (error: any) {
-    if (error.code !== 11000) throw error;
-    const other = await Document.findOne({
-      recognitionKey: doc.kind + ":" + identifier,
-      _id: { $ne: doc._id },
-    }).lean();
-    const duplicate = other
-      ? await documentConflictInfo(other, doc.ownerId)
-      : { message: "Бұл құжат бұрын тіркелген. Қайта қосуға болмайды." };
-    await Document.updateOne(
-      { _id: doc._id },
-      {
-        $set: {
-          status: "duplicate",
-          fields,
-          error: duplicate.message,
-          duplicate,
-          completedAt: new Date(),
-        },
-        $unset: { recognitionKey: 1 },
-      },
-    );
-  }
+  await Document.updateOne(
+    { _id: doc._id },
+    {
+      $set: { status: "done", fields, completedAt: new Date() },
+      $unset: { error: 1, duplicate: 1, recognitionKey: 1 },
+    },
+  );
 }
