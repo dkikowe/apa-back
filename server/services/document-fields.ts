@@ -602,7 +602,7 @@ export function extractFields(text: string, kind: string) {
     const source = labeled(labels.method);
     if (
       source &&
-      /[\p{L}]/u.test(source) &&
+      (/[\p{L}]/u.test(source) || /^(?:[•●*·]{1,8}\s*)\d{4}$/u.test(source)) &&
       !/^(?:Адрес|Комиссия|Сообщение|ИИН|БИН)(?=\s|:|$)/iu.test(source)
     ) {
       let method = source;

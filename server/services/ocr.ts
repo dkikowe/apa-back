@@ -74,32 +74,69 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       )
     ).data;
   };
-  const scanReceipt = async (image: Buffer) => {
-    const first = await scan(image);
-    const fields = extractFields(first.text, "receipt");
-    if (
-      [
-        "amount",
-        "paymentDate",
-        "paymentTime",
-        "receiptNumber",
-        "recipientName",
-        "method",
-      ].some((key) => fields[key] === undefined)
-    ) {
-      // A second layout handles receipts whose labels and values form columns.
-      // Keep the first pass's values; only fill fields it could not read.
+  const scanReceipt = async (
+    image: Buffer,
+    seed: Record<string, string | number> = {},
+  ) => {
+    const fields = { ...seed };
+    const { width, height } = await sharp(image).metadata();
+    const gray = () => sharp(image).grayscale().normalize();
+    const section = (bottom: boolean) => {
+      const cropHeight = Math.ceil(height * 0.65);
+      return gray()
+        .extract({
+          left: 0,
+          top: bottom ? height - cropHeight : 0,
+          width,
+          height: cropHeight,
+        })
+        .resize({ width: 2600, height: 3000, fit: "inside" })
+        .sharpen()
+        .png()
+        .toBuffer();
+    };
+    const passes = [
+      { render: async () => image, mode: PSM.SPARSE_TEXT },
+      { render: async () => image, mode: PSM.AUTO },
+      {
+        render: () => gray().sharpen().png().toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+      },
+      {
+        render: () =>
+          gray().clahe({ width: 32, height: 32, maxSlope: 3 }).png().toBuffer(),
+        mode: PSM.AUTO,
+      },
+      { render: () => section(true), mode: PSM.SPARSE_TEXT },
+      { render: () => section(false), mode: PSM.SPARSE_TEXT },
+      { render: () => gray().threshold(160).png().toBuffer(), mode: PSM.AUTO },
+      { render: () => gray().rotate(90).png().toBuffer(), mode: PSM.AUTO },
+      { render: () => gray().rotate(270).png().toBuffer(), mode: PSM.AUTO },
+    ];
+    let read = false;
+    for (const pass of passes) {
+      if (
+        read &&
+        (Date.now() > recoveryDeadline ||
+          !missingDocumentFields("receipt", fields).length)
+      )
+        break;
       try {
-        const second = await scan(image, PSM.AUTO);
-        for (const [key, value] of Object.entries(
-          extractFields(second.text, "receipt"),
-        ))
+        const result = await scan(await pass.render(), pass.mode);
+        read = true;
+        const found = extractFields(result.text, "receipt");
+        for (const [key, value] of Object.entries(found))
           if (fields[key] === undefined) fields[key] = value;
-      } catch {
-        // A failed fallback must not discard fields already read successfully.
+      } catch (error) {
+        await worker?.terminate().catch(() => {});
+        worker = undefined;
+        if (Date.now() > recoveryDeadline || pass === passes.at(-1)) {
+          if (!read && !Object.keys(fields).length) throw error;
+          break;
+        }
       }
     }
-    return { ...first, fields };
+    return { text: "", fields };
   };
   // Bound the work for unreadable/missing sides, rather than retrying the
   // same pixels forever and blocking every other document in the queue.
@@ -231,6 +268,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           for (const item of content.items) {
             if ("str" in item) layer += item.str + (item.hasEOL ? "\n" : " ");
           }
+          const streamText = layer;
           if (kind === "receipt" && page.rotate === 0) {
             layer = receiptTextLines(
               content.items.flatMap((item) =>
@@ -257,20 +295,15 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
               throw new WrongDocumentKindError();
             identitySources.push(layer);
           }
-          const layerFields = extractFields(layer, kind);
+          const layerFields = {
+            ...(kind === "receipt" ? extractFields(streamText, kind) : {}),
+            ...extractFields(layer, kind),
+          };
           const layerComplete =
-            kind === "identity"
-              ? missingDocumentFields("identity", layerFields).length === 0
-              : Boolean(
-                  layerFields.amount !== undefined &&
-                  layerFields.paymentDate &&
-                  layerFields.receiptNumber &&
-                  layerFields.recipientName &&
-                  (!/Оплачено|Откуда|Төленді|Списано с|Төлем тәсілі|Payment method/iu.test(
-                    layer,
-                  ) ||
-                    layerFields.method),
-                );
+            missingDocumentFields(
+              kind === "identity" ? "identity" : "receipt",
+              layerFields,
+            ).length === 0;
           if (layer.replace(/\s/g, "").length > 40 && layerComplete) {
             text += layer + "\n";
             Object.assign(nativeFields, layerFields);
@@ -320,7 +353,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           try {
             scanned =
               kind === "receipt"
-                ? await scanReceipt(rendered)
+                ? await scanReceipt(rendered, layerFields)
                 : await scanIdentity(rendered, layerFields, values);
           } catch (error) {
             if (error instanceof WrongDocumentKindError) throw error;

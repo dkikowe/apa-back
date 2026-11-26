@@ -1813,7 +1813,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(result.status).toBe(200);
       expect(result.body).toMatchObject({
         id: String(old._id),
-        status: "done",
+        status: "queued",
         fields,
         reused: true,
       });

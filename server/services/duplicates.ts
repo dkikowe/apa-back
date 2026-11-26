@@ -1,5 +1,6 @@
 import {
   IDENTITY_RECOGNITION_VERSION,
+  RECEIPT_RECOGNITION_VERSION,
   missingDocumentFields,
 } from "../../shared/document-recognition.js";
 import type mongoose from "mongoose";
@@ -126,11 +127,15 @@ export async function resumeDraft(doc: any) {
   // Reusing an old partial scan should run the improved reader once, rather
   // than returning its incomplete cached fields forever. Saved attachments
   // are excluded by savedDocumentConflict above.
+  const version =
+    doc.kind === "identity"
+      ? IDENTITY_RECOGNITION_VERSION
+      : RECEIPT_RECOGNITION_VERSION;
   if (
-    doc.kind === "identity" &&
+    (doc.kind === "identity" || doc.kind === "receipt") &&
     doc.status === "done" &&
-    (doc.recognitionVersion || 0) < IDENTITY_RECOGNITION_VERSION &&
-    missingDocumentFields("identity", doc.fields || {}).length
+    (doc.recognitionVersion || 0) < version &&
+    missingDocumentFields(doc.kind, doc.fields || {}).length
   ) {
     return (
       (await Document.findOneAndUpdate(
@@ -140,7 +145,7 @@ export async function resumeDraft(doc: any) {
           participantId: null,
           $or: [
             { recognitionVersion: { $exists: false } },
-            { recognitionVersion: { $lt: IDENTITY_RECOGNITION_VERSION } },
+            { recognitionVersion: { $lt: version } },
           ],
         },
         { $set: { status: "queued" }, $unset: { error: 1 } },
@@ -207,7 +212,10 @@ export async function completeRecognition(
           error: conflict.message,
           duplicate: conflict,
           completedAt: new Date(),
-          recognitionVersion: IDENTITY_RECOGNITION_VERSION,
+          recognitionVersion:
+            doc.kind === "identity"
+              ? IDENTITY_RECOGNITION_VERSION
+              : RECEIPT_RECOGNITION_VERSION,
         },
         $unset: { recognitionKey: 1 },
       },
@@ -221,7 +229,10 @@ export async function completeRecognition(
         status: "done",
         fields,
         completedAt: new Date(),
-        recognitionVersion: IDENTITY_RECOGNITION_VERSION,
+        recognitionVersion:
+          doc.kind === "identity"
+            ? IDENTITY_RECOGNITION_VERSION
+            : RECEIPT_RECOGNITION_VERSION,
       },
       $unset: { error: 1, duplicate: 1, recognitionKey: 1 },
     },

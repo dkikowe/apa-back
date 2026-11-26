@@ -344,3 +344,7 @@ it("recovers a birth date from the intact half of a damaged bilingual heading", 
     ).birthDate,
   ).toBe("1975-04-15");
 });
+
+it("reads a masked card as the printed transfer source", () => {
+  expect(extractFields("Откуда • 0001\nПолучатель Тест А.", "receipt").method).toBe("• 0001");
+});

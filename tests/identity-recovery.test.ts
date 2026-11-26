@@ -124,3 +124,28 @@ describe("Automatic identity recovery", () => {
     expect(engine.recognize).not.toHaveBeenCalled();
   });
 });
+
+it("re-reads a receipt PDF for a missing payer and time while retaining the printed amount and number", async () => {
+  engine.recognize
+    .mockResolvedValueOnce(response(["DATE: 18.11.2026 12:55"]))
+    .mockResolvedValueOnce(response(["Оплачено с Kaspi Gold"]))
+    .mockResolvedValueOnce(response(["ФИО покупателя Тест А."]));
+  const fields = await recognize(
+    textPdf([
+      "TOTAL: 6,487.00 KZT",
+      "DATE: 18.11.2026",
+      "RECIPIENT: TEST ORGANIZATION",
+      "RECEIPT NUMBER: TEST-100",
+    ]),
+    "application/pdf",
+    "receipt",
+  );
+  expect(fields).toMatchObject({
+    amount: 648700,
+    receiptNumber: "TEST-100",
+    paymentTime: "12:55",
+    method: "с Kaspi Gold",
+    payerName: "Тест А.",
+  });
+  expect(engine.recognize).toHaveBeenCalledTimes(3);
+});
