@@ -4,6 +4,7 @@ import { Participant, Payment, Finance } from "../models.js";
 import { memberPipeline, type Filters } from "./members.js";
 import {
   AGE_LABELS,
+  paymentCategoryLabel,
   RECEIPT_TYPES,
   STATUS_LABELS,
   missingParticipantFields,
@@ -15,7 +16,12 @@ export async function financialSummary(year: number) {
   const [members, other, months, memberMonths] = await Promise.all([
     Payment.aggregate([
       { $match: { voidedAt: null, paymentDate: { $gte: from, $lt: to } } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
+      {
+        $group: {
+          _id: { $ifNull: ["$paymentKind", "membership"] },
+          total: { $sum: "$amount" },
+        },
+      },
     ]),
     Finance.aggregate([
       { $match: { voidedAt: null, date: { $gte: from, $lt: to } } },
@@ -34,26 +40,38 @@ export async function financialSummary(year: number) {
       { $match: { voidedAt: null, paymentDate: { $gte: from, $lt: to } } },
       {
         $group: {
-          _id: { $substrBytes: ["$paymentDate", 5, 2] },
+          _id: {
+            month: { $substrBytes: ["$paymentDate", 5, 2] },
+            kind: { $ifNull: ["$paymentKind", "membership"] },
+          },
           total: { $sum: "$amount" },
         },
       },
     ]),
   ]);
-  const membership = members[0]?.total || 0,
+  const membership = members.find((x) => x._id === "membership")?.total || 0,
+    additional = members.find((x) => x._id === "additional")?.total || 0,
     income = other.find((x) => x._id === "income")?.total || 0,
     expense = other.find((x) => x._id === "expense")?.total || 0;
   return {
     membership,
+    additional,
     income,
     expense,
-    totalIncome: membership + income,
-    balance: membership + income - expense,
+    totalIncome: membership + additional + income,
+    balance: membership + additional + income - expense,
     months: Array.from({ length: 12 }, (_, i) => {
       const key = String(i + 1).padStart(2, "0");
       return {
         month: i + 1,
-        membership: memberMonths.find((x) => x._id === key)?.total || 0,
+        membership:
+          memberMonths.find(
+            (x) => x._id.month === key && x._id.kind === "membership",
+          )?.total || 0,
+        additional:
+          memberMonths.find(
+            (x) => x._id.month === key && x._id.kind === "additional",
+          )?.total || 0,
         income:
           months.find((x) => x._id.month === key && x._id.type === "income")
             ?.total || 0,
@@ -172,7 +190,7 @@ export async function makeReport(type: string, f: Filters) {
   } else if (type === "payments") {
     sheet.columns = [
       { header: "Қатысушы", key: "name", width: 35 },
-      { header: "Жарна жылы", key: "year", width: 16 },
+      { header: "Жыл", key: "year", width: 16 },
       { header: "Төлем күні", key: "paymentDate", width: 18 },
       { header: "Төлем уақыты", key: "paymentTime", width: 18 },
       { header: "Сома, ₸", key: "amount", width: 20 },
@@ -181,6 +199,7 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Чек түрі", key: "receiptTypeLabel", width: 35 },
       { header: "Төлем тәсілі", key: "method", width: 24 },
       { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
+      { header: "Төлем түрі", key: "paymentCategoryLabel", width: 32 },
     ];
     const members = await Participant.aggregate([
       ...memberPipeline(f),
@@ -198,6 +217,7 @@ export async function makeReport(type: string, f: Filters) {
       const p: any = row.participantId;
       sheet.addRow({
         ...row,
+        paymentCategoryLabel: paymentCategoryLabel(row),
         receiptTypeLabel:
           RECEIPT_TYPES[row.receiptType as keyof typeof RECEIPT_TYPES] ||
           "Көрсетілмеген",
@@ -213,6 +233,7 @@ export async function makeReport(type: string, f: Filters) {
     ];
     for (const [key, label] of Object.entries({
       membership: "Мүшелік жарналар",
+      additional: "Қосымша төлемдер",
       income: "Өзге кірістер",
       totalIncome: "Жалпы кіріс",
       expense: "Жалпы шығыс",
@@ -239,7 +260,7 @@ export async function makeReport(type: string, f: Filters) {
         sheet.addRow({
           date: row.paymentDate,
           paymentTime: row.paymentTime || "",
-          category: "Мүшелік жарна",
+          category: paymentCategoryLabel(row),
           amount: row.amount! / 100,
           description: row.recipientName || "",
         });

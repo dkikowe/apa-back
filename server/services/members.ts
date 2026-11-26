@@ -136,7 +136,20 @@ export function memberPipeline(
               _id: null,
               lastRecipientName: { $first: "$recipientName" },
               lastReceiptType: { $first: "$receiptType" },
-              total: { $sum: "$amount" },
+              total: {
+                $sum: {
+                  $cond: [
+                    {
+                      $eq: [
+                        { $ifNull: ["$paymentKind", "membership"] },
+                        "membership",
+                      ],
+                    },
+                    "$amount",
+                    0,
+                  ],
+                },
+              },
               lastPaymentAt: {
                 $max: {
                   $concat: [

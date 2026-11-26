@@ -18,6 +18,7 @@ import {
   Admin,
   Participant,
   Payment,
+  PaymentCategory,
   Finance,
   Document,
   Audit,
@@ -25,6 +26,8 @@ import {
 import {
   participantSchema,
   paymentSchema,
+  paymentCategorySchema,
+  MEMBERSHIP_PAYMENT_LABEL,
   financeSchema,
 } from "../shared/domain.js";
 import {
@@ -426,6 +429,41 @@ export function createApp() {
     });
     res.json({ ok: true });
   });
+  app.get("/api/payment-categories", async (_req, res) => {
+    res.json({
+      items: await PaymentCategory.find()
+        .sort({ createdAt: 1, _id: 1 })
+        .select("name amount")
+        .lean(),
+    });
+  });
+  app.post("/api/payment-categories", async (req, res) => {
+    const data = paymentCategorySchema.parse(req.body);
+    const name = data.name.normalize("NFKC").replace(/\s+/g, " ");
+    const nameKey = name.toLocaleLowerCase("kk-KZ");
+    if (nameKey === MEMBERSHIP_PAYMENT_LABEL.toLocaleLowerCase("kk-KZ"))
+      throw new HttpError(
+        409,
+        "Мүшелік жарна тізімде бар. Басқа атау енгізіңіз.",
+      );
+    const created = await atomic(async (session) => {
+      const [category] = await PaymentCategory.create(
+        [{ name, nameKey, amount: data.amount }],
+        { session },
+      );
+      await audit(
+        req.session.adminId!,
+        "create",
+        "PaymentCategory",
+        category._id,
+        null,
+        category.toObject(),
+        session,
+      );
+      return category;
+    });
+    res.status(201).json(created);
+  });
   async function savePayment(req: express.Request, res: express.Response) {
     const data = paymentSchema.parse(req.body),
       id = req.params.paymentId
@@ -441,6 +479,16 @@ export function createApp() {
       const participant = await Participant.findById(participantId).session(s);
       if (!participant || participant.archivedAt)
         throw new HttpError(400, "Алдымен қатысушыны тізімге қайтарыңыз.");
+      const categoryId =
+        data.paymentCategoryId ?? before?.paymentCategoryId?.toString() ?? "";
+      const category = categoryId
+        ? await PaymentCategory.findById(categoryId).session(s)
+        : null;
+      if (categoryId && !category)
+        throw new HttpError(
+          400,
+          "Төлем түрі табылмады. Тізімнен қайта таңдаңыз.",
+        );
       let fileHash: string | undefined;
       const receiptDocumentId =
         data.receiptDocumentId || before?.receiptDocumentId?.toString();
@@ -505,11 +553,15 @@ export function createApp() {
       const values = {
         ...data,
         participantId,
+        paymentKind: category ? "additional" : "membership",
+        paymentCategoryName: category?.name || MEMBERSHIP_PAYMENT_LABEL,
+        ...(category ? { paymentCategoryId: category._id.toString() } : {}),
         ...(receiptDocumentId ? { receiptDocumentId } : {}),
         ...(fileHash ? { fileHash } : {}),
         ...(!duplicate && numberKey ? { receiptNumberKey: numberKey } : {}),
         ...(!duplicate && keys.length ? { dedupeKeys: keys } : {}),
       };
+      if (!category) delete values.paymentCategoryId;
       let p;
       if (before) {
         p = await Payment.findByIdAndUpdate(
@@ -517,6 +569,7 @@ export function createApp() {
           {
             $set: values,
             $unset: {
+              ...(!category ? { paymentCategoryId: 1 } : {}),
               fingerprint: 1,
               duplicateConfirmed: 1,
               ...(!numberKey ? { receiptNumberKey: 1 } : {}),
@@ -831,8 +884,9 @@ export function createApp() {
         });
       if (error.code === 11000)
         return res.status(409).json({
-          message:
-            error.keyPattern?.importKey || error.keyPattern?.iinKey
+          message: error.keyPattern?.nameKey
+            ? "Бұл төлем түрі тізімде бар. Оны тізімнен таңдаңыз."
+            : error.keyPattern?.importKey || error.keyPattern?.iinKey
               ? "Бұл қатысушы бұрын енгізілген. Қайта қосуға болмайды."
               : "Бұл құжат немесе чек бұрын тіркелген. Қайта қосуға болмайды.",
         });

@@ -1501,6 +1501,190 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       remove.mockRestore();
     }
   });
+  it("creates a shared payment category without creating payments or changing balances", async () => {
+    const { Payment } = await import("../server/models.js");
+    const count = await Payment.countDocuments();
+    const created = await post("/api/payment-categories", {
+      name: "  Көрмеге   қатысу  ",
+      amount: 500000,
+    });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      name: "Көрмеге қатысу",
+      amount: 500000,
+    });
+    const catalog = await agent.get("/api/payment-categories");
+    expect(catalog.status).toBe(200);
+    expect(catalog.body.items).toContainEqual(
+      expect.objectContaining({
+        _id: created.body._id,
+        name: "Көрмеге қатысу",
+      }),
+    );
+    expect(await Payment.countDocuments()).toBe(count);
+    expect(
+      (
+        await post("/api/payment-categories", {
+          name: "көрмеге қатысу",
+          amount: 600000,
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await post("/api/payment-categories", {
+          name: "Мүшелік жарна",
+          amount: 600000,
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (await post("/api/payment-categories", { name: "", amount: 1 })).status,
+    ).toBe(400);
+    expect(
+      (
+        await post("/api/payment-categories", {
+          name: "Invalid amount",
+          amount: 0,
+        })
+      ).status,
+    ).toBe(400);
+    expect((await request(app).get("/api/payment-categories")).status).toBe(
+      401,
+    );
+  });
+  it("keeps additional payments out of membership debt and includes them once in income and exports", async () => {
+    const { Payment } = await import("../server/models.js");
+    const cat = (await agent.get("/api/payment-categories")).body.items[0];
+    const p1 = (
+      await post("/api/participants", { ...person, firstName: "ТөлемТүрі" })
+    ).body;
+    const p2 = (
+      await post("/api/participants", { ...person, firstName: "ЕкіншіТүрі" })
+    ).body;
+    const extra = await post(`/api/participants/${p1._id}/payments`, {
+      ...base,
+      year: 2038,
+      paymentDate: "2038-02-01",
+      receiptNumber: "EXTRA-2038-1",
+      paymentCategoryId: cat._id,
+      amount: 200000,
+      paymentKind: "membership",
+      paymentCategoryName: "forged",
+    });
+    expect(extra.status).toBe(201);
+    expect(extra.body).toMatchObject({
+      paymentKind: "additional",
+      paymentCategoryId: cat._id,
+      paymentCategoryName: cat.name,
+      amount: 200000,
+    });
+    const second = await post(`/api/participants/${p2._id}/payments`, {
+      ...base,
+      year: 2038,
+      paymentDate: "2038-02-02",
+      receiptNumber: "EXTRA-2038-2",
+      paymentCategoryId: cat._id,
+      amount: 500000,
+    });
+    expect(second.status).toBe(201);
+    let profile = await agent.get(`/api/participants/${p1._id}?year=2038`);
+    expect(profile.body).toMatchObject({
+      totalPaid: 0,
+      remaining: 648700,
+      status: "unpaid",
+      lastPaymentAt: "2038-02-01T",
+    });
+    expect(profile.body.payments[0].paymentCategoryName).toBe(cat.name);
+    // A pre-existing row without new fields still counts as membership.
+    await Payment.collection.insertOne({
+      participantId: new mongoose.Types.ObjectId(p1._id),
+      year: 2038,
+      paymentDate: "2038-01-01",
+      amount: 100000,
+      voidedAt: null,
+    });
+    profile = await agent.get(`/api/participants/${p1._id}?year=2038`);
+    expect(profile.body).toMatchObject({
+      totalPaid: 100000,
+      remaining: 548700,
+      status: "partial",
+    });
+    const stats = (await agent.get("/api/statistics?year=2038")).body;
+    expect(stats.finance).toMatchObject({
+      membership: 100000,
+      additional: 700000,
+      totalIncome: 800000,
+      balance: 800000,
+    });
+    expect(stats.finance.months[1]).toMatchObject({
+      membership: 0,
+      additional: 700000,
+    });
+    for (const type of ["payments", "income", "financial"]) {
+      const exported = await agent
+        .get(`/api/reports/${type}?year=2038`)
+        .buffer(true)
+        .parse((res, cb) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (x) => chunks.push(x));
+          res.on("end", () => cb(null, Buffer.concat(chunks)));
+        });
+      expect(exported.status).toBe(200);
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(exported.body);
+      const values = JSON.stringify(workbook.worksheets[0].getSheetValues());
+      expect(values).toContain(
+        type === "financial" ? "Қосымша төлемдер" : cat.name,
+      );
+    }
+    expect(
+      (
+        await post(`/api/participants/${p1._id}/payments`, {
+          ...base,
+          paymentCategoryId: cat._id,
+          receiptNumber: "EXTRA-2038-1",
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await post(`/api/participants/${p1._id}/payments`, {
+          ...base,
+          paymentCategoryId: new mongoose.Types.ObjectId().toString(),
+          receiptNumber: "UNKNOWN-CAT",
+        })
+      ).status,
+    ).toBe(400);
+    // Older clients editing another field must preserve the additional category.
+    const edited = await patch(`/api/payments/${extra.body._id}`, {
+      ...base,
+      year: 2038,
+      paymentDate: "2038-02-01",
+      receiptNumber: "EXTRA-2038-1",
+      amount: 250000,
+    });
+    expect(edited.status).toBe(200);
+    expect(edited.body.paymentKind).toBe("additional");
+    const membership = await patch(`/api/payments/${extra.body._id}`, {
+      ...base,
+      year: 2038,
+      paymentDate: "2038-02-01",
+      receiptNumber: "EXTRA-2038-1",
+      amount: 250000,
+      paymentCategoryId: "",
+    });
+    expect(membership.status).toBe(200);
+    expect(membership.body.paymentKind).toBe("membership");
+    expect(membership.body.paymentCategoryId).toBeUndefined();
+    expect(
+      (await agent.get(`/api/participants/${p1._id}?year=2038`)).body.totalPaid,
+    ).toBe(350000);
+    await post(`/api/payments/${second.body._id}/void`, {});
+    expect(
+      (await agent.get("/api/statistics?year=2038")).body.finance,
+    ).toMatchObject({ membership: 350000, additional: 0, totalIncome: 350000 });
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

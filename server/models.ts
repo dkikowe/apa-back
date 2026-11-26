@@ -39,6 +39,14 @@ participant.index({ searchTokens: 1 });
 participant.index({ importKey: 1 }, { unique: true, sparse: true });
 participant.index({ phoneNormalized: 1 });
 participant.index({ lastName: 1, firstName: 1 });
+const paymentCategory = new Schema(
+  {
+    name: { type: String, required: true },
+    nameKey: { type: String, required: true, unique: true },
+    amount: { type: Number, required: true },
+  },
+  options,
+);
 const payment = new Schema(
   {
     participantId: {
@@ -47,6 +55,13 @@ const payment = new Schema(
       required: true,
     },
     year: Number,
+    paymentKind: {
+      type: String,
+      enum: ["membership", "additional"],
+      default: "membership",
+    },
+    paymentCategoryId: { type: Schema.Types.ObjectId, ref: "PaymentCategory" },
+    paymentCategoryName: String,
     amount: Number,
     paymentDate: String,
     paymentTime: { type: String, default: "" },
@@ -134,6 +149,10 @@ const audit = new Schema(
 audit.index({ createdAt: -1 });
 export const Admin = mongoose.model("Admin", admin);
 export const Participant = mongoose.model("Participant", participant);
+export const PaymentCategory = mongoose.model(
+  "PaymentCategory",
+  paymentCategory,
+);
 export const Payment = mongoose.model("MembershipPayment", payment);
 export const Finance = mongoose.model("FinancialTransaction", finance);
 export const Document = mongoose.model("Document", document);
@@ -153,8 +172,15 @@ export const ImportDraft = mongoose.model("ImportDraft", importDraft);
 export async function connect() {
   await mongoose.connect((await import("./config.js")).config.mongo);
   await Promise.all(
-    [Admin, Participant, Payment, Finance, Document, Audit, ImportDraft].map(
-      (m) => m.init(),
-    ),
+    [
+      Admin,
+      Participant,
+      Payment,
+      PaymentCategory,
+      Finance,
+      Document,
+      Audit,
+      ImportDraft,
+    ].map((m) => m.init()),
   );
 }
