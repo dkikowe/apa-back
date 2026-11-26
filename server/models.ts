@@ -115,6 +115,12 @@ const document = new Schema(
     uploadHash: String,
     recognitionKey: String,
     recognitionVersion: Number,
+    recoveryStage: Number,
+    recoveryFailures: Number,
+    recoveryConflicts: [String],
+    nextReadAt: Date,
+    readLease: String,
+    leaseUntil: Date,
     duplicate: Schema.Types.Mixed,
     ownerId: Schema.Types.ObjectId,
     participantId: Schema.Types.ObjectId,
@@ -135,6 +141,7 @@ const document = new Schema(
 document.index({ uploadHash: 1 }, { unique: true, sparse: true });
 document.index({ recognitionKey: 1 }, { unique: true, sparse: true });
 document.index({ status: 1, createdAt: 1 });
+document.index({ status: 1, updatedAt: 1 });
 document.index({ hash: 1 });
 const audit = new Schema(
   {

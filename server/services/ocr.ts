@@ -1,3 +1,5 @@
+import { OCR_LAST_ROUND, WrongDocumentKindError } from "./ocr-policy.js";
+export { OCR_LAST_ROUND, WrongDocumentKindError } from "./ocr-policy.js";
 import { createWorker, PSM } from "tesseract.js";
 import { createCanvas, DOMMatrix, ImageData, Path2D } from "@napi-rs/canvas";
 import sharp from "sharp";
@@ -92,15 +94,98 @@ function receiptBands(items: PositionedText[], height: number) {
     return bottom > top ? [{ top, height: bottom - top, keys: row.keys }] : [];
   });
 }
-export class WrongDocumentKindError extends Error {
-  constructor() {
-    super(
-      "Куәліктің орнына чек жүктелген. Жеке куәлікті таңдаңыз. Чекті «Төлем қосу» бөлімінде жүктеңіз.",
-    );
-    this.name = "WrongDocumentKindError";
+type Fields = Record<string, string | number>;
+type RecoveryOptions = {
+  recoveryStage?: number;
+  previousFields?: Fields;
+  // Worker persists unresolved identity/receipt number disagreements between rounds.
+  conflicts?: string[];
+};
+
+type RecoveryPass = {
+  render: () => Promise<Buffer>;
+  mode: PSM;
+  aligned: boolean;
+};
+function recoveryPasses(image: Buffer, stage: number): RecoveryPass[] {
+  const gray = () =>
+    sharp(image).flatten({ background: "white" }).grayscale().normalize();
+  if (stage === 1) {
+    // Larger native render plus local binarization (configured in Tesseract)
+    // helps small text against uneven paper. Try slight tilt both ways.
+    return [
+      {
+        render: () => gray().median(3).png().toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+        aligned: true,
+      },
+      {
+        render: () => gray().sharpen().png().toBuffer(),
+        mode: PSM.SINGLE_BLOCK,
+        aligned: true,
+      },
+      ...[-3, 3].map((angle) => ({
+        render: () =>
+          gray().rotate(angle, { background: "white" }).png().toBuffer(),
+        mode: PSM.AUTO,
+        aligned: false,
+      })),
+    ];
   }
+  // The earlier reader covered landscape rotation but not an upside-down scan.
+  // Individual color channels can separate blue/green security printing from ink.
+  return [
+    {
+      render: () =>
+        sharp(image)
+          .toColourspace("srgb")
+          .extractChannel("red")
+          .normalize()
+          .png()
+          .toBuffer(),
+      mode: PSM.SPARSE_TEXT,
+      aligned: true,
+    },
+    {
+      render: () =>
+        sharp(image)
+          .toColourspace("srgb")
+          .extractChannel("blue")
+          .normalize()
+          .png()
+          .toBuffer(),
+      mode: PSM.AUTO,
+      aligned: true,
+    },
+    {
+      render: () => gray().rotate(180).png().toBuffer(),
+      mode: PSM.SPARSE_TEXT,
+      aligned: false,
+    },
+    {
+      render: () => gray().rotate(180).sharpen().png().toBuffer(),
+      mode: PSM.AUTO,
+      aligned: false,
+    },
+  ];
 }
-export async function recognize(buffer: Buffer, mime: string, kind: string) {
+
+export async function recognize(
+  buffer: Buffer,
+  mime: string,
+  kind: string,
+  options: RecoveryOptions = {},
+) {
+  const stage = options.recoveryStage ?? 0;
+  const previous = options.previousFields ?? {};
+  const conflicts = options.conflicts ?? [];
+  const receiptNumbers = new Set<string>();
+  function observeReceiptNumber(value: unknown) {
+    if (typeof value === "string" && value.trim())
+      receiptNumbers.add(value.replace(/\s/g, "").toUpperCase());
+  }
+  observeReceiptNumber(previous.receiptNumber);
+
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
   const scan = async (
     image: Buffer,
@@ -110,7 +195,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     worker ??= await createWorker(
       (
         process.env.OCR_LANGUAGES ||
-        (kind === "receipt" ? "eng+rus+kaz" : "kaz+rus+eng")
+        (stage === OCR_LAST_ROUND ? "eng+rus+kaz" : "kaz+rus+eng")
       ).split("+"),
       1,
       {
@@ -125,6 +210,9 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       // Sparse mode keeps transfer label/value pairs in reading order instead
       // of concatenating the entire left column before the right column.
       tessedit_pageseg_mode: mode,
+      ...(stage === 1
+        ? { thresholding_method: "2", user_defined_dpi: "300" }
+        : {}),
     });
     return (await worker.recognize(image, {}, { text: true, blocks })).data;
   };
@@ -133,7 +221,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     seed: Record<string, string | number> = {},
     positioned: PositionedText[] = [],
   ) => {
-    const fields = { ...seed };
+    const fields = { ...seed, ...previous };
     const { width, height } = await sharp(image).metadata();
     const gray = () => sharp(image).grayscale().normalize();
     const section = (bottom: boolean) => {
@@ -174,10 +262,12 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       keys?: string[];
       collectRows?: boolean;
     };
-    const queue: Pass[] = passes.map((pass, i) => ({
-      ...pass,
-      collectRows: i < 2,
-    }));
+    const queue: Pass[] = (stage ? recoveryPasses(image, stage) : passes).map(
+      (pass, i) => ({
+        ...pass,
+        collectRows: i < 2,
+      }),
+    );
     let bestLines = positioned;
     let read = false;
     for (let i = 0; i < queue.length; i++) {
@@ -204,6 +294,8 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           ...extractFields(result.text, "receipt"),
           ...extractFields(receiptTextLines(lines), "receipt"),
         };
+        if (!pass.keys || pass.keys.includes("receiptNumber"))
+          observeReceiptNumber(found.receiptNumber);
         for (const [key, value] of Object.entries(found))
           if (
             fields[key] === undefined &&
@@ -280,10 +372,11 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     seed: Record<string, string | number> = {},
     nativeValues: PositionedText[] = [],
   ) => {
-    const fields = { ...seed };
+    const fields = { ...seed, ...previous };
     const texts: string[] = [];
     const iins = new Set<string>();
     if (typeof seed.iin === "string") iins.add(seed.iin);
+    if (typeof previous.iin === "string") iins.add(previous.iin);
     let successfulPasses = 0;
     let lastError: unknown;
     const meta = await sharp(image).metadata();
@@ -339,7 +432,14 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         positioned: false,
       },
     ];
-    for (const pass of passes) {
+    const queue = stage
+      ? recoveryPasses(image, stage).map((pass) => ({
+          image: pass.render,
+          mode: pass.mode,
+          positioned: pass.aligned,
+        }))
+      : passes;
+    for (const pass of queue) {
       if (
         successfulPasses &&
         (!missingDocumentFields("identity", fields).length ||
@@ -368,8 +468,10 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         // from a reliable PDF layer/earlier pass with later OCR guesses.
         for (const [key, value] of Object.entries(found))
           if (fields[key] === undefined) fields[key] = value;
+        if (iins.size > 1 && !conflicts.includes("iin")) conflicts.push("iin");
         delete fields.iin;
-        if (iins.size === 1) fields.iin = [...iins][0];
+        if (iins.size === 1 && !conflicts.includes("iin"))
+          fields.iin = [...iins][0];
       } catch (error) {
         if (error instanceof WrongDocumentKindError) throw error;
         lastError = error;
@@ -433,6 +535,8 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             ...(kind === "receipt" ? extractFields(streamText, kind) : {}),
             ...extractFields(layer, kind),
           };
+          if (kind === "receipt")
+            observeReceiptNumber(layerFields.receiptNumber);
           const layerComplete =
             missingDocumentFields(
               kind === "identity" ? "identity" : "receipt",
@@ -443,9 +547,19 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             Object.assign(nativeFields, layerFields);
             continue;
           }
-          const viewport = page.getViewport({
-            scale: kind === "identity" ? 3 : 2,
-          });
+          const baseScale = kind === "identity" ? 3 : 2;
+          const base = page.getViewport({ scale: baseScale });
+          // Preserve the original input limit. Recovery increases raster detail
+          // only while there is headroom under the same pixel budget.
+          const recoveryScale = Math.min(
+            stage === 1 ? 1.6 : 1.2,
+            Math.sqrt(12_000_000 / (base.width * base.height)),
+          );
+          const viewport = stage
+            ? page.getViewport({
+                scale: baseScale * Math.max(1, recoveryScale),
+              })
+            : base;
           if (viewport.width * viewport.height > 25000000)
             throw new Error("PDF_PAGE_LIMIT");
           const canvas = createCanvas(
@@ -518,8 +632,12 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     } else {
       const prepared = sharp(buffer, { limitInputPixels: 25000000 })
         .rotate()
-        .resize({ width: 2400, height: 3200, fit: "inside" });
-      if (kind === "receipt") prepared.grayscale().normalize();
+        .resize(
+          stage === 1
+            ? { width: 3200, height: 3800, fit: "inside" }
+            : { width: 2400, height: 3200, fit: "inside" },
+        );
+      if (kind === "receipt" && !stage) prepared.grayscale().normalize();
       const image = await prepared.png().toBuffer();
       if (kind === "receipt") {
         const scanned = await scanReceipt(image);
@@ -536,19 +654,27 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       kind === "identity"
         ? nativeFields
         : { ...extractFields(text, kind), ...nativeFields };
+    Object.assign(result, previous);
     if (kind === "identity") {
       const candidates = new Set(
         identityIinCandidates(identitySources.join("\n")),
       );
       if (typeof result.iin === "string") candidates.add(result.iin);
       delete result.iin;
-      if (candidates.size === 1) {
+      if (candidates.size > 1 && !conflicts.includes("iin"))
+        conflicts.push("iin");
+      if (candidates.size === 1 && !conflicts.includes("iin")) {
         result.iin = [...candidates][0];
         if (!result.birthDate) {
           const date = printedBirthDate(identitySources, result);
           if (date) result.birthDate = date;
         }
       }
+    }
+    if (kind === "receipt") {
+      if (receiptNumbers.size > 1 && !conflicts.includes("receiptNumber"))
+        conflicts.push("receiptNumber");
+      if (conflicts.includes("receiptNumber")) delete result.receiptNumber;
     }
     return result;
   } finally {

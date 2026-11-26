@@ -202,3 +202,82 @@ it("enlarges a missing labeled receipt row and reads it without overwriting nati
   const crop = await sharp(engine.recognize.mock.calls[2][0]).metadata();
   expect(crop.height).toBeLessThan(full.height / 2);
 });
+
+describe("later OCR strategies", () => {
+  it("recovers a missing receipt field in a new rendering while keeping verified values", async () => {
+    const previousFields = {
+      amount: 160000,
+      paymentDate: "2026-11-26",
+      paymentTime: "17:16",
+      payerName: "TEST A.",
+      recipientName: "SAMPLE B.",
+      receiptNumber: "TEST-100",
+    };
+    engine.recognize.mockResolvedValueOnce(
+      response(["PAYMENT METHOD: TEST CARD", "TOTAL: 9 KZT"]),
+    );
+    const f = await recognize(await image(), "image/png", "receipt", {
+      recoveryStage: 1,
+      previousFields,
+    });
+    expect(f).toMatchObject({ ...previousFields, method: "TEST CARD" });
+    expect(engine.recognize).toHaveBeenCalledTimes(1);
+    expect(engine.setParameters.mock.calls[0][0]).toMatchObject({
+      thresholding_method: "2",
+    });
+  });
+  it("retains explicit blank patronymic and withholds an IIN disagreement across recovery jobs", async () => {
+    const previousFields = {
+      lastNameLatin: "TEST",
+      firstNameLatin: "PERSON",
+      birthDate: "1975-04-15",
+      middleName: "",
+      iin: "000123456789",
+    };
+    const conflicts: string[] = [];
+    engine.recognize.mockResolvedValue(
+      response(["IIN: 999123456789", "PATRONYMIC: INCORRECT", ...details]),
+    );
+    const f = await recognize(await image(), "image/png", "identity", {
+      recoveryStage: 1,
+      previousFields,
+      conflicts,
+    });
+    expect(f).toMatchObject({
+      issuedBy: "TEST AUTHORITY",
+      middleName: "",
+      documentNumber: "123456789",
+    });
+    expect(f.iin).toBeUndefined();
+    expect(conflicts).toContain("iin");
+    const final = await recognize(await image(), "image/png", "identity", {
+      recoveryStage: 2,
+      previousFields: f,
+      conflicts,
+    });
+    expect(final.iin).toBeUndefined();
+  });
+  it("retains a receipt number conflict across jobs without losing other recovered fields", async () => {
+    const conflicts: string[] = [];
+    engine.recognize.mockResolvedValue(
+      response(["RECEIPT NUMBER: TX-987", "PAYMENT METHOD: TEST CARD"]),
+    );
+    const f = await recognize(await image(), "image/png", "receipt", {
+      recoveryStage: 1,
+      previousFields: { receiptNumber: "TX-123", amount: 900 },
+      conflicts,
+    });
+    expect(f).toMatchObject({ method: "TEST CARD", amount: 900 });
+    expect(f.receiptNumber).toBeUndefined();
+    expect(conflicts).toContain("receiptNumber");
+    expect(
+      (
+        await recognize(await image(), "image/png", "receipt", {
+          recoveryStage: 2,
+          previousFields: f,
+          conflicts,
+        })
+      ).receiptNumber,
+    ).toBeUndefined();
+  });
+});

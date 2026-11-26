@@ -6,7 +6,11 @@ import {
 import type mongoose from "mongoose";
 import { Document, Participant, Payment } from "../models.js";
 
-import { documentErrorMessage } from "./document-errors.js";
+import {
+  documentErrorMessage,
+  documentUnreadable,
+  readingInterrupted,
+} from "./document-errors.js";
 
 export const receiptKey = (value: unknown) =>
   typeof value === "string"
@@ -129,28 +133,23 @@ export async function resumeDraft(doc: any) {
   // Reusing an old partial scan should run the improved reader once, rather
   // than returning its incomplete cached fields forever. Saved attachments
   // are excluded by savedDocumentConflict above.
-  const version =
-    doc.kind === "identity"
-      ? IDENTITY_RECOGNITION_VERSION
-      : RECEIPT_RECOGNITION_VERSION;
-  if (
-    (doc.kind === "identity" || doc.kind === "receipt") &&
-    doc.status === "done" &&
-    (doc.recognitionVersion || 0) < version &&
-    missingDocumentFields(doc.kind, doc.fields || {}).length
-  ) {
+  const version = readerVersion(doc.kind);
+  if (needsReaderUpgrade(doc)) {
     return (
       (await Document.findOneAndUpdate(
         {
           _id: doc._id,
-          status: "done",
+          status: doc.status,
           participantId: null,
           $or: [
             { recognitionVersion: { $exists: false } },
             { recognitionVersion: { $lt: version } },
           ],
         },
-        { $set: { status: "queued" }, $unset: { error: 1 } },
+        {
+          $set: { ...newReadCycle, recognitionVersion: version },
+          $unset: { error: 1 },
+        },
         { new: true },
       ).lean()) ||
       (await Document.findById(doc._id).lean()) ||
@@ -158,6 +157,46 @@ export async function resumeDraft(doc: any) {
     );
   }
   return doc;
+}
+// Manual retries and version upgrades start a fresh reader cycle. Saved fields
+// stay available while the new job is running; only stages within the new
+// cycle carry OCR guesses forward.
+export const newReadCycle = {
+  status: "queued",
+  recoveryStage: 0,
+  recoveryFailures: 0,
+  recoveryConflicts: [],
+  nextReadAt: null,
+  readLease: null,
+  leaseUntil: null,
+};
+
+export function readerVersion(kind?: string | null) {
+  return kind === "identity"
+    ? IDENTITY_RECOGNITION_VERSION
+    : RECEIPT_RECOGNITION_VERSION;
+}
+
+export function needsReaderUpgrade(doc: {
+  kind?: string | null;
+  status?: string | null;
+  fields?: Record<string, unknown>;
+  recognitionVersion?: number | null;
+  error?: string | null;
+}) {
+  if (
+    (doc.kind !== "identity" && doc.kind !== "receipt") ||
+    (doc.recognitionVersion ?? 0) >= readerVersion(doc.kind)
+  )
+    return false;
+  if (doc.status === "failed") {
+    const error = documentErrorMessage(doc.error);
+    return error === readingInterrupted || error === documentUnreadable;
+  }
+  return (
+    doc.status === "done" &&
+    missingDocumentFields(doc.kind, doc.fields || {}).length > 0
+  );
 }
 export function uploadResult(doc: any, reused = false) {
   return {
@@ -202,41 +241,45 @@ export async function recognitionConflict(
 export async function completeRecognition(
   doc: any,
   fields: Record<string, unknown>,
+  recovery?: { nextStage?: number; conflicts: string[] },
 ) {
   const conflict = await recognitionConflict(doc, fields);
-  if (conflict) {
-    await Document.updateOne(
-      { _id: doc._id },
-      {
-        $set: {
-          status: "duplicate",
-          fields,
-          error: conflict.message,
-          duplicate: conflict,
-          completedAt: new Date(),
-          recognitionVersion:
-            doc.kind === "identity"
-              ? IDENTITY_RECOGNITION_VERSION
-              : RECEIPT_RECOGNITION_VERSION,
-        },
-        $unset: { recognitionKey: 1 },
+  const filter = {
+    _id: doc._id,
+    ...(doc.readLease
+      ? { status: "processing", readLease: doc.readLease }
+      : {}),
+  };
+  const checkpoint = {
+    fields,
+    recognitionVersion: readerVersion(doc.kind),
+    recoveryFailures: 0,
+    recoveryConflicts: recovery?.conflicts ?? [],
+  };
+  const released = {
+    readLease: 1,
+    leaseUntil: 1,
+    nextReadAt: 1,
+    recognitionKey: 1,
+  };
+  if (!conflict && recovery?.nextStage !== undefined) {
+    await Document.updateOne(filter, {
+      $set: {
+        ...checkpoint,
+        status: "queued",
+        recoveryStage: recovery.nextStage,
       },
-    );
+      $unset: { ...released, completedAt: 1, duplicate: 1, error: 1 },
+    });
     return;
   }
-  await Document.updateOne(
-    { _id: doc._id },
-    {
-      $set: {
-        status: "done",
-        fields,
-        completedAt: new Date(),
-        recognitionVersion:
-          doc.kind === "identity"
-            ? IDENTITY_RECOGNITION_VERSION
-            : RECEIPT_RECOGNITION_VERSION,
-      },
-      $unset: { error: 1, duplicate: 1, recognitionKey: 1 },
+  await Document.updateOne(filter, {
+    $set: {
+      ...checkpoint,
+      status: conflict ? "duplicate" : "done",
+      completedAt: new Date(),
+      ...(conflict ? { error: conflict.message, duplicate: conflict } : {}),
     },
-  );
+    $unset: { ...released, ...(!conflict ? { error: 1, duplicate: 1 } : {}) },
+  });
 }

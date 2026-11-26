@@ -45,13 +45,11 @@ import {
   receiptKey,
   savedDocumentConflict,
   resumeDraft,
+  newReadCycle,
+  needsReaderUpgrade,
+  readerVersion,
   uploadResult,
 } from "./services/duplicates.js";
-import {
-  IDENTITY_RECOGNITION_VERSION,
-  RECEIPT_RECOGNITION_VERSION,
-  missingDocumentFields,
-} from "../shared/document-recognition.js";
 import { documentErrorMessage } from "./services/document-errors.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
@@ -748,15 +746,9 @@ export function createApp() {
       Document.findOne(owned).select(documentStatusFields).lean();
     let doc = await current();
     if (!doc) throw new HttpError(404, "Құжат табылмады.");
-    const version =
-      doc.kind === "identity"
-        ? IDENTITY_RECOGNITION_VERSION
-        : RECEIPT_RECOGNITION_VERSION;
+    const version = readerVersion(doc.kind);
     if (
-      (doc.kind === "identity" || doc.kind === "receipt") &&
-      doc.status === "done" &&
-      (doc.recognitionVersion ?? 0) < version &&
-      missingDocumentFields(doc.kind, doc.fields || {}).length &&
+      needsReaderUpgrade(doc) &&
       (doc.kind === "identity"
         ? await Participant.exists({ identityDocumentId: doc._id })
         : await Payment.exists({ receiptDocumentId: doc._id }))
@@ -767,12 +759,12 @@ export function createApp() {
         (await Document.findOneAndUpdate(
           {
             ...owned,
-            status: "done",
+            status: doc.status,
             recognitionVersion: doc.recognitionVersion ?? null,
           },
           {
             $set: {
-              status: "queued",
+              ...newReadCycle,
               recognitionVersion: version,
             },
             $unset: { error: 1 },
@@ -793,7 +785,7 @@ export function createApp() {
         status: { $in: ["failed", "done"] },
         attempts: { $lt: 3 },
       },
-      { $set: { status: "queued", error: null } },
+      { $set: { ...newReadCycle, error: null } },
       { new: true },
     );
     if (!doc) throw new HttpError(400, "Қайта оқу мүмкін емес.");
