@@ -1895,8 +1895,19 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const doc = await Document.create({
       kind: "identity",
       status: "done",
-      fields: { lastName: "Сынақ" },
-      recognitionVersion: 4,
+      fields: {
+        lastName: "Сынақ",
+        firstName: "Сынақ",
+        firstNameLatin: "SAMPLE",
+        lastNameLatin: "SAMPLE",
+        iin: "000123456789",
+        birthDate: "1975-04-15",
+        documentNumber: "000123456",
+        issuedBy: "01.02.2020 — 01.02.2030",
+        issueDate: "2020-02-01",
+        expiryDate: "2030-02-01",
+      },
+      recognitionVersion: 5,
       attempts: 3,
     });
     expect((await resumeDraft(doc)).status).toBe("queued");
@@ -1905,7 +1916,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     await completeRecognition(doc, { lastName: "Сынақ" });
     const updated = await Document.findById(doc._id);
-    expect(updated!.recognitionVersion).toBe(5);
+    expect(updated!.recognitionVersion).toBe(6);
     expect((await resumeDraft(updated)).status).toBe("done");
     expect(await Document.countDocuments({ _id: doc._id })).toBe(1);
   });

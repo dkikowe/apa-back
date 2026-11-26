@@ -1,4 +1,8 @@
-import { parseMoney } from "../../shared/domain.js";
+import {
+  invalidIdentityFields,
+  parseMoney,
+  validIdentityIssuer,
+} from "../../shared/domain.js";
 function dateValue(raw: string) {
   const isoMatch = raw.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   const localMatch = raw.match(/\b(\d{2})[./-](\d{2})[./-](\d{4})\b/);
@@ -147,7 +151,89 @@ const identityExtraLabel = prefix([
   "ПОЛ",
   "SEX",
 ]);
+// Match OCR's common substitutions in field headings only. Keep dates and
+// institution names in their printed spelling.
+function foldHeading(value: string) {
+  return value
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[қ]/gu, "к")
+    .replace(/[үұ]/gu, "у")
+    .replace(/[іi1]/gu, "и")
+    .replace(/3/gu, "з")
+    .replace(/[^\p{L}]/gu, "");
+}
+const issueHeadings = labels.issueDate.map(foldHeading);
+const expiryHeadings = [
+  ...labels.expiryDate,
+  "VALID UNTIL",
+  "VALID THRU",
+  "VALIDITY PERIOD",
+].map(foldHeading);
+const identityDateToken =
+  /\b(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}-\d{2}-\d{2})\b/gu;
+function validityHeading(line: string) {
+  const at = line.search(identityDateToken);
+  const heading = foldHeading(at < 0 ? line : line.slice(0, at));
+  const issue = issueHeadings.some((label) => heading.includes(label));
+  const expiry = expiryHeadings.some((label) => heading.includes(label));
+  return issue || expiry
+    ? { issue, expiry, inline: at < 0 ? "" : line.slice(at) }
+    : undefined;
+}
+
+// Bind a single printed date to its own heading. Under a combined heading,
+// wait for both dates; the sole readable date could be either endpoint.
+function readValidity(lines: string[]) {
+  const starts = new Set<string>(),
+    ends = new Set<string>();
+  for (let i = 0; i < lines.length; i++) {
+    const header = validityHeading(lines[i]);
+    if (!header) continue;
+    let { issue, expiry, inline } = header;
+    while (!inline && i + 1 < lines.length) {
+      const next = validityHeading(lines[i + 1]);
+      if (!next) break;
+      ++i;
+      issue ||= next.issue;
+      expiry ||= next.expiry;
+      inline = next.inline;
+    }
+    let value = inline;
+    while (
+      i + 1 < lines.length &&
+      /^[\d./\s–—−-]+$/u.test(lines[i + 1]) &&
+      (lines[i + 1].search(identityDateToken) >= 0 ||
+        /^[–—−-]$/u.test(lines[i + 1]))
+    ) {
+      value += " " + lines[++i];
+    }
+    const form = value.trim().replace(identityDateToken, "@");
+    const dates = [...value.matchAll(identityDateToken)].map((match) =>
+      dateValue(match[0]),
+    );
+    if (
+      dates.length === 2 &&
+      dates[0] &&
+      dates[1] &&
+      dates[0] < dates[1] &&
+      (/^@\s*[–—−-]\s*@$/u.test(form) ||
+        (issue && expiry && /^@\s+@$/u.test(form)))
+    ) {
+      starts.add(dates[0]);
+      ends.add(dates[1]);
+    } else if (form === "@" && dates[0] && issue !== expiry) {
+      (issue ? starts : ends).add(dates[0]);
+    }
+  }
+  const result: Record<string, string> = {};
+  if (starts.size === 1) result.issueDate = [...starts][0];
+  if (ends.size === 1) result.expiryDate = [...ends][0];
+  for (const key of invalidIdentityFields(result)) delete result[key];
+  return result;
+}
 function isIdentityFieldLabel(value: string) {
+  if (validityHeading(value)) return true;
   return value.split(/[/|]/).some((part) => {
     const text = part.trim();
     return (
@@ -181,7 +267,15 @@ export function extractIdentityLayout(
   ] as const) {
     const found: string[] = [];
     for (const anchor of anchors) {
-      if (!prefix(labels[key]).test(anchor.text.trim())) continue;
+      const validity =
+        (key === "issueDate" || key === "expiryDate") &&
+        validityHeading(anchor.text);
+      if (
+        validity
+          ? !(key === "issueDate" ? validity.issue : validity.expiry)
+          : !prefix(labels[key]).test(anchor.text.trim())
+      )
+        continue;
       const height = Math.max(1, anchor.bbox.y1 - anchor.bbox.y0);
       const candidates = values
         .filter((value) => {
@@ -212,6 +306,13 @@ export function extractIdentityLayout(
         continue;
       const value = candidates[0].text.trim();
       if (
+        validity &&
+        validity.issue &&
+        validity.expiry &&
+        [...value.matchAll(identityDateToken)].length !== 2
+      )
+        continue;
+      if (
         key.endsWith("Date")
           ? Boolean(dateValue(value))
           : key === "iin"
@@ -219,7 +320,9 @@ export function extractIdentityLayout(
             : key === "documentNumber"
               ? /^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(value)
               : key === "issuedBy"
-                ? value.length >= 3 && value.length <= 200
+                ? validIdentityIssuer(value) &&
+                  value.length >= 3 &&
+                  value.length <= 200
                 : /^[\p{Script=Cyrillic}A-Za-z\s’'-]{2,100}$/u.test(value)
       )
         found.push(value);
@@ -410,27 +513,6 @@ export function identityDetails(text: string) {
     ];
     if (values.length === 1) result[key] = values[0];
   }
-  if (
-    /БЕРІЛГЕН\s+КҮНІ|ДАТА\s+ВЫДАЧИ|ЖАРАМДЫЛЫҚ\s+МЕРЗІМІ|СРОК\s+ДЕЙСТВИЯ/iu.test(
-      text,
-    )
-  ) {
-    const ranges = [
-      ...text.matchAll(
-        /(\d{2}[./]\d{2}[./]\d{4})\s*[-–—]\s*(\d{2}[./]\d{2}[./]\d{4})/g,
-      ),
-    ];
-    const unique = [...new Set(ranges.map((r) => r[1] + "|" + r[2]))];
-    if (unique.length === 1) {
-      const [a, b] = unique[0].split("|");
-      const start = dateValue(a),
-        end = dateValue(b);
-      if (start && end && start <= end) {
-        result.issueDate = start;
-        result.expiryDate = end;
-      }
-    }
-  }
   return result;
 }
 function normalizeReceiptLabels(text: string) {
@@ -494,7 +576,12 @@ export function extractFields(text: string, kind: string) {
     return foundEmpty ? "" : undefined;
   }
   if (kind === "identity") {
-    Object.assign(fields, machineReadableNames(text), identityDetails(text));
+    Object.assign(
+      fields,
+      machineReadableNames(text),
+      identityDetails(text),
+      readValidity(lines),
+    );
     for (const key of ["lastName", "firstName", "middleName"] as const) {
       // PDF text order may put English name rows before the native names.
       const allowEmpty = key === "middleName";
@@ -535,33 +622,15 @@ export function extractFields(text: string, kind: string) {
       const value = labeled([...aliases]);
       if (value && /^[A-Za-z\s’'-]{2,100}$/.test(value)) fields[key] = value;
     }
-    for (const key of [
-      "documentNumber",
-      "issuedBy",
-      "issueDate",
-      "expiryDate",
-    ] as const) {
-      const value = labeled(labels[key], false, key.endsWith("Date"));
-      if (!value) continue;
-      if (key.endsWith("Date")) {
-        const dates =
-          value.match(/\d{2}[./]\d{2}[./]\d{4}|\d{4}-\d{2}-\d{2}/g) || [];
-        if (dates.length === 2) {
-          const start = dateValue(dates[0]),
-            end = dateValue(dates[1]);
-          if (start && end && start <= end) {
-            fields.issueDate = start;
-            fields.expiryDate = end;
-          }
-        } else {
-          const date = dateValue(value);
-          if (date && !fields[key]) fields[key] = date;
-        }
-      } else if (key === "documentNumber") {
-        const number = value.replace(/^№\s*/, "");
-        if (/^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(number)) fields[key] = number;
-      } else if (value.length >= 3 && value.length <= 200) fields[key] = value;
+    const doc = labeled(labels.documentNumber);
+    if (doc) {
+      const number = doc.replace(/^№\s*/, "");
+      if (/^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(number))
+        fields.documentNumber = number;
     }
+    const issuer = labeled(labels.issuedBy, false, false, validIdentityIssuer);
+    if (issuer && issuer.length >= 3 && issuer.length <= 200)
+      fields.issuedBy = issuer;
     const birth = labeled(labels.birthDate, false, true);
     if (birth) {
       const date = dateValue(birth);

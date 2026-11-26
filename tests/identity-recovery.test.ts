@@ -11,7 +11,11 @@ vi.mock("tesseract.js", async (original) => ({
 }));
 import { recognize } from "../server/services/ocr.js";
 import { missingDocumentFields } from "../shared/document-recognition.js";
-import { printedBirthDate } from "../server/services/document-fields.js";
+import {
+  extractFields,
+  extractIdentityLayout,
+  printedBirthDate,
+} from "../server/services/document-fields.js";
 import { textPdf } from "./ocr-fixtures.js";
 const core = [
   "SURNAME: TEST",
@@ -201,6 +205,96 @@ it("enlarges a missing labeled receipt row and reads it without overwriting nati
   const full = await sharp(engine.recognize.mock.calls[0][0]).metadata();
   const crop = await sharp(engine.recognize.mock.calls[2][0]).metadata();
   expect(crop.height).toBeLessThan(full.height / 2);
+});
+
+describe("issuer and validity on identity cards", () => {
+  const period = { issueDate: "2020-01-02", expiryDate: "2030-01-01" };
+  const interval = "02.01.2020 — 01.01.2030";
+  it.each([
+    "Жарамдылық мерзімі",
+    "Жарамдылык мерзими / Срок действия",
+    "Жарамдылықмерзiмi",
+    "БЕРІЛГЕН КҮНІ — ҚОЛДАНЫЛУ МЕРЗІМІ/ДАТА ВЫДАЧИ — СРОК ДЕЙСТВИЯ",
+  ])(
+    "reads the printed interval separately from the authority under %s",
+    (label) => {
+      const rows = [
+        "БЕРГЕН ОРГАН / ОРГАН ВЫДАЧИ",
+        label,
+        "02.01.2020",
+        "—",
+        "01.01.2030",
+      ];
+      expect(extractFields(rows.join("\n"), "identity")).toEqual(period);
+      rows.push("КЕМ ВЫДАН", "ҚР ІІМ");
+      expect(extractFields(rows.join("\n"), "identity")).toEqual({
+        ...period,
+        issuedBy: "ҚР ІІМ",
+      });
+    },
+  );
+  it("never assigns a lone date under a combined field, a missing endpoint, or a reversed range", () => {
+    const label = "DATE OF ISSUE / DATE OF EXPIRY";
+    for (const lines of [
+      [label, "02.01.2020"],
+      [label, "—", "02.01.2020"],
+      [label, "02.01.2020 —"],
+      [label, "01.01.2030 — 02.01.2020"],
+      ["БЕРІЛГЕН КҮНІ", "СРОК ДЕЙСТВИЯ", "02.01.2020"],
+      ["ДАТА ВЫДАЧИ: 01.01.2030", "СРОК ДЕЙСТВИЯ: 02.01.2020"],
+    ])
+      expect(extractFields(lines.join("\n"), "identity")).toEqual({});
+    expect(
+      extractFields([label, "02.01.2020", "01.01.2030"].join("\n"), "identity"),
+    ).toEqual(period);
+  });
+  it("does not let a nearby native PDF date range fill an issuing-authority column", () => {
+    const at = (text: string, x: number, y: number) => ({
+      text,
+      bbox: { x0: x, x1: x + 90, y0: y, y1: y + 10 },
+    });
+    const values = [at(interval, 100, 125), at("МВД РК", 350, 125)];
+    expect(extractIdentityLayout(values, [at("КЕМ ВЫДАН", 100, 105)])).toEqual(
+      {},
+    );
+    expect(
+      extractIdentityLayout(values, [
+        at("Жарамдылык мерзими", 100, 105),
+        at("КЕМ ВЫДАН", 350, 105),
+      ]),
+    ).toEqual({ ...period, issuedBy: "МВД РК" });
+    expect(extractFields("ISSUED BY\n" + interval, "identity")).toEqual({});
+  });
+  it("replaces an invalid checkpoint issuer and a lone earlier date with the verified printed values", async () => {
+    const previousFields = {
+      lastNameLatin: "TEST",
+      firstNameLatin: "PERSON",
+      birthDate: "1975-04-15",
+      iin: "000123456789",
+      documentNumber: "123456789",
+      issuedBy: interval,
+      expiryDate: period.issueDate,
+    };
+    engine.recognize.mockResolvedValueOnce(response(["ISSUED BY", interval]));
+    engine.recognize.mockResolvedValueOnce(
+      response([
+        "ISSUED BY: TEST AUTHORITY",
+        "DATE OF ISSUE / DATE OF EXPIRY",
+        interval,
+      ]),
+    );
+    const result = await recognize(await image(), "image/png", "identity", {
+      recoveryStage: 1,
+      previousFields,
+    });
+    expect(result).toMatchObject({
+      ...previousFields,
+      issuedBy: "TEST AUTHORITY",
+      ...period,
+    });
+    expect(engine.recognize).toHaveBeenCalledTimes(2);
+    expect(previousFields.issuedBy).toBe(interval);
+  });
 });
 
 describe("later OCR strategies", () => {

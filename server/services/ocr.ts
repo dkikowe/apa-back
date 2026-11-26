@@ -3,6 +3,7 @@ export { OCR_LAST_ROUND, WrongDocumentKindError } from "./ocr-policy.js";
 import { createWorker, PSM } from "tesseract.js";
 import { createCanvas, DOMMatrix, ImageData, Path2D } from "@napi-rs/canvas";
 import sharp from "sharp";
+import { invalidIdentityFields } from "../../shared/domain.js";
 import { missingDocumentFields } from "../../shared/document-recognition.js";
 import {
   extractFields,
@@ -95,6 +96,23 @@ function receiptBands(items: PositionedText[], height: number) {
   });
 }
 type Fields = Record<string, string | number>;
+// A printed start/end pair supplies stronger evidence than one previously
+// recognized endpoint. Keep all other accepted readings, including an
+// explicitly absent patronymic, across pages and recovery rounds.
+function mergeIdentityFields(fields: Fields, found: Fields) {
+  if (
+    found.issueDate &&
+    found.expiryDate &&
+    (!fields.issueDate || !fields.expiryDate)
+  ) {
+    fields.issueDate = found.issueDate;
+    fields.expiryDate = found.expiryDate;
+  }
+  for (const [key, value] of Object.entries(found))
+    if (fields[key] === undefined) fields[key] = value;
+  for (const key of invalidIdentityFields(fields)) delete fields[key];
+  return fields;
+}
 type RecoveryOptions = {
   recoveryStage?: number;
   previousFields?: Fields;
@@ -185,7 +203,10 @@ export async function recognize(
   options: RecoveryOptions = {},
 ) {
   const stage = options.recoveryStage ?? 0;
-  const previous = options.previousFields ?? {};
+  const previous = { ...options.previousFields };
+  if (kind === "identity") {
+    for (const key of invalidIdentityFields(previous)) delete previous[key];
+  }
   const conflicts = options.conflicts ?? [];
   const receiptNumbers = new Set<string>();
   function observeReceiptNumber(value: unknown) {
@@ -431,7 +452,7 @@ export async function recognize(
     seed: Record<string, string | number> = {},
     nativeValues: PositionedText[] = [],
   ) => {
-    const fields = { ...seed, ...previous };
+    const fields = mergeIdentityFields({ ...previous }, seed);
     const texts: string[] = [];
     const iins = new Set<string>();
     if (typeof seed.iin === "string") iins.add(seed.iin);
@@ -523,10 +544,7 @@ export async function recognize(
         };
         for (const value of identityIinCandidates(result.text)) iins.add(value);
         if (typeof found.iin === "string") iins.add(found.iin);
-        // Explicitly empty patronymics are meaningful. Never replace values
-        // from a reliable PDF layer/earlier pass with later OCR guesses.
-        for (const [key, value] of Object.entries(found))
-          if (fields[key] === undefined) fields[key] = value;
+        mergeIdentityFields(fields, found);
         if (iins.size > 1 && !conflicts.includes("iin")) conflicts.push("iin");
         delete fields.iin;
         if (iins.size === 1 && !conflicts.includes("iin"))
@@ -711,9 +729,8 @@ export async function recognize(
     }
     const result =
       kind === "identity"
-        ? nativeFields
-        : { ...extractFields(text, kind), ...nativeFields };
-    Object.assign(result, previous);
+        ? mergeIdentityFields({ ...previous }, nativeFields)
+        : { ...extractFields(text, kind), ...nativeFields, ...previous };
     if (kind === "identity") {
       const candidates = new Set(
         identityIinCandidates(identitySources.join("\n")),
