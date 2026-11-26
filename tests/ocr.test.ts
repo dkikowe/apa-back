@@ -11,9 +11,11 @@ import {
 const receipt = [
   "SYNTHETIC RECEIPT",
   "TOTAL: 6,487.00 KZT",
-  "DATE: 18.11.2026",
+  "DATE: 18.11.2026 16:49",
   "RECIPIENT: TEST ORGANIZATION",
   "RECEIPT NUMBER: TEST-2026-100",
+  "PAYER: DEMO PERSON",
+  "PAYMENT METHOD: TEST CARD",
 ];
 const identity = [
   "SYNTHETIC IDENTITY DOCUMENT",
@@ -30,6 +32,9 @@ describe("PDF text extraction", () => {
       amount: 648700,
       paymentDate: "2026-11-18",
       recipientName: "TEST ORGANIZATION",
+      paymentTime: "16:49",
+      payerName: "DEMO PERSON",
+      method: "TEST CARD",
       receiptNumber: "TEST-2026-100",
     }));
   it("keeps the spelling of Latin names from a text PDF", async () =>

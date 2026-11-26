@@ -170,6 +170,14 @@ function recoveryPasses(image: Buffer, stage: number): RecoveryPass[] {
   ];
 }
 
+function qrPrefixMisread(value: string, qr: string) {
+  const digits = qr.slice(2);
+  return (
+    value.endsWith(digits) &&
+    /^(?:[0OQ(][()0285BR]{0,2})?$/i.test(value.slice(0, -digits.length))
+  );
+}
+
 export async function recognize(
   buffer: Buffer,
   mime: string,
@@ -223,6 +231,9 @@ export async function recognize(
   ) => {
     const fields = { ...seed, ...previous };
     const { width, height } = await sharp(image).metadata();
+    // Scope visually verified QR codes to this page: another page may carry
+    // a different receipt, which must still trigger conflict detection.
+    const printedQr = new Set<string>();
     const gray = () => sharp(image).grayscale().normalize();
     const section = (bottom: boolean) => {
       const cropHeight = Math.ceil(height * 0.65);
@@ -281,11 +292,8 @@ export async function recognize(
       if (pass.keys && pass.keys.every((key) => fields[key] !== undefined))
         continue;
       try {
-        const result = await scan(
-          await pass.render(),
-          pass.mode,
-          !!pass.collectRows,
-        );
+        const rendered = await pass.render();
+        const result = await scan(rendered, pass.mode, !!pass.collectRows);
         read = true;
         const lines =
           result.blocks?.flatMap((b) => b.paragraphs.flatMap((p) => p.lines)) ||
@@ -294,8 +302,59 @@ export async function recognize(
           ...extractFields(result.text, "receipt"),
           ...extractFields(receiptTextLines(lines), "receipt"),
         };
-        if (!pass.keys || pass.keys.includes("receiptNumber"))
+        // In Cyrillic text Tesseract can read the letters in QR as 08 or 05.
+        // Inspect the actual token pixels before accepting a numeric reading.
+        for (const line of lines) {
+          if (!receiptHeadingFields(line.text).includes("receiptNumber"))
+            continue;
+          const word = line.words?.at(-1);
+          if (
+            !word ||
+            /^QR\d+$/i.test(word.text) ||
+            !/^[0OQ(][()0285BR]{0,2}\d{6,39}$/i.test(word.text)
+          )
+            continue;
+          const { x0, y0, x1, y1 } = word.bbox;
+          if (x1 <= x0 || y1 <= y0) continue;
+          const token = await sharp(rendered)
+            .extract({ left: x0, top: y0, width: x1 - x0, height: y1 - y0 })
+            .extend({
+              top: 8,
+              bottom: 8,
+              left: 8,
+              right: 8,
+              background: "white",
+            })
+            .png()
+            .toBuffer();
+          await worker!.setParameters({
+            tessedit_pageseg_mode: PSM.SINGLE_LINE,
+            tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+          });
+          let code: string;
+          try {
+            code = (await worker!.recognize(token)).data.text.trim();
+          } finally {
+            await worker!.setParameters({ tessedit_char_whitelist: "" });
+          }
+          if (/^QR\d{6,39}$/.test(code)) {
+            if (qrPrefixMisread(word.text, code)) printedQr.add(code);
+            else {
+              observeReceiptNumber(code);
+              observeReceiptNumber(word.text);
+            }
+          }
+        }
+        if (!pass.keys || pass.keys.includes("receiptNumber")) {
+          const number = found.receiptNumber;
+          const matched = [...printedQr].filter(
+            (code) =>
+              number === undefined || qrPrefixMisread(String(number), code),
+          );
+          if (matched.length === 1) found.receiptNumber = matched[0];
+          for (const code of printedQr) observeReceiptNumber(code);
           observeReceiptNumber(found.receiptNumber);
+        }
         for (const [key, value] of Object.entries(found))
           if (
             fields[key] === undefined &&

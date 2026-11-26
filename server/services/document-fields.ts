@@ -126,7 +126,7 @@ const receiptHeadings = (
 
 export function receiptHeadingFields(line: string): string[] {
   const match = receiptHeadings.find(({ heading }) =>
-    heading.test(line.trim()),
+    heading.test(normalizeReceiptLabels(line).trim()),
   );
   if (!match) return [];
   return match.field === "paymentDate"
@@ -435,6 +435,7 @@ export function identityDetails(text: string) {
 }
 function normalizeReceiptLabels(text: string) {
   return text
+    .replace(/(Түбіртек)[ \t]+(?:[МMНHN][оo°]\.?)(?=\s|$)/giu, "$1 №")
     .replace(/(?:№|N[oо°]?\.?)[ \t]*(чека|квитанции)/giu, "№ $1")
     .replace(/№[ \t]*\n[ \t]*(чека|квитанции)/giu, "№ $1");
 }
@@ -453,7 +454,12 @@ export function extractFields(text: string, kind: string) {
     .map((v) => v.trim())
     .filter(Boolean);
   const fields: Record<string, string | number> = {};
-  function labeled(aliases: string[], allowEmpty = false, dateField = false) {
+  function labeled(
+    aliases: string[],
+    allowEmpty = false,
+    dateField = false,
+    accept?: (value: string) => boolean,
+  ) {
     let foundEmpty = false;
     const expression = prefix(aliases);
     for (let i = 0; i < lines.length; i++) {
@@ -483,14 +489,19 @@ export function extractFields(text: string, kind: string) {
         foundEmpty = true;
         continue;
       }
-      if (value && !isLabel) return value.trim();
+      if (value && !isLabel && (!accept || accept(value))) return value.trim();
     }
     return foundEmpty ? "" : undefined;
   }
   if (kind === "identity") {
     Object.assign(fields, machineReadableNames(text), identityDetails(text));
     for (const key of ["lastName", "firstName", "middleName"] as const) {
-      const value = labeled(labels[key], key === "middleName");
+      // PDF text order may put English name rows before the native names.
+      const allowEmpty = key === "middleName";
+      const value =
+        labeled(labels[key], allowEmpty, false, (v) =>
+          /\p{Script=Cyrillic}/u.test(v),
+        ) ?? labeled(labels[key], allowEmpty);
       if (key === "middleName" && value === "") fields.middleName = "";
       if (!value) continue;
       const chunks = value.split(/\s*[/|]\s*/);

@@ -171,6 +171,7 @@ describe("receipt number and payment source variants", () => {
     ["№\nчека\nQR\n123456789", "QR123456789"],
     ["№ квитанции\n001 234 567\n890", "001234567890"],
     ["QR123456789", "QR123456789"],
+    ["Түбіртек Мо QR123456789", "QR123456789"],
     ["Чек нөмірі: 001234567", "001234567"],
   ])("reads %s", (text, expected) => {
     expect(extractFields(text, "receipt").receiptNumber).toBe(expected);

@@ -204,6 +204,43 @@ it("enlarges a missing labeled receipt row and reads it without overwriting nati
 });
 
 describe("later OCR strategies", () => {
+  it("recovers Cyrillic names even when their Latin spellings are already complete", async () => {
+    const previousFields = {
+      lastNameLatin: "TEST",
+      firstNameLatin: "PERSON",
+      iin: "000123456789",
+      birthDate: "1975-04-15",
+      documentNumber: "123456789",
+      issuedBy: "СЫНАҚ ОРГАНЫ",
+      issueDate: "2020-01-01",
+      expiryDate: "2030-01-01",
+    };
+    expect(missingDocumentFields("identity", previousFields)).toEqual([
+      "тегі",
+      "аты",
+    ]);
+    expect(
+      missingDocumentFields("identity", {
+        ...previousFields,
+        issuedBy: "TEST AUTHORITY",
+        lastName: "СЫНАҚ",
+      }),
+    ).toEqual(["аты"]);
+    engine.recognize
+      .mockResolvedValueOnce(response(["SURNAME: TEST", "ТЕГІ: СЫНАҚ"]))
+      .mockResolvedValueOnce(response(["GIVEN NAMES: PERSON", "АТЫ: ҮЛГІ"]));
+    const fields = await recognize(await image(), "image/png", "identity", {
+      recoveryStage: 1,
+      previousFields,
+    });
+    expect(fields).toMatchObject({
+      ...previousFields,
+      lastName: "СЫНАҚ",
+      firstName: "ҮЛГІ",
+    });
+    expect(engine.recognize).toHaveBeenCalledTimes(2);
+    expect(missingDocumentFields("identity", fields)).toEqual([]);
+  });
   it("recovers a missing receipt field in a new rendering while keeping verified values", async () => {
     const previousFields = {
       amount: 160000,
@@ -257,6 +294,46 @@ describe("later OCR strategies", () => {
     });
     expect(final.iin).toBeUndefined();
   });
+  it.each([
+    ["QR123456789", "QR123456789"],
+    ["QR123456780", undefined],
+    ["08123456789", "08123456789"],
+  ])(
+    "reads the mixed-script receipt number from its own pixels (%s)",
+    async (token, expected) => {
+      const line = "Түбіртек Мо 08123456789";
+      const bbox = { x0: 12, y0: 12, x1: 85, y1: 24 };
+      engine.recognize
+        .mockResolvedValueOnce({
+          data: {
+            text: line,
+            blocks: [
+              {
+                paragraphs: [
+                  {
+                    lines: [
+                      {
+                        text: line,
+                        bbox,
+                        words: [{ text: "08123456789", bbox }],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        })
+        .mockResolvedValueOnce(response([token!]));
+      const fields = await recognize(await image(), "image/png", "receipt");
+      expect(fields.receiptNumber).toBe(expected);
+      expect(engine.setParameters).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        }),
+      );
+    },
+  );
   it("retains a receipt number conflict across jobs without losing other recovered fields", async () => {
     const conflicts: string[] = [];
     engine.recognize.mockResolvedValue(
