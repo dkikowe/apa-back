@@ -76,6 +76,7 @@ describe("bank transfer receipt variants", () => {
       paymentDate: "2026-10-16",
       paymentTime: "15:08",
       receiptNumber: "3503000001",
+      method: "• 1111",
       recipientName: "Үлгі Б.",
       receiptType: "personal",
       payerName: "Сынақ А.",
