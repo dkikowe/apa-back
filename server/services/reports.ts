@@ -201,14 +201,22 @@ export async function makeReport(type: string, f: Filters) {
       { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
       { header: "Төлем түрі", key: "paymentCategoryLabel", width: 32 },
     ];
-    const members = await Participant.aggregate([
-      ...memberPipeline(f),
-      { $project: { _id: 1 } },
-    ]);
+    // The unfiltered ledger includes tombstones (archive state is cleared
+    // on deletion). Personal filters only apply to identifiable profiles.
+    const overall =
+      f.archived !== "true" && !f.region && !f.age && !f.q.trim() && !f.status;
+    const memberIds = overall
+      ? await Participant.distinct("_id", { archivedAt: null })
+      : (
+          await Participant.aggregate([
+            ...memberPipeline(f),
+            { $project: { _id: 1 } },
+          ])
+        ).map((m) => m._id);
     for await (const row of Payment.find({
       year: f.year,
       voidedAt: null,
-      participantId: { $in: members.map((m) => m._id) },
+      participantId: { $in: memberIds },
     })
       .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
       .populate("participantId")
@@ -221,7 +229,10 @@ export async function makeReport(type: string, f: Filters) {
         receiptTypeLabel:
           RECEIPT_TYPES[row.receiptType as keyof typeof RECEIPT_TYPES] ||
           "Көрсетілмеген",
-        name: [p.lastName, p.firstName, p.middleName].filter(Boolean).join(" "),
+        name:
+          !p || p.deletedAt
+            ? "Жойылған қатысушы"
+            : [p.lastName, p.firstName, p.middleName].filter(Boolean).join(" "),
         amount: row.amount! / 100,
       });
     }

@@ -118,7 +118,7 @@ function keys(p: any) {
 }
 async function existingKeys(session?: mongoose.ClientSession) {
   const set = new Set<string>();
-  const query = Participant.find()
+  const query = Participant.find({ deletedAt: null })
     .select("lastName firstName birthDate iin documentNumber importKey")
     .lean();
   if (session) query.session(session);

@@ -45,6 +45,7 @@ export async function participantConflict(
 ) {
   if (!iin) return null;
   const p = await Participant.findOne({
+    deletedAt: null,
     iin,
     ...(except ? { _id: { $ne: except } } : {}),
   })
@@ -78,32 +79,61 @@ export async function paymentConflict(
     .session(session || null)
     .lean();
   if (!pay) return null;
-  const p = await Participant.findById(pay.participantId)
+  return savedPaymentConflict(pay, session);
+}
+
+export async function savedPaymentConflict(
+  pay: { _id: mongoose.Types.ObjectId; participantId: mongoose.Types.ObjectId },
+  session?: mongoose.ClientSession,
+): Promise<DuplicateInfo> {
+  const p = await Participant.findOne({
+    _id: pay.participantId,
+    deletedAt: null,
+  })
+    .select("lastName firstName")
     .session(session || null)
     .lean();
   return {
     message: `Бұл чек бұрын тіркелген${name(p) ? `: ${name(p)}` : ""}. Қайта қосуға болмайды.`,
-    participantId: String(pay.participantId),
+    ...(p ? { participantId: String(p._id) } : {}),
     paymentId: String(pay._id),
   };
+}
+// A cached duplicate may outlive the participant it linked to. Recheck
+// against current records before showing that link or refusing a save.
+export async function currentDocumentDuplicate(
+  doc: any,
+  session?: mongoose.ClientSession,
+) {
+  const cached = doc.duplicate;
+  const removed =
+    cached?.participantId &&
+    (await Participant.exists({
+      _id: cached.participantId,
+      deletedAt: { $ne: null },
+    }).session(session || null));
+  if (cached && !removed) return cached;
+  return recognitionConflict(doc, doc.fields || {}, session);
 }
 // Uploads are drafts until a participant/payment actually references them.
 // Merely reading a document must not reserve its IIN or receipt number.
 export async function savedDocumentConflict(
   doc: any,
 ): Promise<DuplicateInfo | null> {
-  const bound =
-    doc.kind === "receipt"
-      ? await Payment.findOne({ receiptDocumentId: doc._id }).lean()
-      : await Participant.findOne({ identityDocumentId: doc._id }).lean();
-  if (bound)
-    return {
-      message: "Бұл құжат сақталған жазбаға тіркелген. Қайта қосуға болмайды.",
-      participantId: String(
-        doc.kind === "receipt" ? (bound as any).participantId : bound._id,
-      ),
-      ...(doc.kind === "receipt" ? { paymentId: String(bound._id) } : {}),
-    };
+  if (doc.kind === "receipt") {
+    const pay = await Payment.findOne({ receiptDocumentId: doc._id }).lean();
+    if (pay) return savedPaymentConflict(pay);
+  } else {
+    const person = await Participant.findOne({
+      identityDocumentId: doc._id,
+      deletedAt: null,
+    }).lean();
+    if (person)
+      return {
+        message: "Бұл құжат сақталған жазбаға тіркелген.",
+        participantId: String(person._id),
+      };
+  }
   return doc.kind === "receipt"
     ? paymentConflict(String(doc.fields?.receiptNumber || ""), doc.hash)
     : participantConflict(String(doc.fields?.iin || ""));
@@ -217,14 +247,22 @@ export function uploadResult(doc: any, reused = false) {
 export async function recognitionConflict(
   doc: any,
   fields: Record<string, unknown>,
+  session?: mongoose.ClientSession,
 ): Promise<DuplicateInfo | null> {
   const boundParticipant =
     doc.kind === "identity"
-      ? await Participant.findOne({ identityDocumentId: doc._id }).lean()
+      ? await Participant.findOne({
+          identityDocumentId: doc._id,
+          deletedAt: null,
+        })
+          .session(session || null)
+          .lean()
       : null;
   const boundPayment =
     doc.kind === "receipt"
-      ? await Payment.findOne({ receiptDocumentId: doc._id }).lean()
+      ? await Payment.findOne({ receiptDocumentId: doc._id })
+          .session(session || null)
+          .lean()
       : null;
   const number =
     doc.kind === "identity"
@@ -235,11 +273,13 @@ export async function recognitionConflict(
       ? await participantConflict(
           number,
           boundParticipant ? String(boundParticipant._id) : undefined,
+          session,
         )
       : await paymentConflict(
           number,
           doc.hash,
           boundPayment ? String(boundPayment._id) : undefined,
+          session,
         );
   return conflict;
 }

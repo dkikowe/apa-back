@@ -2153,6 +2153,198 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       put.mockRestore();
     }
   });
+  it.each([false, true])(
+    "deletes a participant permanently while preserving the receipt and posted income (archived: %s)",
+    async (archived) => {
+      const { Admin, Audit, Document, Payment } =
+        await import("../server/models.js");
+      const admin = await Admin.findOne({ username: "test-admin" }).orFail();
+      const marker = archived ? "ArchivedRemoval" : "ActiveRemoval";
+      const iin = archived ? "000000001982" : "000000001981";
+      const identity = await Document.create({
+        ownerId: admin._id,
+        kind: "identity",
+        status: "done",
+        fields: { iin },
+      });
+      const participant = {
+        ...person,
+        firstName: marker,
+        iin,
+        identityDocumentId: String(identity._id),
+      };
+      const paid = {
+        ...base,
+        year: 2081,
+        paymentDate: "2081-01-15",
+        receiptNumber: "REMOVE-" + marker,
+      };
+      const receipt = await Document.create({
+        ownerId: admin._id,
+        kind: "receipt",
+        status: "done",
+        fields: paid,
+        key: marker + ".pdf",
+        hash: "hash-" + marker,
+        mime: "application/pdf",
+      });
+      const created = await post("/api/participants", participant);
+      expect(created.status).toBe(201);
+      const path = "/api/participants/" + created.body._id;
+      const stats = () => agent.get("/api/statistics?year=2081");
+      const priorIncome = (await stats()).body.finance.membership;
+      const payment = await post(path + "/payments", {
+        ...paid,
+        receiptDocumentId: String(receipt._id),
+      });
+      expect(payment.status).toBe(201);
+      const staleWarning = {
+        participantId: created.body._id,
+        message: "Old duplicate: " + marker,
+      };
+      const [duplicateIdentity, duplicateReceipt] = await Document.create([
+        {
+          ownerId: admin._id,
+          kind: "identity",
+          status: "duplicate",
+          fields: { iin },
+          duplicate: staleWarning,
+        },
+        {
+          ownerId: admin._id,
+          kind: "receipt",
+          status: "duplicate",
+          fields: { amount: paid.amount },
+          hash: receipt.hash,
+          duplicate: staleWarning,
+        },
+      ]);
+      const staleIdentityUrl = "/api/documents/" + duplicateIdentity._id;
+      const staleReceiptUrl = "/api/documents/" + duplicateReceipt._id;
+      expect((await agent.get(staleIdentityUrl)).body).toMatchObject({
+        status: "duplicate",
+        duplicate: { participantId: created.body._id },
+      });
+      if (archived)
+        expect((await post(path + "/archive", {})).status).toBe(200);
+      const list = (inArchive: boolean) =>
+        agent
+          .get("/api/participants")
+          .query({ q: marker, archived: inArchive });
+      expect(
+        (await list(archived)).body.items.map((p: any) => p._id),
+      ).toContain(created.body._id);
+      const remove = () => agent.delete(path).set("x-csrf-token", csrf);
+      expect((await request(app).delete(path)).status).toBe(403);
+      expect((await agent.delete(path)).status).toBe(403);
+      expect(
+        (await remove().set("origin", "https://attacker.invalid")).status,
+      ).toBe(403);
+      expect((await agent.get(path)).status).toBe(200);
+      await remove().expect(200, { ok: true });
+      await remove().expect(200, { ok: true });
+      for (const inArchive of [false, true]) {
+        const listed = await list(inArchive);
+        expect(listed.status).toBe(200);
+        expect(listed.body.items.map((p: any) => p._id)).not.toContain(
+          created.body._id,
+        );
+      }
+      expect((await agent.get(path)).status).toBe(404);
+      expect((await patch(path, participant)).status).toBe(404);
+      expect((await post(path + "/archive", {})).status).toBe(404);
+      expect((await post(path + "/archive", { restore: true })).status).toBe(
+        404,
+      );
+      expect(
+        (
+          await post(path + "/payments", {
+            ...paid,
+            receiptNumber: "BLOCKED-" + marker,
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        await Audit.countDocuments({
+          entity: "Participant",
+          entityId: created.body._id,
+          action: "delete",
+        }),
+      ).toBe(1);
+      expect((await stats()).body.finance.membership).toBe(
+        priorIncome + paid.amount,
+      );
+      const saved = await Payment.findById(payment.body._id).orFail();
+      expect(saved.amount).toBe(paid.amount);
+      expect(saved.voidedAt).toBeNull();
+      expect(String(saved.receiptDocumentId)).toBe(String(receipt._id));
+      expect(
+        (await agent.get("/api/documents/" + receipt._id)).body,
+      ).toMatchObject({
+        kind: "receipt",
+        fields: { receiptNumber: paid.receiptNumber, amount: paid.amount },
+      });
+      const exported = await agent
+        .get("/api/reports/payments?year=2081")
+        .buffer(true)
+        .parse((res, done) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk) => chunks.push(chunk));
+          res.on("end", () => done(null, Buffer.concat(chunks)));
+        });
+      expect(exported.status).toBe(200);
+      const book = new ExcelJS.Workbook();
+      await book.xlsx.load(exported.body);
+      const historical = book.worksheets[0]
+        .getSheetValues()
+        .filter((r: any) => r?.includes(paid.receiptNumber));
+      expect(historical).toHaveLength(1);
+      expect(historical[0]).toContain("Жойылған қатысушы");
+      const identityStatus = await agent.get(staleIdentityUrl).expect(200);
+      expect(identityStatus.body.status).toBe("done");
+      expect(identityStatus.body.duplicate).toBeFalsy();
+      expect(identityStatus.body.error).toBeFalsy();
+      for (const status of [
+        await agent.get(staleReceiptUrl),
+        await post(staleReceiptUrl + "/refresh", {}),
+      ]) {
+        expect(status.status).toBe(200);
+        expect(status.body).toMatchObject({
+          status: "duplicate",
+          duplicate: { paymentId: payment.body._id },
+        });
+        expect(status.body.duplicate.participantId).toBeUndefined();
+        expect(status.body.error).not.toContain(marker);
+        expect(status.body.hash).toBeUndefined();
+      }
+      const replacement = await post("/api/participants", {
+        ...participant,
+        identityDocumentId: String(
+          archived ? duplicateIdentity._id : identity._id,
+        ),
+      });
+      expect(replacement.status).toBe(201);
+      expect(replacement.body._id).not.toBe(created.body._id);
+      const duplicate = await post(
+        "/api/participants/" + replacement.body._id + "/payments",
+        paid,
+      );
+      expect(duplicate.status).toBe(409);
+      expect(duplicate.body.paymentId).toBe(payment.body._id);
+      expect(duplicate.body.participantId).toBeUndefined();
+      const attached = await post(
+        "/api/participants/" + replacement.body._id + "/payments",
+        {
+          ...paid,
+          receiptNumber: "ALTERNATE-" + marker,
+          receiptDocumentId: String(duplicateReceipt._id),
+        },
+      );
+      expect(attached.status).toBe(409);
+      expect(attached.body.paymentId).toBe(payment.body._id);
+      expect(attached.body.participantId).toBeUndefined();
+    },
+  );
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

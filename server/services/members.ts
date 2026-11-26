@@ -36,6 +36,7 @@ export function memberPipeline(
   id?: string,
 ): PipelineStage.FacetPipelineStage[] {
   const match: any = {
+    deletedAt: null,
     archivedAt: f.archived === "true" ? { $ne: null } : null,
   };
   if (id) {

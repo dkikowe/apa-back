@@ -30,6 +30,7 @@ const participant = new Schema(
     searchTokens: [String],
     identityDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },
     archivedAt: { type: Date, default: null },
+    deletedAt: Date,
   },
   options,
 );

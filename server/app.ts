@@ -44,6 +44,8 @@ import {
   paymentConflict,
   receiptKey,
   savedDocumentConflict,
+  currentDocumentDuplicate,
+  savedPaymentConflict,
   resumeDraft,
   newReadCycle,
   needsReaderUpgrade,
@@ -84,6 +86,31 @@ function checkFailedAttachment(
   const { wrongDocumentKind, error } = documentReadState(doc);
   if (wrongDocumentKind || previousId)
     throw new HttpError(400, error || "Құжат оқылмады. Файлды қайта таңдаңыз.");
+}
+async function checkDocumentDuplicate(
+  doc: any,
+  session: mongoose.ClientSession,
+) {
+  if (doc.status !== "duplicate") return;
+  const duplicate = await currentDocumentDuplicate(doc, session);
+  if (duplicate) throw new DuplicateError(duplicate);
+  await Document.updateOne(
+    { _id: doc._id, status: "duplicate" },
+    { $set: { status: "done" }, $unset: { duplicate: 1, error: 1 } },
+    { session },
+  );
+}
+async function publicDocumentStatus({ hash, ...doc }: any) {
+  if (doc.status === "duplicate") {
+    const duplicate = await currentDocumentDuplicate({ ...doc, hash });
+    doc = {
+      ...doc,
+      duplicate,
+      status: duplicate ? "duplicate" : "done",
+      error: duplicate?.message,
+    };
+  }
+  return { ...doc, ...documentReadState(doc) };
 }
 const checkId = (id: string) => {
   if (!mongoose.isValidObjectId(id))
@@ -328,7 +355,7 @@ export function createApp() {
             "Құжат табылмады немесе басқа адамға тіркелген.",
           );
         checkFailedAttachment(doc, data.identityDocumentId);
-        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        await checkDocumentDuplicate(doc, s);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
       }
@@ -375,7 +402,10 @@ export function createApp() {
       .optional()
       .parse(input.previousValues);
     const p = await atomic(async (s) => {
-      const before = await Participant.findById(id).session(s);
+      const before = await Participant.findOne({
+        _id: id,
+        deletedAt: null,
+      }).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
       // Merge against the current row inside the transaction. A form can
       // remain open while OCR fills a date or another admin edits a field.
@@ -419,7 +449,7 @@ export function createApp() {
           data.identityDocumentId,
           before.identityDocumentId?.toString(),
         );
-        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        await checkDocumentDuplicate(doc, s);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
         await Document.updateOne(
@@ -428,8 +458,8 @@ export function createApp() {
           { session: s },
         );
       }
-      const after = await Participant.findByIdAndUpdate(
-        id,
+      const after = await Participant.findOneAndUpdate(
+        { _id: id, deletedAt: null },
         {
           $set: {
             ...normalized,
@@ -457,10 +487,13 @@ export function createApp() {
       .parse(req.body).restore;
     const id = checkId(req.params.id);
     await atomic(async (s) => {
-      const before = await Participant.findById(id).session(s);
+      const before = await Participant.findOne({
+        _id: id,
+        deletedAt: null,
+      }).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
-      const after = await Participant.findByIdAndUpdate(
-        id,
+      const after = await Participant.findOneAndUpdate(
+        { _id: id, deletedAt: null },
         { $set: { archivedAt: restore ? null : new Date() } },
         { new: true, session: s },
       );
@@ -471,6 +504,48 @@ export function createApp() {
         id,
         before.toObject(),
         after?.toObject(),
+        s,
+      );
+    });
+    res.json({ ok: true });
+  });
+  app.delete("/api/participants/:id", async (req, res) => {
+    const id = checkId(req.params.id);
+    await atomic(async (s) => {
+      const before = await Participant.findById(id).session(s);
+      if (!before) throw new HttpError(404, "Қатысушы табылмады.");
+      if (before.deletedAt) return;
+      const deletedAt = new Date();
+      const profileKeys = [
+        ...Object.keys(participantSchema.shape),
+        "archivedAt",
+        "iinKey",
+        "importKey",
+        "phoneNormalized",
+        "searchTokens",
+      ];
+      await Participant.updateOne(
+        { _id: id, deletedAt: null },
+        {
+          $set: { deletedAt },
+          $unset: Object.fromEntries(profileKeys.map((key) => [key, 1])),
+        },
+        { session: s },
+      );
+      // The same identity upload can be used for a new registration. Keep
+      // receipt attachments bound to their original ledger entries.
+      await Document.updateMany(
+        { kind: "identity", participantId: id },
+        { $unset: { participantId: 1 } },
+        { session: s },
+      );
+      await audit(
+        req.session.adminId!,
+        "delete",
+        "Participant",
+        id,
+        { archivedAt: before.archivedAt ?? null },
+        { deletedAt },
         s,
       );
     });
@@ -508,6 +583,20 @@ export function createApp() {
     });
     res.status(201).json(created);
   });
+  // Serialize ledger mutations with deletion on the participant row. A
+  // snapshot read alone would allow a new payment to commit after deletion.
+  async function lockPaymentParticipant(
+    id: string | mongoose.Types.ObjectId,
+    s: mongoose.ClientSession,
+  ) {
+    const p = await Participant.findOneAndUpdate(
+      { _id: id, deletedAt: null },
+      { $inc: { __v: 1 } },
+      { session: s, timestamps: false, projection: { archivedAt: 1 } },
+    ).lean();
+    if (!p) throw new HttpError(404, "Қатысушы табылмады.");
+    return p;
+  }
   async function savePayment(req: express.Request, res: express.Response) {
     const data = paymentSchema.parse(req.body),
       id = req.params.paymentId
@@ -520,8 +609,8 @@ export function createApp() {
       if (id && !before) throw new HttpError(404, "Төлем табылмады.");
       const participantId =
         before?.participantId || checkId(String(req.params.id));
-      const participant = await Participant.findById(participantId).session(s);
-      if (!participant || participant.archivedAt)
+      const participant = await lockPaymentParticipant(participantId, s);
+      if (participant.archivedAt)
         throw new HttpError(400, "Алдымен қатысушыны тізімге қайтарыңыз.");
       const categoryId =
         data.paymentCategoryId ?? before?.paymentCategoryId?.toString() ?? "";
@@ -558,7 +647,7 @@ export function createApp() {
           receiptDocumentId,
           before?.receiptDocumentId?.toString(),
         );
-        if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
+        await checkDocumentDuplicate(doc, s);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
         const sameSources =
@@ -592,11 +681,9 @@ export function createApp() {
           .session(s)
           .lean();
         if (attachedPayment)
-          throw new DuplicateError({
-            message: "Бұл чек бұрын тіркелген. Қайта қосуға болмайды.",
-            participantId: String(attachedPayment.participantId),
-            paymentId: String(attachedPayment._id),
-          });
+          throw new DuplicateError(
+            await savedPaymentConflict(attachedPayment, s),
+          );
         fileHash = doc.hash || undefined;
         await Document.updateOne(
           { _id: doc._id },
@@ -672,6 +759,7 @@ export function createApp() {
         s,
       );
       if (!before) throw new HttpError(404, "Төлем табылмады.");
+      await lockPaymentParticipant(before.participantId, s);
       await Payment.updateOne(
         { _id: id },
         { $set: { voidedAt: new Date() }, $unset: { dedupeKeys: 1 } },
@@ -776,7 +864,7 @@ export function createApp() {
     },
   );
   const documentStatusFields =
-    "kind status fields error wrongDocumentKind duplicate participantId mime originalName size attempts recognitionVersion";
+    "kind status fields error wrongDocumentKind duplicate participantId mime originalName size attempts recognitionVersion hash";
   app.get("/api/documents/:id", async (req, res) => {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
@@ -785,7 +873,7 @@ export function createApp() {
       .select(documentStatusFields)
       .lean();
     if (!d) throw new HttpError(404, "Құжат табылмады.");
-    res.json({ ...d, ...documentReadState(d) });
+    res.json(await publicDocumentStatus(d));
   });
   app.post("/api/documents/:id/refresh", async (req, res) => {
     const owned = { _id: checkId(req.params.id), ownerId: req.session.adminId };
@@ -797,7 +885,10 @@ export function createApp() {
     if (
       needsReaderUpgrade(doc) &&
       (doc.kind === "identity"
-        ? await Participant.exists({ identityDocumentId: doc._id })
+        ? await Participant.exists({
+            identityDocumentId: doc._id,
+            deletedAt: null,
+          })
         : await Payment.exists({ receiptDocumentId: doc._id }))
     ) {
       // Claim the current reader version when queueing. Concurrent editors,
@@ -822,7 +913,7 @@ export function createApp() {
           .lean()) || (await current());
       if (!doc) throw new HttpError(404, "Құжат табылмады.");
     }
-    res.json({ ...doc, ...documentReadState(doc) });
+    res.json(await publicDocumentStatus(doc));
   });
   app.post("/api/documents/:id/retry", async (req, res) => {
     const doc = await Document.findOneAndUpdate(
