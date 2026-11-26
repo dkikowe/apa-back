@@ -1900,7 +1900,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         firstName: "Сынақ",
         firstNameLatin: "SAMPLE",
         lastNameLatin: "SAMPLE",
-        iin: "000123456789",
+        iin: "000000000807",
         birthDate: "1975-04-15",
         documentNumber: "000123456",
         issuedBy: "01.02.2020 — 01.02.2030",
