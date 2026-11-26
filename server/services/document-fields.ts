@@ -335,6 +335,45 @@ export function identityIinCandidates(text: string) {
   if (hasIdentityContext(text)) for (const line of lines) accept(line);
   return [...candidates];
 }
+// The heading and date may be in different layers of a PDF. Only recover a
+// complete date that was actually printed and agrees with the extracted IIN.
+// In particular, the IIN alone supplies neither a date nor a guessed century.
+export function printedBirthDate(
+  sources: string[],
+  fields: Record<string, string | number>,
+) {
+  const iin = fields.iin;
+  if (typeof iin !== "string" || !/^\d{12}$/.test(iin)) return;
+  const dates = new Set<string>();
+  const otherDates = new Set([fields.issueDate, fields.expiryDate]);
+  const validityLabel = prefix([...labels.issueDate, ...labels.expiryDate]);
+  for (const source of sources) {
+    const lines = source
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const [i, line] of lines.entries()) {
+      const value = line.replace(/[ \t]*([./-])[ \t]*/g, "$1");
+      if (!/^(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}-\d{2}-\d{2})$/.test(value))
+        continue;
+      const date = dateValue(value);
+      if (!date || date.slice(2).replaceAll("-", "") !== iin.slice(0, 6))
+        continue;
+      if (
+        (lines[i - 1] || "")
+          .split(/[/|]/)
+          .some((part) => validityLabel.test(part.trim())) ||
+        /^[-–—]$/.test(lines[i - 1] || "") ||
+        /^[-–—]$/.test(lines[i + 1] || "")
+      )
+        otherDates.add(date);
+      dates.add(date);
+    }
+  }
+  for (const date of otherDates)
+    if (typeof date === "string") dates.delete(date);
+  if (dates.size === 1) return [...dates][0];
+}
 export function identityDetails(text: string) {
   const result: Record<string, string> = {};
   const iins = identityIinCandidates(text);

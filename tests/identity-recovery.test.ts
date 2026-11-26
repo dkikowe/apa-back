@@ -11,6 +11,7 @@ vi.mock("tesseract.js", async (original) => ({
 }));
 import { recognize } from "../server/services/ocr.js";
 import { missingDocumentFields } from "../shared/document-recognition.js";
+import { printedBirthDate } from "../server/services/document-fields.js";
 import { textPdf } from "./ocr-fixtures.js";
 const core = [
   "SURNAME: TEST",
@@ -113,6 +114,34 @@ describe("Automatic identity recovery", () => {
     expect(fields.issuedBy).toBe("TEST AUTHORITY");
     expect(fields.iin).toBe("000123456789");
     expect(engine.recognize).toHaveBeenCalledTimes(1);
+  });
+  it("recovers a printed birth date split from its IIN across PDF layers after the heading is lost", async () => {
+    engine.recognize.mockResolvedValue(response(["IIN: 750415400001"]));
+    const fields = await recognize(
+      textPdf([
+        "SURNAME: TEST",
+        "GIVEN NAMES: PERSON",
+        "15. 04. 1975",
+        ...details,
+      ]),
+      "application/pdf",
+      "identity",
+    );
+    expect(fields.birthDate).toBe("1975-04-15");
+  });
+  it("does not infer a date from IIN alone, a validity date, or conflicting printed centuries", () => {
+    const fields = { iin: "750415400001" };
+    for (const evidence of [
+      "",
+      "DATE OF ISSUE\n15.04.1975",
+      "15.04.1975\n—\n15.04.1985",
+      "15.04.1875\n15.04.1975",
+      "16.04.1975",
+    ])
+      expect(printedBirthDate([evidence], fields)).toBeUndefined();
+    expect(
+      printedBirthDate(["15.04.1975"], { ...fields, issueDate: "1975-04-15" }),
+    ).toBeUndefined();
   });
   it("skips OCR for a complete native PDF without requiring a patronymic", async () => {
     const fields = await recognize(

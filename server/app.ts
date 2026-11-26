@@ -47,6 +47,10 @@ import {
   resumeDraft,
   uploadResult,
 } from "./services/duplicates.js";
+import {
+  IDENTITY_RECOGNITION_VERSION,
+  missingDocumentFields,
+} from "../shared/document-recognition.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
@@ -351,11 +355,34 @@ export function createApp() {
     res.json({ ...p, payments });
   });
   app.patch("/api/participants/:id", async (req, res) => {
-    const id = checkId(req.params.id),
-      data = participantSchema.parse(req.body);
+    const id = checkId(req.params.id);
+    const input = z.record(z.string(), z.unknown()).parse(req.body);
+    const previous = z
+      .record(z.string(), z.string())
+      .optional()
+      .parse(input.previousValues);
     const p = await atomic(async (s) => {
       const before = await Participant.findById(id).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
+      // Merge against the current row inside the transaction. A form can
+      // remain open while OCR fills a date or another admin edits a field.
+      const merged: Record<string, unknown> = {};
+      for (const key of Object.keys(participantSchema.shape)) {
+        const stored = before.get(key);
+        const current = stored == null ? "" : String(stored);
+        if (stored != null) merged[key] = current;
+        if (!Object.hasOwn(input, key)) continue;
+        if (previous && Object.hasOwn(previous, key)) {
+          if (input[key] === previous[key]) continue;
+          if (current !== previous[key] && current !== input[key])
+            throw new HttpError(
+              412,
+              "Бұл мәлімет өзгертілді. Соңғы нұсқаны көру үшін терезені жауып, қайта ашыңыз.",
+            );
+        }
+        merged[key] = input[key];
+      }
+      const data = participantSchema.parse(merged);
       const conflict = await participantConflict(data.iin, id, s);
       if (conflict && before.iin !== data.iin)
         throw new DuplicateError(conflict);
@@ -707,15 +734,52 @@ export function createApp() {
       }
     },
   );
+  const documentStatusFields =
+    "kind status fields error duplicate participantId mime originalName size attempts recognitionVersion";
   app.get("/api/documents/:id", async (req, res) => {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
       ownerId: req.session.adminId,
-    }).select(
-      "kind status fields error duplicate participantId mime originalName size attempts",
-    );
+    }).select(documentStatusFields);
     if (!d) throw new HttpError(404, "Құжат табылмады.");
     res.json(d);
+  });
+  app.post("/api/documents/:id/refresh", async (req, res) => {
+    const owned = { _id: checkId(req.params.id), ownerId: req.session.adminId };
+    const current = () =>
+      Document.findOne(owned).select(documentStatusFields).lean();
+    let doc = await current();
+    if (!doc) throw new HttpError(404, "Құжат табылмады.");
+    if (
+      doc.kind === "identity" &&
+      doc.status === "done" &&
+      (doc.recognitionVersion ?? 0) < IDENTITY_RECOGNITION_VERSION &&
+      missingDocumentFields("identity", doc.fields || {}).length &&
+      (await Participant.exists({ identityDocumentId: doc._id }))
+    ) {
+      // Claim the current reader version when queueing. Concurrent editors,
+      // including after a failed scan, share this attempt.
+      doc =
+        (await Document.findOneAndUpdate(
+          {
+            ...owned,
+            status: "done",
+            recognitionVersion: doc.recognitionVersion ?? null,
+          },
+          {
+            $set: {
+              status: "queued",
+              recognitionVersion: IDENTITY_RECOGNITION_VERSION,
+            },
+            $unset: { error: 1 },
+          },
+          { new: true },
+        )
+          .select(documentStatusFields)
+          .lean()) || (await current());
+      if (!doc) throw new HttpError(404, "Құжат табылмады.");
+    }
+    res.json(doc);
   });
   app.post("/api/documents/:id/retry", async (req, res) => {
     const doc = await Document.findOneAndUpdate(

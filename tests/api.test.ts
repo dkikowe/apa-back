@@ -386,6 +386,35 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     ).toBe(201);
   });
 
+  it("preserves an OCR backfill when a stale form saves and detects competing edits to the same field", async () => {
+    const created = await post("/api/participants", { firstName: "Мысал" });
+    expect(created.status).toBe(201);
+    const url = `/api/participants/${created.body._id}`;
+    const fields = { birthDate: "1974-06-14", issuedBy: "Сынақ органы" };
+    expect((await patch(url, fields)).status).toBe(200);
+    const stale = { birthDate: "", issuedBy: "", notes: "" };
+    const merged = await patch(url, {
+      ...stale,
+      notes: "Түзету",
+      previousValues: stale,
+    });
+    expect(merged.status).toBe(200);
+    expect(merged.body).toMatchObject({ ...fields, notes: "Түзету" });
+    const conflicting = await patch(url, {
+      birthDate: "1970-01-01",
+      previousValues: { birthDate: "" },
+    });
+    expect(conflicting.status).toBe(412);
+    const cleared = await patch(url, {
+      issuedBy: "",
+      previousValues: { issuedBy: fields.issuedBy },
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body).toMatchObject({
+      issuedBy: "",
+      birthDate: fields.birthDate,
+    });
+  });
   it("saves optional identity details and preserves document leading zeros", async () => {
     const identity = {
       iin: "000123456789",
@@ -1755,6 +1784,52 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       put.mockRestore();
     }
   });
+  it("refreshes an older attached partial identity only once even at the manual retry limit", async () => {
+    const { Admin, Document, Participant } =
+      await import("../server/models.js");
+    const { IDENTITY_RECOGNITION_VERSION: version } =
+      await import("../shared/document-recognition.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const doc = await Document.create({
+      kind: "identity",
+      ownerId: owner!._id,
+      status: "done",
+      attempts: 3,
+      fields: { firstName: "Сынақ" },
+    });
+    const url = `/api/documents/${doc._id}/refresh`;
+    expect((await post(url, {})).body.status).toBe("done");
+    const person = await Participant.create({
+      firstName: "Сынақ",
+      identityDocumentId: doc._id,
+    });
+    try {
+      for (const r of await Promise.all([post(url, {}), post(url, {})])) {
+        expect(r.status).toBe(200);
+        expect(r.body).toMatchObject({
+          status: "queued",
+          recognitionVersion: version,
+          attempts: 3,
+          fields: { firstName: "Сынақ" },
+        });
+      }
+      await Document.updateOne(
+        { _id: doc._id },
+        { $set: { status: "failed", error: "read error" } },
+      );
+      expect((await post(url, {})).body.status).toBe("failed");
+      await Document.updateOne({ _id: doc._id }, { $set: { status: "done" } });
+      expect((await post(url, {})).body.status).toBe("done");
+      await Document.updateOne(
+        { _id: doc._id },
+        { $set: { ownerId: new mongoose.Types.ObjectId() } },
+      );
+      expect((await post(url, {})).status).toBe(404);
+    } finally {
+      await Participant.deleteOne({ _id: person._id });
+      await Document.deleteOne({ _id: doc._id });
+    }
+  });
   it("automatically rereads an old incomplete identity draft once without reserving or duplicating it", async () => {
     const { Document } = await import("../server/models.js");
     const { resumeDraft, completeRecognition } =
@@ -1771,7 +1846,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     await completeRecognition(doc, { lastName: "Сынақ" });
     const updated = await Document.findById(doc._id);
-    expect(updated!.recognitionVersion).toBe(2);
+    expect(updated!.recognitionVersion).toBe(3);
     expect((await resumeDraft(updated)).status).toBe("done");
     expect(await Document.countDocuments({ _id: doc._id })).toBe(1);
   });

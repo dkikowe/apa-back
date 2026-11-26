@@ -6,6 +6,7 @@ import {
   extractFields,
   extractIdentityLayout,
   identityIinCandidates,
+  printedBirthDate,
   isReceiptInsteadOfIdentity,
   type PositionedText,
 } from "./document-fields.js";
@@ -408,7 +409,13 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       );
       if (typeof result.iin === "string") candidates.add(result.iin);
       delete result.iin;
-      if (candidates.size === 1) result.iin = [...candidates][0];
+      if (candidates.size === 1) {
+        result.iin = [...candidates][0];
+        if (!result.birthDate) {
+          const date = printedBirthDate(identitySources, result);
+          if (date) result.birthDate = date;
+        }
+      }
     }
     return result;
   } finally {
