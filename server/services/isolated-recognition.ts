@@ -32,7 +32,9 @@ export const isolatedRecognition: typeof recognize = (...args) =>
       if ("error" in result) {
         reject(
           result.error === "wrong-kind"
-            ? new WrongDocumentKindError()
+            ? new WrongDocumentKindError(
+                args[2] === "receipt" ? "receipt" : "identity",
+              )
             : new Error("OCR failed"),
         );
       } else {

@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { extractFields, receiptTextLines } from "../server/services/ocr.js";
+import { textImage } from "./ocr-fixtures.js";
+import {
+  extractFields,
+  receiptTextLines,
+  recognize,
+} from "../server/services/ocr.js";
 const receipt = [
   "Оплата совершена",
   "2 345 ₸",
@@ -275,3 +280,29 @@ describe("Kazakh personal transfers", () => {
     },
   );
 });
+
+// These are raster receipts: the recipient comes from visible text only.
+describe.runIf(process.env.RUN_OCR_TESTS === "1")(
+  "personal receipt names",
+  () => {
+    it.each(["Үміт Ұ.", "Ульяна У."])(
+      "preserves the printed spelling %s",
+      async (recipient) => {
+        const receipt = textImage([
+          "Перевод выполнен успешно",
+          "2 000 ₸",
+          recipient,
+          "Тип перевода",
+          "Перевод клиенту Kaspi",
+          "№ квитанции 111222333444555666",
+          "Дата и время 14.11.2026 18:45",
+          "Отправитель Тест А.",
+          "Откуда Kaspi Gold",
+        ]);
+        expect(
+          (await recognize(receipt, "image/png", "receipt")).recipientName,
+        ).toBe(recipient);
+      },
+    );
+  },
+);

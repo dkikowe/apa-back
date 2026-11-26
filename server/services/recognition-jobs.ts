@@ -94,6 +94,7 @@ async function failRead(
             : "failed",
       ...(duplicate ? { duplicate, error: duplicate.message } : {}),
       recoveryFailures: failures + 1,
+      wrongDocumentKind: terminal,
       ...(advance
         ? { recoveryStage: stage + 1, ...(stage === 0 ? { fields: {} } : {}) }
         : {}),

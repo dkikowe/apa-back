@@ -115,6 +115,7 @@ const document = new Schema(
     uploadHash: String,
     recognitionKey: String,
     recognitionVersion: Number,
+    wrongDocumentKind: Boolean,
     recoveryStage: Number,
     recoveryFailures: Number,
     recoveryConflicts: [String],

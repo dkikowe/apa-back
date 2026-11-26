@@ -1,7 +1,13 @@
+export const receiptInsteadOfIdentity =
+  "Куәліктің орнына чек жүктелген. Жеке куәлікті таңдаңыз. Чекті «Төлем қосу» бөлімінде жүктеңіз.";
+export const identityInsteadOfReceipt =
+  "Чектің орнына жеке куәлік жүктелген. Төлем чегін таңдаңыз.";
 export class WrongDocumentKindError extends Error {
-  constructor() {
+  constructor(expected: "identity" | "receipt" = "identity") {
     super(
-      "Куәліктің орнына чек жүктелген. Жеке куәлікті таңдаңыз. Чекті «Төлем қосу» бөлімінде жүктеңіз.",
+      expected === "receipt"
+        ? identityInsteadOfReceipt
+        : receiptInsteadOfIdentity,
     );
     this.name = "WrongDocumentKindError";
   }

@@ -34,20 +34,23 @@ function pdfObjects(objects: Buffer[]) {
     ),
   ]);
 }
-export function textPdf(lines: string[]) {
-  const content =
-    "BT /F1 22 Tf 40 800 Td 35 TL " +
-    lines.map((line, i) => `${i ? "T* " : ""}(${line}) Tj`).join("\n") +
-    " ET";
-  return pdfObjects(
-    [
-      "<< /Type /Catalog /Pages 2 0 R >>",
-      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 850 1000] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+export function textPdf(...pages: string[][]) {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    `<< /Type /Pages /Kids [${pages.map((_, i) => `${4 + i * 2} 0 R`).join(" ")}] /Count ${pages.length} >>`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  for (const lines of pages) {
+    const content =
+      "BT /F1 22 Tf 40 800 Td 35 TL " +
+      lines.map((line, i) => `${i ? "T* " : ""}(${line}) Tj`).join("\n") +
+      " ET";
+    objects.push(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 850 1000] /Resources << /Font << /F1 3 0 R >> >> /Contents ${objects.length + 2} 0 R >>`,
       `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
-    ].map((v) => Buffer.from(v)),
-  );
+    );
+  }
+  return pdfObjects(objects.map((v) => Buffer.from(v)));
 }
 export async function imagePdf(png: Buffer, footer = false, overlay = "") {
   const image = await sharp(png).jpeg({ quality: 95 }).toBuffer();

@@ -298,6 +298,48 @@ describe("issuer and validity on identity cards", () => {
 });
 
 describe("later OCR strategies", () => {
+  it.each([
+    ["Үлгі Ұ.", "Үлгі Ұ.", "Үлгі Ұ."],
+    ["Үлгі Ұ.", "Улгі У.", "Улгі У."],
+    ["Үлгі Ұ.", "Басқа А.", "Улгі У."],
+  ])(
+    "uses consistent recipient glyph readings and retains the baseline on disagreement (%s, %s)",
+    async (first, second, expected) => {
+      const name = "Улгі У.";
+      const baseline = response([
+        "TOTAL: 2000 KZT",
+        "DATE: 14.11.2026 18:45",
+        "RECIPIENT: " + name,
+        "SENDER: Тест А.",
+        "RECEIPT NUMBER: TEST-123",
+        "PAYMENT METHOD: TEST CARD",
+      ]);
+      engine.recognize
+        .mockResolvedValueOnce({
+          data: {
+            ...baseline.data,
+            blocks: [
+              {
+                paragraphs: [
+                  {
+                    lines: [
+                      { text: name, bbox: { x0: 10, y0: 10, x1: 60, y1: 26 } },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        })
+        .mockResolvedValueOnce(response([first]))
+        .mockResolvedValueOnce(response([second]));
+      const fields = await recognize(await image(), "image/png", "receipt");
+      expect(fields.recipientName).toBe(expected);
+      expect(fields.payerName).toBe("Тест А.");
+      expect(engine.recognize).toHaveBeenCalledTimes(3);
+    },
+  );
+
   it("recovers Cyrillic names even when their Latin spellings are already complete", async () => {
     const previousFields = {
       lastNameLatin: "TEST",

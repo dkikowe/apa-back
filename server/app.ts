@@ -50,7 +50,7 @@ import {
   readerVersion,
   uploadResult,
 } from "./services/duplicates.js";
-import { documentErrorMessage } from "./services/document-errors.js";
+import { documentReadState } from "./services/document-errors.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
@@ -72,6 +72,18 @@ class HttpError extends Error {
   ) {
     super(message);
   }
+}
+// A failed replacement must never inherit the previous attachment's form values.
+// The first upload can still be entered manually after an ordinary read failure.
+function checkFailedAttachment(
+  doc: Parameters<typeof documentReadState>[0],
+  nextId: string,
+  previousId?: string,
+) {
+  if (doc.status !== "failed" || nextId === previousId) return;
+  const { wrongDocumentKind, error } = documentReadState(doc);
+  if (wrongDocumentKind || previousId)
+    throw new HttpError(400, error || "Құжат оқылмады. Файлды қайта таңдаңыз.");
 }
 const checkId = (id: string) => {
   if (!mongoose.isValidObjectId(id))
@@ -315,6 +327,7 @@ export function createApp() {
             400,
             "Құжат табылмады немесе басқа адамға тіркелген.",
           );
+        checkFailedAttachment(doc, data.identityDocumentId);
         if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
@@ -401,6 +414,11 @@ export function createApp() {
           $or: [{ participantId: null }, { participantId: id }],
         }).session(s);
         if (!doc) throw new HttpError(400, "Құжат табылмады.");
+        checkFailedAttachment(
+          doc,
+          data.identityDocumentId,
+          before.identityDocumentId?.toString(),
+        );
         if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
@@ -535,9 +553,38 @@ export function createApp() {
             400,
             "Чек табылмады немесе басқа қатысушыға тіркелген.",
           );
+        checkFailedAttachment(
+          doc,
+          receiptDocumentId,
+          before?.receiptDocumentId?.toString(),
+        );
         if (doc.status === "duplicate") throw new DuplicateError(doc.duplicate);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
+        const sameSources =
+          before?.receiptDocumentId?.toString() === receiptDocumentId &&
+          before?.receiptText === data.receiptText &&
+          receiptKey(before?.receiptNumber) === receiptKey(data.receiptNumber);
+        if (data.receiptText && !sameSources) {
+          let textNumber: string;
+          try {
+            textNumber = receiptKey(
+              extractReceiptText(data.receiptText).receiptNumber,
+            );
+          } catch {
+            throw new HttpError(400, "Бір чектің мәтінін ғана қойыңыз.");
+          }
+          const fileNumber = receiptKey(doc.fields?.receiptNumber);
+          if (
+            !fileNumber ||
+            fileNumber !== textNumber ||
+            textNumber !== receiptKey(data.receiptNumber)
+          )
+            throw new HttpError(
+              400,
+              "Файлдағы және мәтіндегі чек нөмірлерін тексеріңіз. Бір төлемге бір чек қажет.",
+            );
+        }
         const attachedPayment = await Payment.findOne({
           receiptDocumentId: doc._id,
           ...(id ? { _id: { $ne: id } } : {}),
@@ -729,7 +776,7 @@ export function createApp() {
     },
   );
   const documentStatusFields =
-    "kind status fields error duplicate participantId mime originalName size attempts recognitionVersion";
+    "kind status fields error wrongDocumentKind duplicate participantId mime originalName size attempts recognitionVersion";
   app.get("/api/documents/:id", async (req, res) => {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
@@ -738,7 +785,7 @@ export function createApp() {
       .select(documentStatusFields)
       .lean();
     if (!d) throw new HttpError(404, "Құжат табылмады.");
-    res.json({ ...d, error: documentErrorMessage(d.error) });
+    res.json({ ...d, ...documentReadState(d) });
   });
   app.post("/api/documents/:id/refresh", async (req, res) => {
     const owned = { _id: checkId(req.params.id), ownerId: req.session.adminId };
@@ -775,7 +822,7 @@ export function createApp() {
           .lean()) || (await current());
       if (!doc) throw new HttpError(404, "Құжат табылмады.");
     }
-    res.json({ ...doc, error: documentErrorMessage(doc.error) });
+    res.json({ ...doc, ...documentReadState(doc) });
   });
   app.post("/api/documents/:id/retry", async (req, res) => {
     const doc = await Document.findOneAndUpdate(

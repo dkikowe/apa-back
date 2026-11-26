@@ -304,6 +304,153 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       (await request(app).get(`/api/documents/${doc._id}/url`)).status,
     ).toBe(401);
   });
+  it("rejects a wrong-kind file even with a typed identifier and preserves saved attachments when replacement reading fails", async () => {
+    const { Admin, Document, Participant, Payment } =
+      await import("../server/models.js");
+    const { receiptInsteadOfIdentity } =
+      await import("../server/services/ocr-policy.js");
+    const admin = await Admin.findOne({ username: "test-admin" });
+    const ownerId = admin!._id;
+    const [
+      originalId,
+      wrongKind,
+      unreadableId,
+      originalReceipt,
+      unreadableReceipt,
+    ] = await Document.create([
+      { kind: "identity", ownerId, status: "done" },
+      {
+        kind: "identity",
+        ownerId,
+        status: "failed",
+        error: receiptInsteadOfIdentity,
+      },
+      { kind: "identity", ownerId, status: "failed" },
+      { kind: "receipt", ownerId, status: "done" },
+      { kind: "receipt", ownerId, status: "failed" },
+    ]);
+    const identifier = "000000000839";
+    for (const path of ["", "/refresh"]) {
+      const url = "/api/documents/" + wrongKind._id + path;
+      const r = path ? await post(url, {}) : await agent.get(url);
+      expect(r.body.wrongDocumentKind).toBe(true);
+    }
+    const personWith = (documentId: unknown) => ({
+      ...person,
+      iin: identifier,
+      identityDocumentId: String(documentId),
+    });
+    expect(
+      (await post("/api/participants", personWith(wrongKind._id))).status,
+    ).toBe(400);
+    expect(await Participant.countDocuments({ iin: identifier })).toBe(0);
+    const p = await post("/api/participants", personWith(originalId._id));
+    expect(p.status).toBe(201);
+    const url = "/api/participants/" + p.body._id;
+    expect(
+      (await patch(url, { identityDocumentId: String(unreadableId._id) }))
+        .status,
+    ).toBe(400);
+    const payload = {
+      ...base,
+      receiptNumber: "REPLACEMENT-TEST-839",
+      receiptDocumentId: String(originalReceipt._id),
+    };
+    const pay = await post(url + "/payments", payload);
+    expect(pay.status).toBe(201);
+    expect(
+      (
+        await patch("/api/payments/" + pay.body._id, {
+          ...payload,
+          receiptDocumentId: String(unreadableReceipt._id),
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      String((await Participant.findById(p.body._id))!.identityDocumentId),
+    ).toBe(String(originalId._id));
+    expect(
+      String((await Payment.findById(pay.body._id))!.receiptDocumentId),
+    ).toBe(String(originalReceipt._id));
+    expect(
+      await Document.countDocuments({
+        _id: { $in: [wrongKind._id, unreadableId._id, unreadableReceipt._id] },
+        participantId: { $ne: null },
+      }),
+    ).toBe(0);
+    await Document.updateOne(
+      { _id: originalId._id },
+      { $set: { status: "failed" } },
+    );
+    expect((await patch(url, { notes: "test note" })).status).toBe(200);
+    await Payment.deleteOne({ _id: pay.body._id });
+    await Participant.deleteOne({ _id: p.body._id });
+    await Document.deleteMany({
+      _id: {
+        $in: [
+          originalId._id,
+          wrongKind._id,
+          unreadableId._id,
+          originalReceipt._id,
+          unreadableReceipt._id,
+        ],
+      },
+    });
+  });
+  it("requires the same printed number for a file and pasted receipt used together", async () => {
+    const { Admin, Document, Payment } = await import("../server/models.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const account = await post("/api/participants", {
+      firstName: "File and text check",
+    });
+    const doc = await Document.create({
+      kind: "receipt",
+      ownerId: owner!._id,
+      status: "done",
+      fields: { receiptNumber: "QR28394700001" },
+    });
+    const url = "/api/participants/" + account.body._id + "/payments";
+    const payload = {
+      ...base,
+      receiptNumber: "QR28394700001",
+      receiptDocumentId: String(doc._id),
+    };
+    const text = (number: string) =>
+      "Оплата совершена 1 090 ₸ Сынақ № чека " +
+      number +
+      " Дата и время по Астане 18.11.2026 16:00";
+    expect(
+      (await post(url, { ...payload, receiptText: text("QR28394700002") }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await post(url, { ...payload, receiptText: "Оплата совершена 1 090 ₸" }))
+        .status,
+    ).toBe(400);
+    expect(await Payment.countDocuments({ receiptDocumentId: doc._id })).toBe(
+      0,
+    );
+    const same = await post(url, {
+      ...payload,
+      receiptText: text(payload.receiptNumber),
+    });
+    expect(same.status).toBe(201);
+    expect(
+      (
+        await patch("/api/payments/" + same.body._id, {
+          ...payload,
+          receiptText: text("QR28394700002"),
+        })
+      ).status,
+    ).toBe(400);
+    expect((await Payment.findById(same.body._id))!.receiptText).toBe(
+      text(payload.receiptNumber),
+    );
+    const { Participant } = await import("../server/models.js");
+    await Payment.deleteOne({ _id: same.body._id });
+    await Document.deleteOne({ _id: doc._id });
+    await Participant.deleteOne({ _id: account.body._id });
+  });
   it("rejects executable uploads and oversized / invalid dates", async () => {
     const upload = await agent
       .post("/api/documents")

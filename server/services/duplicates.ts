@@ -2,20 +2,19 @@ import {
   IDENTITY_RECOGNITION_VERSION,
   RECEIPT_RECOGNITION_VERSION,
   missingDocumentFields,
+  receiptKey,
 } from "../../shared/document-recognition.js";
 import type mongoose from "mongoose";
 import { Document, Participant, Payment } from "../models.js";
 
 import {
   documentErrorMessage,
+  documentReadState,
   documentUnreadable,
   readingInterrupted,
 } from "./document-errors.js";
 
-export const receiptKey = (value: unknown) =>
-  typeof value === "string"
-    ? value.normalize("NFKC").replace(/\s/g, "").toUpperCase()
-    : "";
+export { receiptKey } from "../../shared/document-recognition.js";
 const receiptPattern = (value: string) =>
   new RegExp(
     "^\\s*" +
@@ -164,6 +163,7 @@ export async function resumeDraft(doc: any) {
 export const newReadCycle = {
   status: "queued",
   recoveryStage: 0,
+  wrongDocumentKind: false,
   recoveryFailures: 0,
   recoveryConflicts: [],
   nextReadAt: null,
@@ -193,17 +193,23 @@ export function needsReaderUpgrade(doc: {
     const error = documentErrorMessage(doc.error);
     return error === readingInterrupted || error === documentUnreadable;
   }
-  return (
-    doc.status === "done" &&
-    missingDocumentFields(doc.kind, doc.fields || {}).length > 0
-  );
+  if (doc.status !== "done") return false;
+  const fields = doc.fields || {};
+  // The old personal-transfer reader could flatten printed ү/ұ into у even
+  // when every field was present. Refresh these cached names on first reuse.
+  const oldTransferName =
+    doc.kind === "receipt" &&
+    (doc.recognitionVersion ?? 0) < 7 &&
+    fields.receiptType === "personal" &&
+    /у/iu.test(String(fields.recipientName ?? ""));
+  return oldTransferName || missingDocumentFields(doc.kind, fields).length > 0;
 }
 export function uploadResult(doc: any, reused = false) {
   return {
     id: doc._id,
     status: doc.status,
     fields: doc.fields || {},
-    error: documentErrorMessage(doc.error),
+    ...documentReadState(doc),
     attempts: doc.attempts,
     reused,
   };

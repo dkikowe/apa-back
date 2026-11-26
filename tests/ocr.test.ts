@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import sharp from "sharp";
-import { recognize, WrongDocumentKindError } from "../server/services/ocr.js";
+import {
+  identityInsteadOfReceipt,
+  receiptInsteadOfIdentity,
+} from "../server/services/ocr-policy.js";
+import { recognize } from "../server/services/ocr.js";
 import {
   textImage,
   textPdf,
@@ -45,6 +49,37 @@ describe("PDF text extraction", () => {
       firstNameLatin: "AIGUL",
       birthDate: "1975-04-15",
     }));
+  it("rejects an identity PDF uploaded as a receipt, including a native layer without headings", async () => {
+    const bareIdentity = [
+      "750415000000",
+      "123456789",
+      "TEST<<PERSON<<<<<<<<<<<<",
+    ];
+    for (const page of [identity, bareIdentity]) {
+      await expect(
+        recognize(textPdf(page), "application/pdf", "receipt"),
+      ).rejects.toThrow(identityInsteadOfReceipt);
+    }
+  });
+  it("keeps a real receipt with personal details, on the same or a separate PDF page", async () => {
+    const bankPage = [
+      ...receipt.filter((line) => !line.startsWith("DATE:")),
+      "DATE: 18.11.2026 12:10",
+      "PAYER: TEST PERSON",
+      "PAYMENT METHOD: TEST CARD",
+    ];
+    for (const doc of [
+      textPdf([...identity, ...bankPage]),
+      textPdf(identity, bankPage),
+      textPdf(bankPage, identity),
+    ]) {
+      expect(await recognize(doc, "application/pdf", "receipt")).toMatchObject({
+        amount: 648700,
+        receiptNumber: "TEST-2026-100",
+        recipientName: "TEST ORGANIZATION",
+      });
+    }
+  });
   it("rejects a malformed PDF safely", async () => {
     await expect(
       recognize(Buffer.from("%PDF-1.7\nbroken"), "application/pdf", "receipt"),
@@ -99,7 +134,12 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
           "image/png",
           "identity",
         ),
-      ).rejects.toBeInstanceOf(WrongDocumentKindError);
+      ).rejects.toThrow(receiptInsteadOfIdentity);
+    });
+    it("rejects a raster identity in receipt uploads instead of using the birth date as payment date", async () => {
+      await expect(
+        recognize(textImage(identity), "image/png", "receipt"),
+      ).rejects.toThrow(identityInsteadOfReceipt);
     });
     it("reads PNG receipt with grouped money", async () =>
       expect(

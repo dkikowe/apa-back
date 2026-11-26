@@ -12,6 +12,7 @@ import {
   printedBirthDate,
   receiptHeadingFields,
   isReceiptInsteadOfIdentity,
+  isIdentityInsteadOfReceipt,
   type PositionedText,
 } from "./document-fields.js";
 export {
@@ -95,6 +96,34 @@ function receiptBands(items: PositionedText[], height: number) {
     return bottom > top ? [{ top, height: bottom - top, keys: row.keys }] : [];
   });
 }
+// Locate only the printed recipient, including a value on the same line as
+// its label. Identical lines in multiple positions are ambiguous.
+function recipientBox(lines: Tesseract.Line[], name: string) {
+  const boxes = lines.flatMap((line) => {
+    const text = line.text.trim().replace(/\s+/gu, " ");
+    if (text === name) return [line.bbox];
+    if (
+      !receiptHeadingFields(text).includes("recipientName") ||
+      !text.endsWith(" " + name)
+    )
+      return [];
+    const words = line.words?.slice(-name.split(" ").length);
+    if (!words?.length || words.map((w) => w.text).join(" ") !== name)
+      return [];
+    return [
+      {
+        x0: words[0].bbox.x0,
+        x1: words.at(-1)!.bbox.x1,
+        y0: Math.min(...words.map((w) => w.bbox.y0)),
+        y1: Math.max(...words.map((w) => w.bbox.y1)),
+      },
+    ];
+  });
+  return boxes.length === 1 ? boxes[0] : undefined;
+}
+const foldRecipientU = (name: string) =>
+  name.replace(/[үұ]/gu, "у").replace(/[ҮҰ]/gu, "У");
+
 type Fields = Record<string, string | number>;
 // A printed start/end pair supplies stronger evidence than one previously
 // recognized endpoint. Keep all other accepted readings, including an
@@ -245,6 +274,57 @@ export async function recognize(
     });
     return (await worker.recognize(image, {}, { text: true, blocks })).data;
   };
+  const confirmRecipient = async (
+    rendered: Buffer,
+    box: Tesseract.Bbox,
+    name: string,
+  ) => {
+    try {
+      const crop = await sharp(rendered)
+        .extract({
+          left: box.x0,
+          top: box.y0,
+          width: box.x1 - box.x0,
+          height: box.y1 - box.y0,
+        })
+        .png()
+        .toBuffer();
+      let first: string | undefined;
+      for (const [height, mode] of [
+        [42, PSM.SINGLE_LINE],
+        [64, PSM.SINGLE_BLOCK],
+      ] as const) {
+        const strip = sharp(crop)
+          .resize({ height, width: 3000, fit: "inside" })
+          .grayscale()
+          .normalize();
+        if (mode === PSM.SINGLE_BLOCK) strip.sharpen();
+        const enlarged = await strip
+          .extend({
+            top: 18,
+            bottom: 18,
+            left: 23,
+            right: 23,
+            background: "white",
+          })
+          .png()
+          .toBuffer();
+        const text = (await scan(enlarged, mode, false)).text
+          .trim()
+          .replace(/\s+/gu, " ");
+        if (
+          foldRecipientU(text) !== foldRecipientU(name) ||
+          (first && text !== first)
+        )
+          return;
+        first = text;
+      }
+      return first;
+    } catch {
+      // A failed optional crop leaves the full-page reading available.
+      return;
+    }
+  };
   const scanReceipt = async (
     image: Buffer,
     seed: Record<string, string | number> = {},
@@ -300,6 +380,7 @@ export async function recognize(
         collectRows: i < 2,
       }),
     );
+    let checkedRecipient = false;
     let bestLines = positioned;
     let read = false;
     for (let i = 0; i < queue.length; i++) {
@@ -315,6 +396,8 @@ export async function recognize(
       try {
         const rendered = await pass.render();
         const result = await scan(rendered, pass.mode, !!pass.collectRows);
+        if (pass.collectRows && isIdentityInsteadOfReceipt(result.text))
+          throw new WrongDocumentKindError("receipt");
         read = true;
         const lines =
           result.blocks?.flatMap((b) => b.paragraphs.flatMap((p) => p.lines)) ||
@@ -323,6 +406,29 @@ export async function recognize(
           ...extractFields(result.text, "receipt"),
           ...extractFields(receiptTextLines(lines), "receipt"),
         };
+        // At receipt scale OCR can confuse у, ү and ұ. Only amend the OCR
+        // spelling when two reads of that same name agree on every letter.
+        const name = found.recipientName;
+        if (
+          !checkedRecipient &&
+          !seed.recipientName &&
+          found.receiptType === "personal" &&
+          typeof name === "string" &&
+          /[уүұ]/iu.test(name) &&
+          (!fields.recipientName ||
+            (typeof fields.recipientName === "string" &&
+              foldRecipientU(fields.recipientName) === foldRecipientU(name)))
+        ) {
+          const box = recipientBox(lines, name);
+          if (box && box.x1 > box.x0 && box.y1 > box.y0) {
+            checkedRecipient = true;
+            const confirmed = await confirmRecipient(rendered, box, name);
+            if (confirmed) {
+              fields.recipientName = confirmed;
+              if (previous.recipientName) previous.recipientName = confirmed;
+            }
+          }
+        }
         // In Cyrillic text Tesseract can read the letters in QR as 08 or 05.
         // Inspect the actual token pixels before accepting a numeric reading.
         for (const line of lines) {
@@ -393,6 +499,7 @@ export async function recognize(
         )
           bestLines = lines;
       } catch (error) {
+        if (error instanceof WrongDocumentKindError) throw error;
         await worker?.terminate().catch(() => {});
         worker = undefined;
         if (Date.now() > recoveryDeadline || pass === queue.at(-1)) {
@@ -573,6 +680,7 @@ export async function recognize(
         useSystemFonts: true,
       }).promise;
       try {
+        let identityPageInReceipt = false;
         if (pdf.numPages > 10) throw new Error("PDF_PAGE_LIMIT");
         for (let n = 1; n <= pdf.numPages; n++) {
           const page = await pdf.getPage(n);
@@ -602,6 +710,13 @@ export async function recognize(
                   : [],
               ),
             );
+          }
+          if (
+            kind === "receipt" &&
+            isIdentityInsteadOfReceipt(layer + "\n" + streamText)
+          ) {
+            identityPageInReceipt = true;
+            continue;
           }
           if (kind === "identity") {
             if (isReceiptInsteadOfIdentity(layer))
@@ -681,7 +796,11 @@ export async function recognize(
                 ? await scanReceipt(rendered, layerFields, values)
                 : await scanIdentity(rendered, layerFields, values);
           } catch (error) {
-            if (error instanceof WrongDocumentKindError) throw error;
+            if (error instanceof WrongDocumentKindError) {
+              if (kind !== "receipt") throw error;
+              identityPageInReceipt = true;
+              continue;
+            }
             const usableLayer =
               kind === "identity"
                 ? Object.keys(layerFields).length > 0
@@ -703,6 +822,17 @@ export async function recognize(
             Object.assign(nativeFields, scanned.fields);
           }
         }
+        if (
+          identityPageInReceipt &&
+          !(
+            nativeFields.amount &&
+            (nativeFields.receiptNumber ||
+              nativeFields.method ||
+              nativeFields.recipientName ||
+              nativeFields.payerName)
+          )
+        )
+          throw new WrongDocumentKindError("receipt");
       } finally {
         await pdf.loadingTask.destroy();
       }

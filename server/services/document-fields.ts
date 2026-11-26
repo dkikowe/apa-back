@@ -409,17 +409,44 @@ function hasIdentityContext(text: string) {
     );
   return hasBirthLabel && (hasNameLabel || hasMachineRow);
 }
+function receiptSignals(text: string) {
+  const success =
+    /Оплата совершена|Т[өео]лем жасалды|С[әа]тті аударылды|Перевод (?:успешно|выполнен)|Плат[её]ж выполнен|PAYMENT SUCCESSFUL/iu.test(
+      text,
+    );
+  const receiptLabel =
+    /№\s*(?:чека|квитанции)|Түбіртек\s*(?:№|[МMNН][оo])|ФИО\s+покупателя|ИИН\s*\/\s*БИН\s+продавца|НОМЕР\s+(?:ЧЕКА|КВИТАНЦИИ|ТРАНЗАКЦИИ)|RECEIPT\s+NUMBER|TRANSACTION\s+(?:NUMBER|ID)|ЧЕК(?:ТІҢ)?\s+НӨМІРІ/iu.test(
+      text,
+    );
+  const money =
+    /\d[\d., \u00a0]*\s*(?:₸|KZT|тенге|теңге|тг(?=\s|[.,!]|$))/iu.test(text);
+  return { success, receiptLabel, money };
+}
 export function isReceiptInsteadOfIdentity(text: string) {
+  const { success, receiptLabel, money } = receiptSignals(text);
   return (
     !hasIdentityContext(text) &&
-    /Оплата совершена|Т[өео]лем жасалды|С[әа]тті аударылды|Перевод (?:успешно|выполнен)|Плат[её]ж выполнен/iu.test(
-      text,
-    ) &&
-    /№\s*(?:чека|квитанции)|Түбіртек\s*№|ФИО\s+покупателя|ИИН\s*[/]\s*БИН/iu.test(
-      text,
-    )
+    ((success && (receiptLabel || money)) || (receiptLabel && money))
   );
 }
+
+export function isIdentityInsteadOfReceipt(text: string) {
+  const { success, receiptLabel } = receiptSignals(text);
+  if (receiptLabel || success) return false;
+  // A customer's name, a business IIN or a payment date are routine on receipts.
+  // Require the identity form itself or the printed machine-readable name row.
+  const printedIin = /(?<!\d)\d{12}(?!\d)/u.test(text);
+  if (!printedIin) return false;
+  const mrzName =
+    /(?:^|[\s<])[A-Z]{2,}(?:<[A-Z]+)*<<[A-Z]{2,}(?:<[A-Z]+)*<{3,}/u.test(text);
+  const cardNumber = /(?<![\dA-Z])\d{9}(?![\dA-Z])/u.test(text);
+  const birthOrIssuer =
+    /ДАТА\s+РОЖДЕНИЯ|ТУҒАН\s+КҮНІ|DATE\s+OF\s+BIRTH|БЕРГЕН\s+ОРГАН|ОРГАН\s+ВЫДАЧИ|ISSUED\s+BY/iu.test(
+      text,
+    );
+  return (mrzName && cardNumber) || (hasIdentityContext(text) && birthOrIssuer);
+}
+
 export function identityIinCandidates(text: string) {
   if (isReceiptInsteadOfIdentity(text)) return [];
   const lines = text
