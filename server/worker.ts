@@ -2,6 +2,7 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import { connect, Document } from "./models.js";
 import { completeRecognition } from "./services/duplicates.js";
+import { readingInterrupted, documentUnreadable } from "./services/document-errors.js";
 import { storage } from "./services/storage.js";
 import { recognize, WrongDocumentKindError } from "./services/ocr.js";
 await connect();
@@ -22,8 +23,7 @@ while (!stopped) {
     {
       $set: {
         status: "failed",
-        error:
-          "Құжатты оқу аяқталмады. Қолмен толтырыңыз немесе қайталап көріңіз.",
+        error: readingInterrupted,
       },
     },
   );
@@ -55,7 +55,7 @@ while (!stopped) {
           error:
             error instanceof WrongDocumentKindError
               ? error.message
-              : "Құжат оқылмады. Мәліметтерді қолмен толтыра аласыз.",
+              : documentUnreadable,
           completedAt: new Date(),
         },
       },

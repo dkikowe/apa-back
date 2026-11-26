@@ -6,6 +6,8 @@ import {
 import type mongoose from "mongoose";
 import { Document, Participant, Payment } from "../models.js";
 
+import { documentErrorMessage } from "./document-errors.js";
+
 export const receiptKey = (value: unknown) =>
   typeof value === "string"
     ? value.normalize("NFKC").replace(/\s/g, "").toUpperCase()
@@ -162,7 +164,7 @@ export function uploadResult(doc: any, reused = false) {
     id: doc._id,
     status: doc.status,
     fields: doc.fields || {},
-    error: doc.error,
+    error: documentErrorMessage(doc.error),
     attempts: doc.attempts,
     reused,
   };

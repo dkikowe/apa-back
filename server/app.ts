@@ -51,6 +51,7 @@ import {
   IDENTITY_RECOGNITION_VERSION,
   missingDocumentFields,
 } from "../shared/document-recognition.js";
+import { documentErrorMessage } from "./services/document-errors.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
@@ -302,7 +303,7 @@ export function createApp() {
         if (!data.iin)
           throw new HttpError(
             400,
-            "Қайталануын тексеру үшін куәліктегі ЖСН-ді (12 сан) енгізіңіз.",
+            "Қайталануын тексеру үшін куәліктегі 12 таңбалы ЖСН қажет.",
           );
         const doc = await Document.findOne({
           _id: data.identityDocumentId,
@@ -392,7 +393,7 @@ export function createApp() {
         if (!data.iin)
           throw new HttpError(
             400,
-            "Қайталануын тексеру үшін куәліктегі ЖСН-ді (12 сан) енгізіңіз.",
+            "Қайталануын тексеру үшін куәліктегі 12 таңбалы ЖСН қажет.",
           );
         const doc = await Document.findOne({
           _id: data.identityDocumentId,
@@ -471,10 +472,7 @@ export function createApp() {
     const name = data.name.normalize("NFKC").replace(/\s+/g, " ");
     const nameKey = name.toLocaleLowerCase("kk-KZ");
     if (nameKey === MEMBERSHIP_PAYMENT_LABEL.toLocaleLowerCase("kk-KZ"))
-      throw new HttpError(
-        409,
-        "Мүшелік жарна тізімде бар. Басқа атау енгізіңіз.",
-      );
+      throw new HttpError(409, "Мүшелік жарна тізімде бар.");
     const created = await atomic(async (session) => {
       const [category] = await PaymentCategory.create(
         [{ name, nameKey, amount: data.amount }],
@@ -525,10 +523,7 @@ export function createApp() {
         (receiptDocumentId || data.receiptText) &&
         !receiptKey(data.receiptNumber)
       )
-        throw new HttpError(
-          400,
-          "Қайталануын тексеру үшін чек нөмірін енгізіңіз.",
-        );
+        throw new HttpError(400, "Қайталануын тексеру үшін чек нөмірі қажет.");
       if (receiptDocumentId) {
         const doc = await Document.findOne({
           _id: receiptDocumentId,
@@ -740,9 +735,11 @@ export function createApp() {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
       ownerId: req.session.adminId,
-    }).select(documentStatusFields);
+    })
+      .select(documentStatusFields)
+      .lean();
     if (!d) throw new HttpError(404, "Құжат табылмады.");
-    res.json(d);
+    res.json({ ...d, error: documentErrorMessage(d.error) });
   });
   app.post("/api/documents/:id/refresh", async (req, res) => {
     const owned = { _id: checkId(req.params.id), ownerId: req.session.adminId };
@@ -779,7 +776,7 @@ export function createApp() {
           .lean()) || (await current());
       if (!doc) throw new HttpError(404, "Құжат табылмады.");
     }
-    res.json(doc);
+    res.json({ ...doc, error: documentErrorMessage(doc.error) });
   });
   app.post("/api/documents/:id/retry", async (req, res) => {
     const doc = await Document.findOneAndUpdate(
@@ -792,8 +789,7 @@ export function createApp() {
       { $set: { status: "queued", error: null } },
       { new: true },
     );
-    if (!doc)
-      throw new HttpError(400, "Қайта оқу мүмкін емес. Қолмен толтырыңыз.");
+    if (!doc) throw new HttpError(400, "Қайта оқу мүмкін емес.");
     res.json({ ok: true });
   });
   app.get("/api/documents/:id/content", async (req, res) => {

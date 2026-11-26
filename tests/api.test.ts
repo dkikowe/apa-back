@@ -271,12 +271,19 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       kind: "identity",
       ownerId: admin!._id,
       status: "failed",
-      error: "OCR unavailable",
+      error: "Құжат оқылмады. Мәліметтерді қолмен толтыра аласыз.",
       key: "synthetic/key",
       hash: "synthetic",
     });
     const state = await agent.get(`/api/documents/${doc._id}`);
-    expect(state.body.status).toBe("failed");
+    expect(state.body).toMatchObject({
+      status: "failed",
+      error: "Құжат оқылмады.",
+    });
+    const refreshed = await post(`/api/documents/${doc._id}/refresh`, {});
+    expect(refreshed.body.error).toBe("Құжат оқылмады.");
+    const { uploadResult } = await import("../server/services/duplicates.js");
+    expect(uploadResult(doc, true).error).toBe("Құжат оқылмады.");
     const created = await post("/api/participants", {
       ...person,
       firstName: "Қолмен түзетілген",
