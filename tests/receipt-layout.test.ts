@@ -232,3 +232,45 @@ it("reads the Kazakh Kaspi labels for the receipt, buyer and source", () => {
     receiptType: "urshyk",
   });
 });
+
+describe("Kazakh personal transfers", () => {
+  it.each(["Қайдан", "Кайдан"])(
+    "reads the headline amount, recipient and %s source on the scanned receipt",
+    (sourceLabel) => {
+      expect(
+        extractFields(
+          [
+            "Сәтті аударылды",
+            "1 700Т",
+            "Сынақ М.",
+            "Аударым түрі",
+            "Kaspi",
+            "клиентіне аудару",
+            "Түбіртек №",
+            "1234567890123456",
+            "07",
+            "19.11.2026 09:25",
+            "Күні мен уақыты",
+            "(Астана уақыты)",
+            "Комиссия",
+            "0 ₸",
+            "Жіберуші",
+            "Үлгі О.Т.",
+            sourceLabel,
+            "Kaspi Gold",
+          ].join("\n"),
+          "receipt",
+        ),
+      ).toEqual({
+        amount: 170000,
+        paymentDate: "2026-11-19",
+        paymentTime: "09:25",
+        receiptNumber: "123456789012345607",
+        payerName: "Үлгі О.Т.",
+        recipientName: "Сынақ М.",
+        method: "Kaspi Gold",
+        receiptType: "personal",
+      });
+    },
+  );
+});

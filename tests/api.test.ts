@@ -1837,6 +1837,57 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       await Document.deleteOne({ _id: doc._id });
     }
   });
+  it("refreshes an attached version-three receipt in payment edit without saving a payment or claiming its own number", async () => {
+    const { Admin, Document, Participant, Payment } =
+      await import("../server/models.js");
+    const { completeRecognition, resumeDraft } =
+      await import("../server/services/duplicates.js");
+    const { RECEIPT_RECOGNITION_VERSION } =
+      await import("../shared/document-recognition.js");
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const fields = { receiptNumber: "SAVED-RECEIPT-REFRESH", amount: 648700 };
+    const doc = await Document.create({
+      kind: "receipt",
+      ownerId: owner!._id,
+      status: "done",
+      recognitionVersion: 3,
+      fields,
+      attempts: 3,
+    });
+    const participant = await Participant.create({ firstName: "Сынақ" });
+    const payment = await Payment.create({
+      ...base,
+      ...fields,
+      participantId: participant._id,
+      receiptDocumentId: doc._id,
+      recipientName: "Сақталған алушы",
+    });
+    try {
+      const url = `/api/documents/${doc._id}/refresh`;
+      expect((await post(url, {})).body).toMatchObject({
+        status: "queued",
+        recognitionVersion: RECEIPT_RECOGNITION_VERSION,
+      });
+      await completeRecognition(doc, {
+        ...fields,
+        recipientName: "Оқылған алушы",
+        method: "Аударым",
+      });
+      const read = await post(url, {});
+      expect(read.body).toMatchObject({
+        status: "done",
+        fields: { method: "Аударым" },
+      });
+      expect((await Payment.findById(payment._id))!.recipientName).toBe(
+        "Сақталған алушы",
+      );
+      await expect(resumeDraft(doc)).rejects.toThrow();
+    } finally {
+      await Payment.deleteOne({ _id: payment._id });
+      await Document.deleteOne({ _id: doc._id });
+      await Participant.deleteOne({ _id: participant._id });
+    }
+  });
   it("automatically rereads an old incomplete identity draft once without reserving or duplicating it", async () => {
     const { Document } = await import("../server/models.js");
     const { resumeDraft, completeRecognition } =

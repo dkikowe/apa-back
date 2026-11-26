@@ -7,6 +7,7 @@ import {
   extractIdentityLayout,
   identityIinCandidates,
   printedBirthDate,
+  receiptHeadingFields,
   isReceiptInsteadOfIdentity,
   type PositionedText,
 } from "./document-fields.js";
@@ -20,22 +21,76 @@ Object.assign(globalThis, { DOMMatrix, ImageData, Path2D });
 // PDF content streams can list the left column before the right column. Rebuild
 // receipt rows by their visible position, so dates stay beside their labels.
 export function receiptTextLines(items: PositionedText[]) {
-  const rows: { y: number; items: PositionedText[] }[] = [];
+  return receiptRows(items)
+    .map((row) => row.text)
+    .join("\n");
+}
+
+// Tesseract may return the value before its label when their baselines differ
+// by a few pixels. Group overlapping text on the same printed row.
+function receiptRows(items: PositionedText[]): PositionedText[] {
+  const rows: PositionedText[][] = [];
   for (const item of [...items]
     .filter((v) => v.text.trim())
     .sort((a, b) => a.bbox.y1 - b.bbox.y1 || a.bbox.x0 - b.bbox.x0)) {
-    const row = rows.find((r) => Math.abs(r.y - item.bbox.y1) <= 2);
-    if (row) row.items.push(item);
-    else rows.push({ y: item.bbox.y1, items: [item] });
-  }
-  return rows
-    .map((row) =>
-      row.items
-        .sort((a, b) => a.bbox.x0 - b.bbox.x0)
-        .map((v) => v.text)
-        .join(" "),
+    const row = rows.at(-1);
+    const anchor = row?.[0]?.bbox;
+    const box = item.bbox;
+    const overlap = anchor
+      ? Math.min(box.y1, anchor.y1) - Math.max(box.y0, anchor.y0)
+      : 0;
+    if (
+      anchor &&
+      (Math.abs(anchor.y1 - box.y1) <= 2 ||
+        overlap > 0.6 * Math.min(box.y1 - box.y0, anchor.y1 - anchor.y0))
     )
-    .join("\n");
+      row!.push(item);
+    else rows.push([item]);
+  }
+  return rows.map((row) => ({
+    text: row
+      .sort((a, b) => a.bbox.x0 - b.bbox.x0)
+      .map((v) => v.text.trim())
+      .join(" "),
+    bbox: {
+      x0: Math.min(...row.map((v) => v.bbox.x0)),
+      x1: Math.max(...row.map((v) => v.bbox.x1)),
+      y0: Math.min(...row.map((v) => v.bbox.y0)),
+      y1: Math.max(...row.map((v) => v.bbox.y1)),
+    },
+  }));
+}
+
+// Read a narrow strip with its printed heading, stopping before the next
+// heading. Kaspi prints the amount and recipient together in the success header.
+function receiptBands(items: PositionedText[], height: number) {
+  const rows = receiptRows(items).map((row) => {
+    const success =
+      /^(?:Сәтті аударылды|Перевод выполнен успешно|Оплата совершена|Төлем жасалды)/iu.test(
+        row.text,
+      );
+    const keys = success
+      ? ["amount", "recipientName"]
+      : receiptHeadingFields(row.text);
+    const boundary =
+      keys.length > 0 ||
+      /^(?:Аударым түрі|Тип перевода|Комиссия|Сообщение|Адрес|ИИН|БИН)(?=\s|:|$)/iu.test(
+        row.text,
+      );
+    return { ...row, keys, boundary, success };
+  });
+  return rows.flatMap((row, i) => {
+    if (!row.keys.length) return [];
+    const lineHeight = Math.max(8, row.bbox.y1 - row.bbox.y0);
+    const top = Math.max(0, Math.floor(row.bbox.y0 - lineHeight * 0.3));
+    const next = rows.slice(i + 1).find((v) => v.boundary)?.bbox.y0 ?? height;
+    const bottom = Math.min(
+      height,
+      Math.floor(next),
+      Math.ceil(row.bbox.y1 + lineHeight * (row.success ? 10 : 4)),
+    );
+    return bottom > top ? [{ top, height: bottom - top, keys: row.keys }] : [];
+  });
 }
 export class WrongDocumentKindError extends Error {
   constructor() {
@@ -47,7 +102,11 @@ export class WrongDocumentKindError extends Error {
 }
 export async function recognize(buffer: Buffer, mime: string, kind: string) {
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
-  const scan = async (image: Buffer, mode = PSM.SPARSE_TEXT) => {
+  const scan = async (
+    image: Buffer,
+    mode = PSM.SPARSE_TEXT,
+    blocks = kind === "identity",
+  ) => {
     worker ??= await createWorker(
       (
         process.env.OCR_LANGUAGES ||
@@ -67,17 +126,12 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       // of concatenating the entire left column before the right column.
       tessedit_pageseg_mode: mode,
     });
-    return (
-      await worker.recognize(
-        image,
-        {},
-        { text: true, blocks: kind === "identity" },
-      )
-    ).data;
+    return (await worker.recognize(image, {}, { text: true, blocks })).data;
   };
   const scanReceipt = async (
     image: Buffer,
     seed: Record<string, string | number> = {},
+    positioned: PositionedText[] = [],
   ) => {
     const fields = { ...seed };
     const { width, height } = await sharp(image).metadata();
@@ -114,27 +168,106 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
       { render: () => gray().rotate(90).png().toBuffer(), mode: PSM.AUTO },
       { render: () => gray().rotate(270).png().toBuffer(), mode: PSM.AUTO },
     ];
+    type Pass = {
+      render: () => Promise<Buffer>;
+      mode: PSM;
+      keys?: string[];
+      collectRows?: boolean;
+    };
+    const queue: Pass[] = passes.map((pass, i) => ({
+      ...pass,
+      collectRows: i < 2,
+    }));
+    let bestLines = positioned;
     let read = false;
-    for (const pass of passes) {
+    for (let i = 0; i < queue.length; i++) {
       if (
         read &&
         (Date.now() > recoveryDeadline ||
           !missingDocumentFields("receipt", fields).length)
       )
         break;
+      const pass = queue[i];
+      if (pass.keys && pass.keys.every((key) => fields[key] !== undefined))
+        continue;
       try {
-        const result = await scan(await pass.render(), pass.mode);
+        const result = await scan(
+          await pass.render(),
+          pass.mode,
+          !!pass.collectRows,
+        );
         read = true;
-        const found = extractFields(result.text, "receipt");
+        const lines =
+          result.blocks?.flatMap((b) => b.paragraphs.flatMap((p) => p.lines)) ||
+          [];
+        const found = {
+          ...extractFields(result.text, "receipt"),
+          ...extractFields(receiptTextLines(lines), "receipt"),
+        };
         for (const [key, value] of Object.entries(found))
-          if (fields[key] === undefined) fields[key] = value;
+          if (
+            fields[key] === undefined &&
+            (!pass.keys ||
+              pass.keys.includes(key) ||
+              (key === "receiptType" &&
+                pass.keys.includes("recipientName") &&
+                found.recipientName === fields.recipientName))
+          )
+            fields[key] = value;
+        if (
+          pass.collectRows &&
+          receiptBands(lines, height).length >
+            receiptBands(bestLines, height).length
+        )
+          bestLines = lines;
       } catch (error) {
         await worker?.terminate().catch(() => {});
         worker = undefined;
-        if (Date.now() > recoveryDeadline || pass === passes.at(-1)) {
+        if (Date.now() > recoveryDeadline || pass === queue.at(-1)) {
           if (!read && !Object.keys(fields).length) throw error;
           break;
         }
+      }
+      if (i === 1) {
+        // Try field-specific enlarged crops while there is still budget.
+        // Deduplicate by missing field to bound work on repeated PDF headings.
+        const targeted: Pass[] = [];
+        const seen = new Set<string>();
+        for (const band of receiptBands(bestLines, height)) {
+          const keys = band.keys.filter(
+            (key) => fields[key] === undefined && !seen.has(key),
+          );
+          if (!keys.length) continue;
+          for (const key of keys) seen.add(key);
+          for (const mode of [PSM.SINGLE_BLOCK, PSM.SPARSE_TEXT]) {
+            targeted.push({
+              mode,
+              keys,
+              render: () => {
+                const strip = gray()
+                  .extract({
+                    left: 0,
+                    top: band.top,
+                    width,
+                    height: band.height,
+                  })
+                  .resize({
+                    width: Math.min(3000, width * 2),
+                    height: 1600,
+                    fit: "inside",
+                  });
+                return (
+                  mode === PSM.SINGLE_BLOCK
+                    ? strip.sharpen()
+                    : strip.threshold(165)
+                )
+                  .png()
+                  .toBuffer();
+              },
+            });
+          }
+        }
+        queue.splice(i + 1, 0, ...targeted);
       }
     }
     return { text: "", fields };
@@ -354,7 +487,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           try {
             scanned =
               kind === "receipt"
-                ? await scanReceipt(rendered, layerFields)
+                ? await scanReceipt(rendered, layerFields, values)
                 : await scanIdentity(rendered, layerFields, values);
           } catch (error) {
             if (error instanceof WrongDocumentKindError) throw error;

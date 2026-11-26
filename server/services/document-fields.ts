@@ -105,12 +105,34 @@ const labels = {
     "PAYMENT METHOD",
     "ОПЛАЧЕНО",
     "ОТКУДА",
+    "ҚАЙДАН",
+    "КАЙДАН",
     "ТӨЛЕНДІ",
     "СПИСАНО С",
   ],
 };
 const prefix = (values: string[]) =>
   new RegExp("^(?:" + values.join("|") + ")(?=\\s|[:/|–—-]|$)", "iu");
+const receiptHeadings = (
+  [
+    "amount",
+    "paymentDate",
+    "recipientName",
+    "payerName",
+    "receiptNumber",
+    "method",
+  ] as const
+).map((field) => ({ field, heading: prefix(labels[field]) }));
+
+export function receiptHeadingFields(line: string): string[] {
+  const match = receiptHeadings.find(({ heading }) =>
+    heading.test(line.trim()),
+  );
+  if (!match) return [];
+  return match.field === "paymentDate"
+    ? ["paymentDate", "paymentTime"]
+    : [match.field];
+}
 const anyLabel = prefix(Object.values(labels).flat());
 // Either language can remain readable when OCR damages the other half of a
 // bilingual heading. Never use such a heading as the value of an empty name.
@@ -287,7 +309,7 @@ function hasIdentityContext(text: string) {
 export function isReceiptInsteadOfIdentity(text: string) {
   return (
     !hasIdentityContext(text) &&
-    /Оплата совершена|Т[өео]лем жасалды|Перевод (?:успешно|выполнен)|Плат[её]ж выполнен/iu.test(
+    /Оплата совершена|Т[өео]лем жасалды|С[әа]тті аударылды|Перевод (?:успешно|выполнен)|Плат[её]ж выполнен/iu.test(
       text,
     ) &&
     /№\s*(?:чека|квитанции)|Түбіртек\s*№|ФИО\s+покупателя|ИИН\s*[/]\s*БИН/iu.test(
@@ -544,7 +566,7 @@ export function extractFields(text: string, kind: string) {
     // Never use the merchant IIN, a card number, or an arbitrary unlabeled number.
     if (fields.amount === undefined) {
       const success = lines.findIndex((line) =>
-        /^(?:Оплата совершена|Плат[её]ж выполнен|Перевод выполнен успешно|Перевод успешно соверш[её]н|Перевод успешно совер\.{3}|Т[өео]лем жасалды|Төлем сәтті орындалды)$/iu.test(
+        /^(?:Оплата совершена|Плат[её]ж выполнен|Перевод выполнен успешно|Перевод успешно соверш[её]н|Перевод успешно совер\.{3}|Т[өео]лем жасалды|Төлем сәтті орындалды|С[әа]тті аударылды)$/iu.test(
           line,
         ),
       );
@@ -579,7 +601,16 @@ export function extractFields(text: string, kind: string) {
           break;
         block.push(lines[j]);
       }
-      const value = block.join(" ");
+      let value = block.join(" ");
+      // In two-column transfers the date can sit just above the label baseline
+      // and be returned first. Only accept an adjacent, complete date/time.
+      if (
+        !dateValue(value) &&
+        /^\d{2}[./]\d{2}[./]\d{4}\s+\d{2}:\d{2}(?::\d{2})?$/.test(
+          lines[i - 1] || "",
+        )
+      )
+        value = lines[i - 1];
       const parsed = dateValue(value);
       if (!parsed) continue;
       fields.paymentDate = parsed;
@@ -732,7 +763,7 @@ export function extractReceiptText(message: string) {
     .replace(/\s+/g, " ")
     .trim();
   const success =
-    /Оплата совершена|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Т[өео]лем жасалды|Төлем сәтті орындалды/giu;
+    /Оплата совершена|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Т[өео]лем жасалды|Төлем сәтті орындалды|С[әа]тті аударылды/giu;
   const matches = [...message.matchAll(success)];
   if (matches.length > 1)
     throw new Error("Бір уақытта бір чектің мәтінін ғана қойыңыз.");
@@ -755,6 +786,7 @@ export function extractReceiptText(message: string) {
     "Сообщение",
     "Адрес",
     "Тип перевода",
+    "Аударым түрі",
   ]
     .sort((a, b) => b.length - a.length)
     .map((s) =>

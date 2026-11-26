@@ -49,6 +49,7 @@ import {
 } from "./services/duplicates.js";
 import {
   IDENTITY_RECOGNITION_VERSION,
+  RECEIPT_RECOGNITION_VERSION,
   missingDocumentFields,
 } from "../shared/document-recognition.js";
 import { documentErrorMessage } from "./services/document-errors.js";
@@ -747,12 +748,18 @@ export function createApp() {
       Document.findOne(owned).select(documentStatusFields).lean();
     let doc = await current();
     if (!doc) throw new HttpError(404, "Құжат табылмады.");
+    const version =
+      doc.kind === "identity"
+        ? IDENTITY_RECOGNITION_VERSION
+        : RECEIPT_RECOGNITION_VERSION;
     if (
-      doc.kind === "identity" &&
+      (doc.kind === "identity" || doc.kind === "receipt") &&
       doc.status === "done" &&
-      (doc.recognitionVersion ?? 0) < IDENTITY_RECOGNITION_VERSION &&
-      missingDocumentFields("identity", doc.fields || {}).length &&
-      (await Participant.exists({ identityDocumentId: doc._id }))
+      (doc.recognitionVersion ?? 0) < version &&
+      missingDocumentFields(doc.kind, doc.fields || {}).length &&
+      (doc.kind === "identity"
+        ? await Participant.exists({ identityDocumentId: doc._id })
+        : await Payment.exists({ receiptDocumentId: doc._id }))
     ) {
       // Claim the current reader version when queueing. Concurrent editors,
       // including after a failed scan, share this attempt.
@@ -766,7 +773,7 @@ export function createApp() {
           {
             $set: {
               status: "queued",
-              recognitionVersion: IDENTITY_RECOGNITION_VERSION,
+              recognitionVersion: version,
             },
             $unset: { error: 1 },
           },

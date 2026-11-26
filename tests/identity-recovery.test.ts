@@ -178,3 +178,27 @@ it("re-reads a receipt PDF for a missing payer and time while retaining the prin
   });
   expect(engine.recognize).toHaveBeenCalledTimes(3);
 });
+
+it("enlarges a missing labeled receipt row and reads it without overwriting native fields", async () => {
+  const pdf = textPdf([
+    "TOTAL: 1600 KZT",
+    "DATE: 26.11.2026 17:16",
+    "RECEIPT NUMBER: TEST-100",
+    "SENDER: TEST A.",
+    "PAYMENT METHOD: TEST CARD",
+    "RECIPIENT:",
+  ]);
+  engine.recognize
+    .mockResolvedValueOnce(response([]))
+    .mockResolvedValueOnce(response([]))
+    .mockResolvedValueOnce(response(["RECIPIENT: SAMPLE B.", "TOTAL: 1 KZT"]));
+  expect(await recognize(pdf, "application/pdf", "receipt")).toMatchObject({
+    amount: 160000,
+    recipientName: "SAMPLE B.",
+    method: "TEST CARD",
+  });
+  expect(engine.recognize).toHaveBeenCalledTimes(3);
+  const full = await sharp(engine.recognize.mock.calls[0][0]).metadata();
+  const crop = await sharp(engine.recognize.mock.calls[2][0]).metadata();
+  expect(crop.height).toBeLessThan(full.height / 2);
+});
