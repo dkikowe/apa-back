@@ -1,13 +1,12 @@
 import { createWorker, PSM } from "tesseract.js";
 import { createCanvas, DOMMatrix, ImageData, Path2D } from "@napi-rs/canvas";
 import sharp from "sharp";
+import { missingDocumentFields } from "../../shared/document-recognition.js";
 import {
   extractFields,
   extractIdentityLayout,
-  identityDetails,
   identityIinCandidates,
   isReceiptInsteadOfIdentity,
-  machineReadableNames,
   type PositionedText,
 } from "./document-fields.js";
 export {
@@ -102,37 +101,116 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
     }
     return { ...first, fields };
   };
-  const scanIdentity = async (image: Buffer) => {
-    const first = await scan(image);
-    if (isReceiptInsteadOfIdentity(first.text))
-      throw new WrongDocumentKindError();
-    const fields = extractFields(first.text, "identity");
-    let text = first.text;
-    let blocks = first.blocks;
-    if (
-      !fields.iin ||
-      !(fields.lastName || fields.lastNameLatin) ||
-      !(fields.firstName || fields.firstNameLatin) ||
-      !fields.birthDate
-    ) {
+  // Bound the work for unreadable/missing sides, rather than retrying the
+  // same pixels forever and blocking every other document in the queue.
+  const recoveryDeadline = Date.now() + 120_000;
+  const scanIdentity = async (
+    image: Buffer,
+    seed: Record<string, string | number> = {},
+    nativeValues: PositionedText[] = [],
+  ) => {
+    const fields = { ...seed };
+    const texts: string[] = [];
+    const iins = new Set<string>();
+    if (typeof seed.iin === "string") iins.add(seed.iin);
+    let successfulPasses = 0;
+    let lastError: unknown;
+    const meta = await sharp(image).metadata();
+    const width = meta.width!,
+      height = meta.height!;
+    const gray = () => sharp(image).grayscale().normalize();
+    const region = (bottom: boolean) => {
+      const cropHeight = Math.ceil(height * 0.65);
+      return gray()
+        .extract({
+          left: 0,
+          top: bottom ? height - cropHeight : 0,
+          width,
+          height: cropHeight,
+        })
+        .resize({ width: 3000, height: 3000, fit: "inside" })
+        .sharpen()
+        .png()
+        .toBuffer();
+    };
+    // Different layouts, local contrast and enlarged overlapping regions
+    // recover small/faded text. Coordinate-based PDF matching is used only
+    // on passes that retain the original coordinate system.
+    const passes = [
+      { image: async () => image, mode: PSM.SPARSE_TEXT, positioned: true },
+      { image: async () => image, mode: PSM.AUTO, positioned: true },
+      {
+        image: () => gray().sharpen().png().toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+        positioned: true,
+      },
+      {
+        image: () =>
+          gray().clahe({ width: 32, height: 32, maxSlope: 3 }).png().toBuffer(),
+        mode: PSM.AUTO,
+        positioned: true,
+      },
+      { image: () => region(false), mode: PSM.SPARSE_TEXT, positioned: false },
+      { image: () => region(true), mode: PSM.SPARSE_TEXT, positioned: false },
+      {
+        image: () => gray().threshold(160).png().toBuffer(),
+        mode: PSM.AUTO,
+        positioned: true,
+      },
+      {
+        image: () => sharp(image).rotate(90).png().toBuffer(),
+        mode: PSM.AUTO,
+        positioned: false,
+      },
+      {
+        image: () => sharp(image).rotate(270).png().toBuffer(),
+        mode: PSM.AUTO,
+        positioned: false,
+      },
+    ];
+    for (const pass of passes) {
+      if (
+        successfulPasses &&
+        (!missingDocumentFields("identity", fields).length ||
+          Date.now() > recoveryDeadline)
+      )
+        break;
       try {
-        const second = await scan(image, PSM.AUTO);
-        if (isReceiptInsteadOfIdentity(second.text))
+        const result = await scan(await pass.image(), pass.mode);
+        if (isReceiptInsteadOfIdentity(result.text))
           throw new WrongDocumentKindError();
-        text += "\n" + second.text;
-        blocks = [...(blocks || []), ...(second.blocks || [])];
-        for (const [key, value] of Object.entries(
-          extractFields(second.text, "identity"),
-        ))
+        successfulPasses++;
+        texts.push(result.text);
+        const anchors =
+          result.blocks?.flatMap((block) =>
+            block.paragraphs.flatMap((paragraph) => paragraph.lines),
+          ) || [];
+        const found = {
+          ...extractFields(result.text, "identity"),
+          ...(pass.positioned
+            ? extractIdentityLayout(nativeValues, anchors)
+            : {}),
+        };
+        for (const value of identityIinCandidates(result.text)) iins.add(value);
+        if (typeof found.iin === "string") iins.add(found.iin);
+        // Explicitly empty patronymics are meaningful. Never replace values
+        // from a reliable PDF layer/earlier pass with later OCR guesses.
+        for (const [key, value] of Object.entries(found))
           if (fields[key] === undefined) fields[key] = value;
+        delete fields.iin;
+        if (iins.size === 1) fields.iin = [...iins][0];
       } catch (error) {
         if (error instanceof WrongDocumentKindError) throw error;
+        lastError = error;
+        // A failed OCR engine can be recreated on the next strategy.
+        await worker?.terminate().catch(() => {});
+        worker = undefined;
+        if (Date.now() > recoveryDeadline) break;
       }
     }
-    const iins = identityIinCandidates(text);
-    delete fields.iin;
-    if (iins.length === 1) fields.iin = iins[0];
-    return { ...first, text, blocks, fields };
+    if (!successfulPasses && !Object.keys(seed).length)
+      throw lastError || new Error("OCR_FAILED");
+    return { text: texts.join("\n"), fields };
   };
   try {
     let text = "";
@@ -182,14 +260,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
           const layerFields = extractFields(layer, kind);
           const layerComplete =
             kind === "identity"
-              ? Boolean(
-                  (layerFields.lastName || layerFields.lastNameLatin) &&
-                  (layerFields.firstName || layerFields.firstNameLatin) &&
-                  layerFields.lastNameLatin &&
-                  layerFields.firstNameLatin &&
-                  layerFields.birthDate &&
-                  layerFields.iin,
-                )
+              ? missingDocumentFields("identity", layerFields).length === 0
               : Boolean(
                   layerFields.amount !== undefined &&
                   layerFields.paymentDate &&
@@ -202,6 +273,7 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
                 );
           if (layer.replace(/\s/g, "").length > 40 && layerComplete) {
             text += layer + "\n";
+            Object.assign(nativeFields, layerFields);
             continue;
           }
           const viewport = page.getViewport({
@@ -219,12 +291,37 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             viewport,
           }).promise;
           const rendered = canvas.toBuffer("image/png");
+          const values: PositionedText[] = content.items.flatMap((item) => {
+            if (
+              !("str" in item) ||
+              !item.str.trim() ||
+              item.transform[1] !== 0 ||
+              item.transform[2] !== 0 ||
+              page.rotate !== 0
+            )
+              return [];
+            const [x, y] = viewport.convertToViewportPoint(
+              item.transform[4],
+              item.transform[5],
+            );
+            return [
+              {
+                text: item.str,
+                bbox: {
+                  x0: x,
+                  y0: y - item.height * viewport.scale,
+                  x1: x + item.width * viewport.scale,
+                  y1: y,
+                },
+              },
+            ];
+          });
           let scanned;
           try {
             scanned =
               kind === "receipt"
                 ? await scanReceipt(rendered)
-                : await scanIdentity(rendered);
+                : await scanIdentity(rendered, layerFields, values);
           } catch (error) {
             if (error instanceof WrongDocumentKindError) throw error;
             const usableLayer =
@@ -245,56 +342,18 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
             );
           if (kind === "identity") {
             identitySources.push(scanned.text);
-            const values: PositionedText[] = content.items.flatMap((item) => {
-              if (
-                !("str" in item) ||
-                !item.str.trim() ||
-                item.transform[1] !== 0 ||
-                item.transform[2] !== 0 ||
-                page.rotate !== 0
-              )
-                return [];
-              const [x, y] = viewport.convertToViewportPoint(
-                item.transform[4],
-                item.transform[5],
-              );
-              return [
-                {
-                  text: item.str,
-                  bbox: {
-                    x0: x,
-                    y0: y - item.height * viewport.scale,
-                    x1: x + item.width * viewport.scale,
-                    y1: y,
-                  },
-                },
-              ];
-            });
-            const anchors =
-              scanned.blocks?.flatMap((block) =>
-                block.paragraphs.flatMap((paragraph) => paragraph.lines),
-              ) || [];
-            Object.assign(
-              nativeFields,
-              "fields" in scanned ? scanned.fields : {},
-              layerFields,
-              identityDetails(layer + "\n" + scanned.text),
-              extractIdentityLayout(values, anchors),
-              machineReadableNames(layer),
-            );
+            Object.assign(nativeFields, scanned.fields);
           }
         }
       } finally {
         await pdf.loadingTask.destroy();
       }
     } else {
-      const image = await sharp(buffer, { limitInputPixels: 25000000 })
+      const prepared = sharp(buffer, { limitInputPixels: 25000000 })
         .rotate()
-        .resize({ width: 2400, height: 3200, fit: "inside" })
-        .grayscale()
-        .normalize()
-        .png()
-        .toBuffer();
+        .resize({ width: 2400, height: 3200, fit: "inside" });
+      if (kind === "receipt") prepared.grayscale().normalize();
+      const image = await prepared.png().toBuffer();
       if (kind === "receipt") {
         const scanned = await scanReceipt(image);
         text = scanned.text;
@@ -306,7 +365,10 @@ export async function recognize(buffer: Buffer, mime: string, kind: string) {
         Object.assign(nativeFields, scanned.fields);
       }
     }
-    const result = { ...extractFields(text, kind), ...nativeFields };
+    const result =
+      kind === "identity"
+        ? nativeFields
+        : { ...extractFields(text, kind), ...nativeFields };
     if (kind === "identity") {
       const candidates = new Set(
         identityIinCandidates(identitySources.join("\n")),

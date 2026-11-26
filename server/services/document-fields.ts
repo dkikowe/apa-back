@@ -17,7 +17,12 @@ const labels = {
   lastName: ["ТЕГІ", "ФАМИЛИЯ", "SURNAME"],
   firstName: ["АТЫ", "ИМЯ", "GIVEN NAMES", "GIVEN NAME", "FIRST NAME", "NAME"],
   middleName: ["ӘКЕСІНІҢ АТЫ", "ОТЧЕСТВО", "PATRONYMIC"],
-  birthDate: ["ТУҒАН КҮНІ", "ДАТА РОЖДЕНИЯ", "DATE OF BIRTH"],
+  birthDate: [
+    "ТУҒАН КҮНІ, АЙЫ, ЖЫЛЫ",
+    "ТУҒАН КҮНІ",
+    "ДАТА РОЖДЕНИЯ",
+    "DATE OF BIRTH",
+  ],
   iin: ["ЖСН", "ИИН", "IIN"],
   documentNumber: [
     "КУӘЛІК НӨМІРІ",
@@ -374,6 +379,11 @@ function normalizeReceiptLabels(text: string) {
 }
 export function extractFields(text: string, kind: string) {
   if (kind === "receipt") text = normalizeReceiptLabels(text);
+  else
+    text = text.replace(
+      /(\d{2})[ \t]*([./])[ \t]*(\d{2})[ \t]*([./])[ \t]*(\d{4})/g,
+      "$1$2$3$4$5",
+    );
   const lines = text
     .normalize("NFC")
     // Halyk wraps the label around the value in narrow receipt columns.
@@ -382,16 +392,24 @@ export function extractFields(text: string, kind: string) {
     .map((v) => v.trim())
     .filter(Boolean);
   const fields: Record<string, string | number> = {};
-  function labeled(aliases: string[], allowEmpty = false) {
+  function labeled(aliases: string[], allowEmpty = false, dateField = false) {
     let foundEmpty = false;
     const expression = prefix(aliases);
     for (let i = 0; i < lines.length; i++) {
-      if (!expression.test(lines[i])) continue;
-      let value = lines[i].replace(expression, "").replace(/^[\s:/|]+/, "");
+      let heading = lines[i];
+      // A damaged Kazakh heading can still have a clear Russian label.
+      if (kind === "identity" && !expression.test(heading)) {
+        const parts = heading.split(/\s*[/|]\s*/);
+        const labelIndex = parts.findIndex((part) => expression.test(part));
+        if (labelIndex >= 0) heading = parts.slice(labelIndex).join(" / ");
+      }
+      if (!expression.test(heading)) continue;
+      let value = heading.replace(expression, "").replace(/^[\s:/|]+/, "");
       // A bilingual heading is one label, never the person's name.
       while (expression.test(value))
         value = value.replace(expression, "").replace(/^[\s:/|]+/, "");
       if (!value) value = lines[i + 1] || "";
+      if (dateField && /^[-–—]+$/.test(value)) value = lines[i + 2] || "";
       // Some receipts put timezone wording between the date label and value.
       if (/^(?:по Астане|Астана уақыты бойынша|\(Астана\))$/iu.test(value))
         value = lines[i + 2] || "";
@@ -451,7 +469,7 @@ export function extractFields(text: string, kind: string) {
       "issueDate",
       "expiryDate",
     ] as const) {
-      const value = labeled(labels[key]);
+      const value = labeled(labels[key], false, key.endsWith("Date"));
       if (!value) continue;
       if (key.endsWith("Date")) {
         const dates =
@@ -472,7 +490,7 @@ export function extractFields(text: string, kind: string) {
         if (/^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(number)) fields[key] = number;
       } else if (value.length >= 3 && value.length <= 200) fields[key] = value;
     }
-    const birth = labeled(labels.birthDate);
+    const birth = labeled(labels.birthDate, false, true);
     if (birth) {
       const date = dateValue(birth);
       if (date) fields.birthDate = date;

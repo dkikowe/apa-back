@@ -1,3 +1,7 @@
+import {
+  IDENTITY_RECOGNITION_VERSION,
+  missingDocumentFields,
+} from "../../shared/document-recognition.js";
 import type mongoose from "mongoose";
 import { Document, Participant, Payment } from "../models.js";
 
@@ -111,13 +115,40 @@ export async function resumeDraft(doc: any) {
       },
       { new: true },
     ).lean();
-    if (updated) return updated;
+    if (updated) return resumeDraft(updated);
     const current = await Document.findById(doc._id).lean();
     if (current) {
       const conflict = await savedDocumentConflict(current);
       if (conflict) throw new DuplicateError(conflict);
       return current;
     }
+  }
+  // Reusing an old partial scan should run the improved reader once, rather
+  // than returning its incomplete cached fields forever. Saved attachments
+  // are excluded by savedDocumentConflict above.
+  if (
+    doc.kind === "identity" &&
+    doc.status === "done" &&
+    (doc.recognitionVersion || 0) < IDENTITY_RECOGNITION_VERSION &&
+    missingDocumentFields("identity", doc.fields || {}).length
+  ) {
+    return (
+      (await Document.findOneAndUpdate(
+        {
+          _id: doc._id,
+          status: "done",
+          participantId: null,
+          $or: [
+            { recognitionVersion: { $exists: false } },
+            { recognitionVersion: { $lt: IDENTITY_RECOGNITION_VERSION } },
+          ],
+        },
+        { $set: { status: "queued" }, $unset: { error: 1 } },
+        { new: true },
+      ).lean()) ||
+      (await Document.findById(doc._id).lean()) ||
+      doc
+    );
   }
   return doc;
 }
@@ -176,6 +207,7 @@ export async function completeRecognition(
           error: conflict.message,
           duplicate: conflict,
           completedAt: new Date(),
+          recognitionVersion: IDENTITY_RECOGNITION_VERSION,
         },
         $unset: { recognitionKey: 1 },
       },
@@ -185,7 +217,12 @@ export async function completeRecognition(
   await Document.updateOne(
     { _id: doc._id },
     {
-      $set: { status: "done", fields, completedAt: new Date() },
+      $set: {
+        status: "done",
+        fields,
+        completedAt: new Date(),
+        recognitionVersion: IDENTITY_RECOGNITION_VERSION,
+      },
       $unset: { error: 1, duplicate: 1, recognitionKey: 1 },
     },
   );

@@ -326,3 +326,21 @@ describe("Empty identity patronymic", () => {
     ).not.toHaveProperty("middleName");
   });
 });
+
+it("reads the long bilingual birth date label on older identity cards", () => {
+  expect(
+    extractFields(
+      "Туған күні, айы, жылы / Дата рождения\n15.04.1975",
+      "identity",
+    ).birthDate,
+  ).toBe("1975-04-15");
+});
+
+it("recovers a birth date from the intact half of a damaged bilingual heading", () => {
+  expect(
+    extractFields(
+      "LYE ні, айы, жылы / Дата рождения\n-\n15. 04. 1975",
+      "identity",
+    ).birthDate,
+  ).toBe("1975-04-15");
+});

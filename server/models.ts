@@ -114,6 +114,7 @@ const document = new Schema(
     hash: String,
     uploadHash: String,
     recognitionKey: String,
+    recognitionVersion: Number,
     duplicate: Schema.Types.Mixed,
     ownerId: Schema.Types.ObjectId,
     participantId: Schema.Types.ObjectId,

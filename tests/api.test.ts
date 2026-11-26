@@ -1755,6 +1755,26 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       put.mockRestore();
     }
   });
+  it("automatically rereads an old incomplete identity draft once without reserving or duplicating it", async () => {
+    const { Document } = await import("../server/models.js");
+    const { resumeDraft, completeRecognition } =
+      await import("../server/services/duplicates.js");
+    const doc = await Document.create({
+      kind: "identity",
+      status: "done",
+      fields: { lastName: "Сынақ" },
+      attempts: 3,
+    });
+    expect((await resumeDraft(doc)).status).toBe("queued");
+    expect((await resumeDraft(await Document.findById(doc._id))).status).toBe(
+      "queued",
+    );
+    await completeRecognition(doc, { lastName: "Сынақ" });
+    const updated = await Document.findById(doc._id);
+    expect(updated!.recognitionVersion).toBe(2);
+    expect((await resumeDraft(updated)).status).toBe("done");
+    expect(await Document.countDocuments({ _id: doc._id })).toBe(1);
+  });
   it("recovers legacy drafts marked duplicate of another unsaved upload", async () => {
     const sharp = (await import("sharp")).default;
     const { createHash } = await import("node:crypto");
