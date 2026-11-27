@@ -9,6 +9,7 @@ import {
   addCitizenCardEvidence,
   extractFields,
   extractIdentityLayout,
+  hasBlankIdentityMrz,
   identityIinCandidates,
   printedBirthDate,
   receiptHeadingFields,
@@ -991,7 +992,10 @@ export async function recognize(
     for (const pass of queue) {
       if (
         successfulPasses &&
-        (!missingDocumentFields("identity", fields).length ||
+        ((!missingDocumentFields("identity", fields).length &&
+          (fields.identityMrz !== "blank" ||
+            hasDemographics(fields) ||
+            successfulPasses >= 2)) ||
           Date.now() > recoveryDeadline)
       )
         break;
@@ -1036,6 +1040,7 @@ export async function recognize(
             printedIins.add(previous.iin);
         }
         mergeIdentityFields(fields, found);
+        if (hasBlankIdentityMrz(result.text)) fields.identityMrz = "blank";
         if (iins.size > 1 && !conflicts.includes("iin")) conflicts.push("iin");
         delete fields.iin;
         if (confirmedIin) fields.iin = confirmedIin;
@@ -1049,6 +1054,7 @@ export async function recognize(
           printedIins.size === 1 &&
           printedIins.has(fields.iin) &&
           (!fields.firstNameLatin || !fields.lastNameLatin) &&
+          fields.identityMrz !== "blank" &&
           Date.now() < recoveryDeadline
         ) {
           const rows = anchors.filter(({ text }) => {
@@ -1166,6 +1172,8 @@ export async function recognize(
             ...(kind === "receipt" ? extractFields(streamText, kind) : {}),
             ...extractFields(layer, kind),
           };
+          if (kind === "identity" && hasBlankIdentityMrz(layer))
+            layerFields.identityMrz = "blank";
           if (kind === "receipt")
             observeReceiptNumber(layerFields.receiptNumber);
           const layerComplete =

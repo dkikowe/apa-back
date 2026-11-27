@@ -40,7 +40,7 @@ const receipt = {
   receiptNumber: "TEST-01",
 };
 const fixture = { kind: "receipt", mime: "image/png", key: "test" };
-it("gives delayed IIN reads one immediate retry on a new reader version", async () => {
+it("gives delayed IIN or Latin-name reads one immediate retry on a new reader version", async () => {
   const now = new Date();
   const later = new Date(+now + 86400000);
   const version = readerVersion("identity");
@@ -54,14 +54,26 @@ it("gives delayed IIN reads one immediate retry on a new reader version", async 
     recognitionVersion: version - 1,
     nextReadAt: later,
   };
-  const [waiting] = await Document.create([
+  const [waiting, waitingForLatin] = await Document.create([
     old,
+    { ...old, fields: { iin: "000000000001", lastName: "Сынақ" } },
     { ...old, kind: "receipt" },
     { ...old, recognitionVersion: version },
     { ...old, status: "processing" },
-    { ...old, fields: { iin: "000000000001" } },
+    {
+      ...old,
+      fields: {
+        iin: "000000000002",
+        firstNameLatin: "FIRST",
+        lastNameLatin: "LAST",
+      },
+    },
   ]);
-  expect((await wakeOutdatedIdentityReads(now)).modifiedCount).toBe(1);
+  expect((await wakeOutdatedIdentityReads(now)).modifiedCount).toBe(2);
+  expect(await Document.findById(waitingForLatin._id).lean()).toMatchObject({
+    nextReadAt: now,
+    recognitionVersion: version,
+  });
   expect(await Document.findById(waiting._id).lean()).toMatchObject({
     fields: old.fields,
     recoveryStage: 8,

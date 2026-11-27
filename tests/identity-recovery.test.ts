@@ -81,6 +81,38 @@ describe("Automatic identity recovery", () => {
     expect(unrelated.citizenship).toBeUndefined();
     expect(unrelated.birthplace).toBeUndefined();
   });
+  it("can finish a digital ID with a blank MRZ and still reads sex when it is printed", async () => {
+    const blankRows = [34, 40, 34].map((size) => "<".repeat(size));
+    const overlay = blankRows
+      .map((row, i) => `\nBT /F1 6 Tf 5 ${35 - 12 * i} Td (${row}) Tj ET`)
+      .join("");
+    const coreFields = [
+      "ФАМИЛИЯ: АБАЕВА",
+      "ИМЯ: АЙГУЛЬ",
+      ...core.slice(2),
+      ...details,
+    ];
+    const original = await sharp(await image())
+      .resize(300, 300)
+      .png()
+      .toBuffer();
+    const source = await imagePdf(original, false, overlay);
+    engine.recognize.mockResolvedValue(response(coreFields));
+    const blank = await recognize(source, "application/pdf", "identity");
+    expect(blank).toMatchObject({ identityMrz: "blank", iin: "000123456789" });
+    expect(blank.sex).toBeUndefined();
+    expect(blank.firstNameLatin).toBeUndefined();
+    expect(missingDocumentFields("identity", blank)).toEqual([]);
+    expect(
+      missingDocumentFields("identity", { ...blank, identityMrz: undefined }),
+    ).toEqual(["латынша тегі", "латынша аты"]);
+    engine.recognize.mockResolvedValue(
+      response([...coreFields, "ЖЫНЫСЫ / ПОЛ: Ж"]),
+    );
+    expect(
+      await recognize(source, "application/pdf", "identity"),
+    ).toMatchObject({ sex: "Әйел" });
+  });
   it("reads the labelled one-letter sex in a separate column and the original native birthplace", () => {
     const item = (text: string, x: number, y: number, width: number) => ({
       text,

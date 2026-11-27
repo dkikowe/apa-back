@@ -223,6 +223,23 @@ export function addCitizenCardEvidence(
   if (!result.citizenship && isKazakhCitizenCard(text))
     result.citizenship = kazakhCitizenship;
 }
+
+// Some digital cards print three filler-only rows in place of the MRZ.
+// A single filler line, a cropped scan or a damaged MRZ is weaker evidence.
+export function hasBlankIdentityMrz(text: string) {
+  const lines = text
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/\s/gu, ""))
+    .filter(Boolean);
+  const filler = /^<{30,44}$/u;
+  return lines.some(
+    (line, index) =>
+      index >= 2 &&
+      filler.test(line) &&
+      filler.test(lines[index - 1]) &&
+      filler.test(lines[index - 2]),
+  );
+}
 // ICAO 9303 TD1/TD2/TD3 data rows. Require exact columns and both date
 // check digits. The issuing-state code in the header is a different field.
 function mrzDemographics(lines: string[]) {

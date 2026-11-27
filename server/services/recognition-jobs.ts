@@ -32,7 +32,11 @@ export async function wakeOutdatedIdentityReads(now = new Date()) {
       status: "queued",
       recoveryHasCheckpoint: true,
       recognitionVersion: { $lt: version },
-      "fields.iin": { $in: [null, ""] },
+      $or: [
+        { "fields.iin": { $in: [null, ""] } },
+        { "fields.lastNameLatin": { $in: [null, ""] } },
+        { "fields.firstNameLatin": { $in: [null, ""] } },
+      ],
       nextReadAt: { $gt: now },
     },
     { $set: { nextReadAt: now, recognitionVersion: version } },
