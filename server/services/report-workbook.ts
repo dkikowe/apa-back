@@ -3,7 +3,6 @@ import {
   AGE_LABELS,
   ageAt,
   ageGroup,
-  money,
   MEMBERSHIP_PAYMENT_LABEL,
   RECEIPT_TYPES,
   paymentCategoryLabel,
@@ -17,6 +16,7 @@ export type ReportColumn = {
   money?: boolean;
 };
 export type ReportHeading = { title: string; purpose: string };
+type IncomeTotal = { label: string; amount: number };
 const tengeFormat = "#,##0.00";
 export const kkCollator = new Intl.Collator("kk", { numeric: true });
 
@@ -26,10 +26,10 @@ export function startTable(
   heading: ReportHeading,
   year: number,
   columns: ReportColumn[],
-  totals: { label: string; amount: number }[] = [],
+  totals: IncomeTotal[] = [],
   totalsOffset = 0,
+  incomeByType: IncomeTotal[] = [],
 ) {
-  const headerRow = totals.length ? 4 : 3;
   const sheet = book.addWorksheet(name);
   sheet.columns = columns.map(({ key, width, money }) => ({
     key,
@@ -62,7 +62,7 @@ export function startTable(
       ...Array(totalsOffset).fill(null),
       ...totals.flatMap(({ label, amount }) => [label, amount / 100]),
     ]);
-    line.height = 44;
+    line.height = incomeByType.length ? 57 : 44;
     line.eachCell((cell, column) => {
       cell.font = {
         name: "Calibri",
@@ -70,11 +70,50 @@ export function startTable(
         bold: true,
         color: { argb: "FF173F35" },
       };
-      cell.alignment = { wrapText: true, vertical: "middle" };
+      cell.alignment = {
+        wrapText: true,
+        vertical: "middle",
+        ...(incomeByType.length ? { indent: 1 } : {}),
+      };
       if ((column - totalsOffset) % 2 === 0) cell.numFmt = tengeFormat;
     });
   }
+  if (incomeByType.length) {
+    const title = sheet.addRow([null, "Кіріс түрі бойынша, ₸"]);
+    sheet.mergeCells(title.number, 2, title.number, 5);
+    title.height = 27;
+    title.getCell(2).font = { name: "Calibri", size: 14, bold: true };
+    for (let i = 0; i < incomeByType.length; i += 2) {
+      const pair = incomeByType.slice(i, i + 2);
+      const line = sheet.addRow([
+        null,
+        ...pair.flatMap(({ label, amount }) => [label, amount / 100]),
+      ]);
+      line.height = Math.max(
+        26,
+        ...pair.map(
+          ({ label }, index) =>
+            22 * Math.ceil(label.length / (index ? 17 : 29)),
+        ),
+      );
+      pair.forEach((_, index) => {
+        const labelCell = line.getCell(2 + 2 * index);
+        const amountCell = line.getCell(3 + 2 * index);
+        amountCell.numFmt = tengeFormat;
+        amountCell.font = { name: "Calibri", size: 13, bold: true };
+        for (const cell of [labelCell, amountCell]) {
+          cell.alignment = { ...cell.alignment, indent: 1 };
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: index ? "FFF1F4F2" : "FFE6F1EB" },
+          };
+        }
+      });
+    }
+  }
   const headers = sheet.addRow(columns.map((c) => c.header));
+  const headerRow = headers.number;
   headers.height = 45;
   headers.eachCell((cell) => {
     cell.font = {
@@ -90,22 +129,25 @@ export function startTable(
     };
     cell.alignment = { vertical: "middle", wrapText: true };
   });
-  sheet.views = [{ state: "frozen", ySplit: headerRow, showGridLines: true }];
+  // A large catalogue must leave room to scroll through participant rows.
+  const freeze = headerRow <= 10;
+  sheet.views = freeze
+    ? [{ state: "frozen", ySplit: headerRow, showGridLines: true }]
+    : [{ state: "normal", showGridLines: true }];
   sheet.pageSetup = {
     orientation: "landscape",
     paperSize: 9,
     fitToPage: true,
     fitToWidth: 1,
     fitToHeight: 0,
-    printTitlesRow: `1:${headerRow}`,
+    printTitlesRow: `${freeze ? 1 : headerRow}:${headerRow}`,
   };
   sheet.properties.defaultRowHeight = 21;
   return sheet;
 }
 
 export function finishTable(sheet: ExcelJS.Worksheet) {
-  const view = sheet.views[0];
-  const headerRow = view?.state === "frozen" ? view.ySplit || 3 : 3;
+  const headerRow = Number(sheet.pageSetup.printTitlesRow?.split(":").at(-1));
   sheet.autoFilter = {
     from: { row: headerRow, column: 1 },
     to: { row: Math.max(headerRow, sheet.rowCount), column: sheet.columnCount },
@@ -197,6 +239,7 @@ const provincialMembershipAmount = 650000; // tiyn, reporting reference only
 type RegionalReport = {
   people: (ParticipantInfo & { _id: unknown })[];
   category?: ReportCategory;
+  configuredCategories?: string[];
   byRegion: boolean;
   otherIncome?: {
     date?: string | null;
@@ -205,81 +248,94 @@ type RegionalReport = {
     description?: string | null;
   }[];
 };
-const provincialReceiptColumn = { header: "Чек", key: "receipt", width: 100 };
 const registrationNumberColumn = {
   header: "№",
   key: "registrationNumber",
   width: 10,
 };
 
-function receiptText(payment: ReportPayment) {
-  const date = payment.paymentDate?.replace(
-    /^(\d{4})-(\d{2})-(\d{2})$/,
-    "$3.$2.$1",
-  );
-  const time = payment.paymentTime?.replace(/:(\d{2}):00$/, ":$1");
-  return [
-    [date, time].filter(Boolean).join(" "),
-    payment.receiptNumber && `№ ${payment.receiptNumber}`,
-    payment.amount == null ? "" : money(payment.amount),
-    paymentCategoryLabel(payment),
-    RECEIPT_TYPES[payment.receiptType as keyof typeof RECEIPT_TYPES],
-  ]
-    .filter(Boolean)
-    .join(" · ")
-    .replace(/\s*\n\s*/g, " ");
+function provincialIncomeBreakdown(
+  categoryAmounts: Map<string, number>,
+  purposes: Map<string, string>,
+  regional: RegionalReport,
+): IncomeTotal[] {
+  const grouped = new Map<string, IncomeTotal>();
+  function collect(label: string, amount: number) {
+    const display = label.trim().replace(/\s+/g, " ");
+    const key = display.normalize("NFC").toLocaleLowerCase("kk-KZ");
+    const total = grouped.get(key);
+    if (total) total.amount += amount;
+    else grouped.set(key, { label: display, amount });
+  }
+  collect(MEMBERSHIP_PAYMENT_LABEL, 0);
+  for (const name of regional.configuredCategories || []) collect(name, 0);
+  for (const [key, label] of purposes)
+    collect(label, categoryAmounts.get(key) || 0);
+  for (const entry of regional.otherIncome || [])
+    collect(entry.category?.trim() || "Өзге кіріс", entry.amount || 0);
+  return [...grouped.values()].sort((a, b) => {
+    if (a.label === b.label) return 0;
+    if (a.label === MEMBERSHIP_PAYMENT_LABEL) return -1;
+    if (b.label === MEMBERSHIP_PAYMENT_LABEL) return 1;
+    return kkCollator.compare(a.label, b.label);
+  });
 }
 
-function fillProvincialReceipts(
+function fillProvincialPaymentDates(
   sheet: ExcelJS.Worksheet,
   firstRow: ExcelJS.Row,
   payments: ReportPayment[],
 ) {
-  // Split very long histories into continuation rows so every receipt stays
-  // readable within Excel's row-height limit. Amount totals appear only once.
+  // For multiple payments the same index identifies the date, sender and recipient,
+  // even when different purposes put the dates in different columns.
   let row = firstRow;
-  let receiptLines: string[] = [],
-    senders: string[] = [],
-    recipients: string[] = [];
+  let lines = new Map<string, string[]>();
   let visualLines = 0;
+  function addLine(key: string, value: string) {
+    const values = lines.get(key);
+    if (values) values.push(value);
+    else lines.set(key, [value]);
+  }
   function finishRow() {
-    for (const [key, lines] of [
-      ["receipt", receiptLines],
-      ["sender", senders],
-      ["recipient", recipients],
-    ] as const) {
+    for (const [key, values] of lines) {
       const cell = row.getCell(key);
-      cell.value = lines.join("\n");
+      cell.value = values.join("\n");
       cell.alignment = { vertical: "top", wrapText: true };
     }
     row.height = Math.max(42, Math.min(409, visualLines * 22 + 4));
   }
-  payments.forEach((payment, index) => {
+  for (const [index, payment] of payments.entries()) {
     const prefix = payments.length > 1 ? `${index + 1}. ` : "";
-    const receipt = prefix + receiptText(payment);
     const sender =
       prefix + (payment.payerName?.trim().replace(/\s+/g, " ") || "—");
     const recipient =
       prefix + (payment.recipientName?.trim().replace(/\s+/g, " ") || "—");
     const height = Math.max(
       1,
-      Math.ceil(receipt.length / 80),
       Math.ceil(sender.length / 24),
       Math.ceil(recipient.length / 40),
     );
     if (visualLines && visualLines + height > 17) {
       finishRow();
       row = sheet.addRow({});
-      receiptLines = [];
-      senders = [];
-      recipients = [];
+      lines = new Map();
       visualLines = 0;
     }
-    receiptLines.push(receipt);
-    senders.push(sender);
-    recipients.push(recipient);
+    const dateKey = `date:${purposeKey(payment)}`;
+    if (payments.length === 1) {
+      setPaymentDate(row, dateKey, payment.paymentDate, payment.paymentTime);
+    } else {
+      const day = payment.paymentDate?.replace(
+        /^(\d{4})-(\d{2})-(\d{2})$/,
+        "$3.$2.$1",
+      );
+      const time = payment.paymentTime?.replace(/:(\d{2}):00$/, ":$1");
+      addLine(dateKey, prefix + [day, time].filter(Boolean).join(" "));
+    }
+    addLine("sender", sender);
+    addLine("recipient", recipient);
     visualLines += height;
-  });
+  }
   if (visualLines) finishRow();
 }
 
@@ -306,6 +362,7 @@ export function addPaymentTables(
   >();
   for (const p of regional?.people || [])
     people.set(String(p._id), { person: p, sums: new Map() });
+  const categoryAmounts = new Map<string, number>();
   let received = 0,
     highlighted = 0;
   for (const p of payments) {
@@ -318,7 +375,13 @@ export function addPaymentTables(
       sums: new Map<string, number>(),
     };
     account.latest ??= p;
-    if (provincial) (account.receipts ??= []).push(p);
+    if (provincial) {
+      (account.receipts ??= []).push(p);
+      categoryAmounts.set(
+        key,
+        (categoryAmounts.get(key) || 0) + (p.amount || 0),
+      );
+    }
     received += p.amount || 0;
     if (
       provincial &&
@@ -369,15 +432,26 @@ export function addPaymentTables(
     { header: "Аймақ", key: "region", width: 34 },
     { header: "Елді мекен", key: "village", width: 23 },
   ];
-  const categoryColumns = categories.map(([key, header]) => ({
-    header:
-      provincial && key === "membership"
-        ? "Мүшелік жарна (6 500 ₸)"
-        : `${header}, ₸`,
-    key,
-    width: 24,
-    money: true,
-  }));
+  const categoryColumns = categories.flatMap(([key, label]) => [
+    {
+      header:
+        provincial && key === "membership"
+          ? "Мүшелік жарна (6 500 ₸)"
+          : `${label}, ₸`,
+      key,
+      width: 24,
+      money: true,
+    },
+    ...(provincial
+      ? [
+          {
+            header: `Күні мен уақыты — ${label}`,
+            key: `date:${key}`,
+            width: 29,
+          },
+        ]
+      : []),
+  ]);
   const summary = startTable(
     book,
     "Қатысушылар",
@@ -396,6 +470,7 @@ export function addPaymentTables(
             { header: "Телефон", key: "phone", width: 20 },
             { header: "Жасы", key: "age", width: 16 },
             { header: "Жас санаты", key: "ageGroup", width: 23 },
+            areaColumns[0],
           ]
         : regional
           ? [
@@ -420,15 +495,17 @@ export function addPaymentTables(
       { header: "Барлығы, ₸", key: "total", width: 22, money: true },
       ...(provincial
         ? [
-            provincialReceiptColumn,
             { header: "Жіберуші", key: "sender", width: 30 },
             { header: "Алушы", key: "recipient", width: 52 },
-            ...areaColumns,
+            areaColumns[1],
           ]
         : []),
     ],
     totals,
     provincial ? 1 : 0,
+    provincial
+      ? provincialIncomeBreakdown(categoryAmounts, purposes, regional)
+      : [],
   );
   const accounts = [...people.values()].sort((a, b) => {
     if (provincial) {
@@ -480,7 +557,7 @@ export function addPaymentTables(
       total: amounts.reduce((a, b) => a + b, 0) / 100,
     });
     if (provincial)
-      fillProvincialReceipts(summary, row, account.receipts || []);
+      fillProvincialPaymentDates(summary, row, account.receipts || []);
     else
       setPaymentDate(
         row,
@@ -504,7 +581,13 @@ export function addPaymentTables(
     [
       ...(provincial ? [registrationNumberColumn] : []),
       { header: "Қатысушы", key: "name", width: 36 },
-      { header: "Чек күні мен уақыты (Астана)", key: "paidAt", width: 24 },
+      {
+        header: provincial
+          ? "Төлем күні мен уақыты (Астана)"
+          : "Чек күні мен уақыты (Астана)",
+        key: "paidAt",
+        width: 26,
+      },
       { header: "Төлем мақсаты", key: "purpose", width: 28 },
       { header: "Сома, ₸", key: "amount", width: 18, money: true },
       {
@@ -517,7 +600,6 @@ export function addPaymentTables(
       { header: "Төлем тәсілі", key: "method", width: 24 },
       { header: "Чек түрі", key: "receiptTypeLabel", width: 26 },
       { header: "Жарна жылы", key: "year", width: 15 },
-      ...(provincial ? [provincialReceiptColumn] : []),
     ],
   );
   for (const p of payments) {
@@ -531,7 +613,6 @@ export function addPaymentTables(
       ...(provincial
         ? {
             registrationNumber: visibleRegistrationNumber(p.person),
-            receipt: receiptText(p),
           }
         : {}),
     });

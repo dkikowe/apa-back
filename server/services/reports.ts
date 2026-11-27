@@ -2,7 +2,7 @@ import ExcelJS from "exceljs";
 import { Types } from "mongoose";
 import { REPORT_TITLES, type ReportType } from "../../shared/report-names.js";
 import { regionLabel } from "../../shared/locations.js";
-import { Participant, Payment, Finance } from "../models.js";
+import { Participant, Payment, PaymentCategory, Finance } from "../models.js";
 import { filtersSchema, memberPipeline, type Filters } from "./members.js";
 import { backfillRegistrationNumbers } from "./registration-numbers.js";
 import {
@@ -29,7 +29,7 @@ import {
 
 const purposes: Record<ReportType, string> = {
   "mangystau-oblast":
-    "Мүшелік жарна және өзге төлемдер нақты төленген сома бойынша көрсетілген. Чектер Астана уақытымен берілген.",
+    "Әр төлем түрінің жанында чектегі күні мен Астана уақыты көрсетілген. «Төлемдер» парағында әр төлемнің сомасы жеке берілген.",
   "mangystau-district":
     "Аймақ пен елді мекен бойынша қатысушылардың қосымша төлемдері.",
   awards:
@@ -436,36 +436,38 @@ export async function makeReport(
     if (!byRegion) await backfillRegistrationNumbers();
     const dateRange = { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` };
     const region = byRegion ? f.region : "";
-    const [people, payments, otherIncome] = await Promise.all([
-      Participant.find({
-        deletedAt: null,
-        archivedAt: null,
-        siteHiddenAt: null,
-        ...(region ? { region } : {}),
-      })
-        .select(reportPersonProjection)
-        .lean(),
-      reportPayments(
-        {
-          paymentDate: dateRange,
-          ...(byRegion
-            ? {
-                paymentKind: "additional",
-                ...(category
-                  ? { paymentCategoryId: new Types.ObjectId(category.id) }
-                  : {}),
-              }
-            : {}),
-        },
-        region,
-      ),
-      !byRegion
-        ? Finance.find({ type: "income", voidedAt: null, date: dateRange })
-            .sort({ date: -1, _id: -1 })
-            .select("date category amount description")
-            .lean()
-        : undefined,
-    ]);
+    const [people, payments, otherIncome, configuredCategories] =
+      await Promise.all([
+        Participant.find({
+          deletedAt: null,
+          archivedAt: null,
+          siteHiddenAt: null,
+          ...(region ? { region } : {}),
+        })
+          .select(reportPersonProjection)
+          .lean(),
+        reportPayments(
+          {
+            paymentDate: dateRange,
+            ...(byRegion
+              ? {
+                  paymentKind: "additional",
+                  ...(category
+                    ? { paymentCategoryId: new Types.ObjectId(category.id) }
+                    : {}),
+                }
+              : {}),
+          },
+          region,
+        ),
+        !byRegion
+          ? Finance.find({ type: "income", voidedAt: null, date: dateRange })
+              .sort({ date: -1, _id: -1 })
+              .select("date category amount description")
+              .lean()
+          : undefined,
+        byRegion ? undefined : PaymentCategory.distinct("name"),
+      ]);
     if (byRegion)
       heading.purpose += category
         ? ` Төлем түрі — ${category.name}.`
@@ -475,6 +477,7 @@ export async function makeReport(
       byRegion,
       category: byRegion ? category : undefined,
       otherIncome,
+      configuredCategories,
     });
   } else if (
     type === "awards" ||

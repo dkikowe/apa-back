@@ -2757,6 +2757,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const archived = await Participant.create({
       ...common,
       firstName: "Мұрағат",
+      region: "Ақтау",
       archivedAt: new Date(),
     });
     const [show, villageFee, otherFee, emptyFee] = await PaymentCategory.create(
@@ -2774,6 +2775,14 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         },
         { name: "Жаңа төлем", nameKey: "regional-test-empty", amount: 560000 },
       ],
+    );
+    // A long catalogue moves the participant table beyond Excel's frozen area.
+    await PaymentCategory.insertMany(
+      Array.from({ length: 9 }, (_, index) => ({
+        name: `Қосымша сынақ ${index + 1}`,
+        nameKey: `unused-provincial-fixture-${index}`,
+        amount: 10000,
+      })),
     );
     const payment = {
       participantId: a._id,
@@ -2832,7 +2841,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         paymentKind: "additional",
         paymentCategoryId: otherFee._id,
         paymentCategoryName: otherFee.name,
-        paymentTime: "09:21",
+        paymentTime: "",
         amount: 560000,
         receiptNumber: "R-OTHER",
       },
@@ -2841,6 +2850,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         ...payment,
         participantId: archived._id,
         amount: 10150,
+        paymentKind: "additional",
+        paymentCategoryName: "Ескі төлем",
         receiptNumber: "R-ARCHIVED",
       },
     ]);
@@ -2849,8 +2860,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         type: "income",
         date: "2044-03-01",
         category: "Өзге сынақ",
-        amount: 3355,
+        amount: 2355,
       },
+      { type: "income", date: "2044-03-01", category: show.name, amount: 1000 },
       { type: "expense", date: "2044-03-01", category: "Шығыс", amount: 1100 },
       {
         type: "income",
@@ -2860,6 +2872,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         voidedAt: new Date(),
       },
     ]);
+    const tableHeader = (sheet: ExcelJS.Worksheet) =>
+      Number(/^A(\d+):/.exec(String(sheet.autoFilter))?.[1]);
     const exportBook = async (
       type: keyof typeof REPORT_TITLES,
       filter = "",
@@ -2873,6 +2887,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
           res.on("end", () => cb(null, Buffer.concat(chunks)));
         });
       expect(result.status).toBe(200);
+      expect(result.headers["content-type"]).toContain(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
       expect(
         decodeURIComponent(result.headers["content-disposition"]),
       ).toContain(reportFilename(type, year));
@@ -2883,8 +2900,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         expect(sheet.getCell("A1").text).toContain(String(year));
         expect(sheet.getCell("A2").text.length).toBeGreaterThan(15);
         const view = sheet.views[0];
-        expect(view.state).toBe("frozen");
-        const header = view.state === "frozen" ? Number(view.ySplit) : 0;
+        const header = tableHeader(sheet);
+        expect(view.state).toBe(header > 10 ? "normal" : "frozen");
+        if (view.state === "frozen") expect(view.ySplit).toBe(header);
         expect(sheet.autoFilter).toBe(
           `A${header}:${sheet.getCell(sheet.rowCount, sheet.columnCount).address}`,
         );
@@ -2892,8 +2910,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       return book;
     };
     const records = (sheet: ExcelJS.Worksheet) => {
-      const view = sheet.views[0];
-      const header = view.state === "frozen" ? Number(view.ySplit) : 0;
+      const header = tableHeader(sheet);
       const rows = [];
       for (let n = header + 1; n <= sheet.rowCount; n++) {
         const row: Record<string, ExcelJS.CellValue> = {};
@@ -2913,6 +2930,38 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(summary.getCell("E3").value).toBe(32289.25);
     expect(summary.getCell("G3").value).toBe(33.55);
     expect(summary.getCell("I3").value).toBe(6500);
+    const headerRow = tableHeader(summary);
+    expect(headerRow).toBeGreaterThan(10);
+    expect(summary.getRow(4).values).toContain("Кіріс түрі бойынша, ₸");
+    const byType = new Map<string, number>();
+    for (let n = 5; n < headerRow; n++) {
+      for (const col of [2, 4]) {
+        const category = summary.getCell(n, col).text;
+        if (n < headerRow - 1) expect(category).not.toBe("");
+        if (!category) continue;
+        const amount = summary.getCell(n, col + 1).value;
+        expect(typeof amount).toBe("number");
+        expect(byType.has(category)).toBe(false);
+        byType.set(category, Number(amount));
+      }
+    }
+    expect(Object.fromEntries(byType)).toMatchObject({
+      "Мүшелік жарна": 18587,
+      "Аудандық жарна": 1500.75,
+      "Басқа мақсат": 5600,
+      Көрме: 6510,
+      "Жаңа төлем": 0,
+      "Ескі төлем": 101.5,
+      "Өзге сынақ": 23.55,
+    });
+    expect(byType.has("Алып тасталды")).toBe(false);
+    expect(byType.has("Шығыс")).toBe(false);
+    expect(
+      [...byType.values()].reduce(
+        (sum, amount) => sum + Math.round(amount * 100),
+        0,
+      ),
+    ).toBe(3232280);
     const registered = records(summary).filter((r) =>
       String(r["Аты-жөні (құжат бойынша)"]).startsWith("Есепсынақ "),
     );
@@ -2925,15 +2974,20 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Телефон",
       "Жасы",
       "Жас санаты",
+      "Аймақ",
       "Мүшелік жарна (6 500 ₸)",
+      "Күні мен уақыты — Мүшелік жарна",
       "Аудандық жарна, ₸",
+      "Күні мен уақыты — Аудандық жарна",
       "Басқа мақсат, ₸",
+      "Күні мен уақыты — Басқа мақсат",
+      "Ескі төлем, ₸",
+      "Күні мен уақыты — Ескі төлем",
       "Көрме, ₸",
+      "Күні мен уақыты — Көрме",
       "Барлығы, ₸",
-      "Чек",
       "Жіберуші",
       "Алушы",
-      "Аймақ",
       "Елді мекен",
     ]);
     const age = ageAt(common.birthDate);
@@ -2949,65 +3003,36 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Барлығы, ₸": 26587.75,
       "Туған күні": new Date("1990-02-01T00:00Z"),
     });
-    const receipts = String(twin["Чек"])
-      .replace(/[\u00a0\u202f]/g, " ")
-      .split("\n");
-    const expectedReceipts = [
-      [
-        "02.03.2044 10:35:22",
-        "R-TWO",
-        RECEIPT_TYPES.urshyk,
-        "6 487 ₸",
-        "Мүшелік жарна",
-      ],
-      [
-        "01.03.2044 11:15",
-        "R-EXTRA",
-        RECEIPT_TYPES.personal,
-        "6 500 ₸",
-        "Көрме",
-      ],
-      [
-        "01.03.2044 09:44",
-        "R-PARTIAL",
-        RECEIPT_TYPES.personal,
-        "1 500,75 ₸",
-        "Аудандық жарна",
-      ],
-      [
-        "01.03.2044 09:21",
-        "R-OTHER",
-        RECEIPT_TYPES.personal,
-        "5 600 ₸",
-        "Басқа мақсат",
-      ],
-      [
-        "01.03.2044 09:05",
-        "R-ONE",
-        RECEIPT_TYPES.personal,
-        "6 500 ₸",
-        "Мүшелік жарна",
-      ],
-    ];
-    expect(receipts).toHaveLength(expectedReceipts.length);
-    for (const [index, expected] of expectedReceipts.entries()) {
-      expect(receipts[index]).toMatch(new RegExp(`^${index + 1}\\. `));
-      for (const part of expected) expect(receipts[index]).toContain(part);
-      expect(receipts[index]).toContain("№");
-    }
+    const paymentTimes = (
+      row: Record<string, ExcelJS.CellValue>,
+      purpose: string,
+    ) =>
+      String(row["Күні мен уақыты — " + purpose] ?? "")
+        .split("\n")
+        .filter(Boolean);
+    expect(paymentTimes(twin, "Мүшелік жарна")).toEqual([
+      "1. 02.03.2044 10:35:22",
+      "4. 01.03.2044 09:05",
+    ]);
+    expect(paymentTimes(twin, "Көрме")).toEqual(["2. 01.03.2044 11:15"]);
+    expect(paymentTimes(twin, "Аудандық жарна")).toEqual([
+      "3. 01.03.2044 09:44",
+    ]);
+    expect(paymentTimes(twin, "Басқа мақсат")).toEqual(["5. 01.03.2044"]);
+    expect(paymentTimes(twin, "Ескі төлем")).toEqual([]);
     expect(String(twin["Жіберуші"]).split("\n")).toEqual([
       "1. —",
       "2. Көрме төлеушісі",
       "3. —",
-      "4. —",
-      "5. Сынақ төлеуші",
+      "4. Сынақ төлеуші",
+      "5. —",
     ]);
     expect(String(twin["Алушы"]).split("\n")).toEqual([
       "1. Ұршық ұйымы",
       "2. —",
       "3. —",
-      "4. —",
-      "5. Сынақ алушы",
+      "4. Сынақ алушы",
+      "5. —",
     ]);
     const otherTwin = registered.find((r) => r["Телефон"] === b.phone)!;
     expect(otherTwin).toMatchObject({
@@ -3017,9 +3042,21 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       Жіберуші: "—",
       Алушы: "—",
     });
-    expect(otherTwin["Чек"]).toContain("01.03.2044");
-    expect(otherTwin["Чек"]).toContain("R-THREE");
-    expect(otherTwin["Чек"]).not.toMatch(/\d\d:\d\d|R-ONE|Жеке|URSHYK/);
+    const dateCell = (memberNumber: ExcelJS.CellValue, purpose: string) => {
+      const column = (
+        summary.getRow(headerRow).values as ExcelJS.CellValue[]
+      ).indexOf("Күні мен уақыты — " + purpose);
+      const row = summary
+        .getRows(headerRow + 1, summary.rowCount - headerRow)!
+        .find((r) => r.getCell(1).value === memberNumber)!;
+      return row.getCell(column);
+    };
+    const dayOnly = dateCell(otherTwin["№"], "Мүшелік жарна");
+    expect(dayOnly.value).toEqual(new Date("2044-03-01T00:00Z"));
+    expect(dayOnly.numFmt).toBe("dd.mm.yyyy");
+    const dayAndTime = dateCell(archived.registrationNumber, "Ескі төлем");
+    expect(dayAndTime.value).toEqual(new Date("2044-03-01T09:05Z"));
+    expect(dayAndTime.numFmt).toMatch(/hh:mm/i);
     const unpaid = registered.find((r) => r["Елді мекен"] === c.village)!;
     expect(unpaid).toMatchObject({
       "Барлығы, ₸": 0,
@@ -3027,7 +3064,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Жас санаты": null,
       "Туған күні": null,
     });
-    for (const key of ["Чек", "Жіберуші", "Алушы"])
+    expect(paymentTimes(unpaid, "Мүшелік жарна")).toEqual([]);
+    for (const key of ["Жіберуші", "Алушы"])
       expect(String(unpaid[key] ?? "")).toMatch(/^(?:—)?$/);
     const ledger = records(regional.worksheets[1]);
     const numbers = registered.map((r) => r["№"]);
@@ -3042,20 +3080,32 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     expect(ledger).toHaveLength(7);
     expect(ledger[0]["Чек нөмірі"]).toBe("R-TWO");
-    expect(ledger[0]["Чек күні мен уақыты (Астана)"]).toEqual(
-      new Date("2044-03-02T10:35:22Z"),
+    const statementTime = "Төлем күні мен уақыты (Астана)";
+    expect(Object.keys(ledger[0])).not.toContain("Чек");
+    expect(Object.keys(ledger[0])).not.toContain(
+      "Чек күні мен уақыты (Астана)",
     );
-    for (const expected of expectedReceipts) {
-      const row = ledger.find((r) => r["Чек нөмірі"] === expected[1])!;
-      const statement = String(row["Чек"]).replace(/[\u00a0\u202f]/g, " ");
-      for (const part of expected) expect(statement).toContain(part);
-    }
+    expect(ledger[0]).toMatchObject({
+      [statementTime]: new Date("2044-03-02T10:35:22Z"),
+      "Сома, ₸": 6487,
+      "Чек түрі": RECEIPT_TYPES.urshyk,
+      "Төлем мақсаты": "Мүшелік жарна",
+    });
+    expect(ledger.find((r) => r["Чек нөмірі"] === "R-PARTIAL")).toMatchObject({
+      [statementTime]: new Date("2044-03-01T09:44Z"),
+      "Сома, ₸": 1500.75,
+      "Чек түрі": RECEIPT_TYPES.personal,
+      "Төлем мақсаты": "Аудандық жарна",
+    });
+    expect(
+      ledger.find((r) => r["Чек нөмірі"] === "R-THREE")?.[statementTime],
+    ).toEqual(new Date("2044-03-01T00:00Z"));
     expect(ledger.find((r) => r["Чек нөмірі"] === "R-ONE")).toMatchObject({
       Жіберуші: "Сынақ төлеуші",
       Алушы: "Сынақ алушы",
       "Төлем мақсаты": "Мүшелік жарна",
     });
-    expect(records(regional.worksheets[2])).toHaveLength(1);
+    expect(records(regional.worksheets[2])).toHaveLength(2);
     const district = await exportBook(
       "mangystau-district",
       "&region=" + encodeURIComponent(common.region),
