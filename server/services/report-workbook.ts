@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import { prepareProvincialLayout } from "./provincial-sheet-layout.js";
 import {
   AGE_LABELS,
   ageAt,
@@ -300,12 +301,25 @@ function fillProvincialPayments(
   sheet: ExcelJS.Worksheet,
   firstRow: ExcelJS.Row,
   payments: ReportPayment[],
+  countLines: ReturnType<typeof prepareProvincialLayout>,
 ) {
   // The same index connects each payment to its sender and recipient.
   let row = firstRow;
   let lines = new Map<string, string[]>();
-  let visualLines = 0;
-  function addLine(key: string, value: string) {
+  const baselineLines = (current: ExcelJS.Row) => {
+    let count = 1;
+    current.eachCell((cell, column) => {
+      if (typeof cell.value === "string")
+        count = Math.max(count, countLines(column, cell.value));
+    });
+    return count;
+  };
+  let visualLines = baselineLines(firstRow);
+  const usedLines = new Map<string, number>();
+  function addLine(key: string, value: string, height: number) {
+    const used = (usedLines.get(key) ?? 0) + height;
+    usedLines.set(key, used);
+    visualLines = Math.max(visualLines, used);
     const values = lines.get(key);
     if (values) values.push(value);
     else lines.set(key, [value]);
@@ -316,7 +330,7 @@ function fillProvincialPayments(
       cell.value = values.join("\n");
       cell.alignment = { vertical: "top", wrapText: true };
     }
-    row.height = Math.max(42, Math.min(409, visualLines * 22 + 4));
+    row.height = Math.min(409, visualLines * 17 + 3);
   }
   for (const [index, payment] of payments.entries()) {
     const prefix = payments.length > 1 ? `${index + 1}. ` : "";
@@ -325,24 +339,28 @@ function fillProvincialPayments(
       prefix + (payment.payerName?.trim().replace(/\s+/g, " ") || "—");
     const recipient =
       prefix + (payment.recipientName?.trim().replace(/\s+/g, " ") || "—");
-    const height = Math.max(
-      1,
-      Math.ceil(description.length / 35),
-      Math.ceil(sender.length / 24),
-      Math.ceil(recipient.length / 40),
-    );
-    if (visualLines && visualLines + height > 17) {
+    const additions = [
+      [purposeKey(payment), description],
+      ["sender", sender],
+      ["recipient", recipient],
+    ].map(([key, value]) => ({ key, value, height: countLines(key, value) }));
+    // A single Excel row can be at most 409 points. Continue the payment
+    // history before a cell would exceed 23 lines at the retained 13 pt font.
+    if (
+      lines.size &&
+      additions.some(
+        ({ key, height }) => (usedLines.get(key) ?? 0) + height > 23,
+      )
+    ) {
       finishRow();
       row = sheet.addRow({});
       lines = new Map();
-      visualLines = 0;
+      usedLines.clear();
+      visualLines = 1;
     }
-    addLine(purposeKey(payment), description);
-    addLine("sender", sender);
-    addLine("recipient", recipient);
-    visualLines += height;
+    for (const { key, value, height } of additions) addLine(key, value, height);
   }
-  if (visualLines) finishRow();
+  finishRow();
 }
 
 export function addPaymentTables(
@@ -444,7 +462,7 @@ export function addPaymentTables(
         ? "Мүшелік жарна (6 500 ₸)"
         : `${label}, ₸`,
     key,
-    width: provincial ? 40 : 24,
+    width: provincial ? 32 : 24,
     money: !provincial,
   }));
   const summary = startTable(
@@ -453,19 +471,19 @@ export function addPaymentTables(
     heading,
     year,
     [
-      ...(provincial ? [registrationNumberColumn] : []),
+      ...(provincial ? [{ ...registrationNumberColumn, width: 6.5 }] : []),
       {
         header: regional ? "Аты-жөні (құжат бойынша)" : "Қатысушы",
         key: "name",
-        width: 36,
+        width: provincial ? 30 : 36,
       },
       ...(provincial
         ? [
-            { header: "Туған күні", key: "birthDate", width: 17 },
+            { header: "Туған күні", key: "birthDate", width: 14 },
             { header: "Телефон", key: "phone", width: 20 },
-            { header: "Жасы", key: "age", width: 16 },
-            { header: "Жас санаты", key: "ageGroup", width: 23 },
-            areaColumns[0],
+            { header: "Жасы", key: "age", width: 8 },
+            { header: "Жас санаты", key: "ageGroup", width: 18 },
+            { ...areaColumns[0], width: 26 },
           ]
         : regional
           ? [
@@ -487,12 +505,17 @@ export function addPaymentTables(
           ]
         : []),
       ...categoryColumns,
-      { header: "Барлығы, ₸", key: "total", width: 22, money: true },
+      {
+        header: "Барлығы, ₸",
+        key: "total",
+        width: provincial ? 15 : 22,
+        money: true,
+      },
       ...(provincial
         ? [
-            { header: "Жіберуші", key: "sender", width: 30 },
-            { header: "Алушы", key: "recipient", width: 52 },
-            areaColumns[1],
+            { header: "Жіберуші", key: "sender", width: 21 },
+            { header: "Алушы", key: "recipient", width: 45 },
+            { ...areaColumns[1], width: 17 },
           ]
         : []),
     ],
@@ -525,6 +548,16 @@ export function addPaymentTables(
     }
     return kkCollator.compare(personName(a.person), personName(b.person));
   });
+  const countLines = provincial
+    ? prepareProvincialLayout(
+        summary,
+        accounts.reduce(
+          (max, a) => Math.max(max, visibleRegistrationNumber(a.person) ?? 0),
+          0,
+        ),
+        received / 100,
+      )
+    : undefined;
   for (const account of accounts) {
     const p = account.person;
     const age = regional ? ageAt(p?.birthDate || "") : NaN;
@@ -555,16 +588,21 @@ export function addPaymentTables(
         : {}),
       total: [...account.sums.values()].reduce((a, b) => a + b, 0) / 100,
     });
-    if (provincial)
-      fillProvincialPayments(summary, row, account.receipts || []);
-    else
+    if (regional) setPaymentDate(row, "birthDate", p?.birthDate);
+    if (countLines) {
+      for (const key of ["age", "registrationNumber"])
+        row.getCell(key).alignment = {
+          vertical: "middle",
+          horizontal: "center",
+        };
+      fillProvincialPayments(summary, row, account.receipts || [], countLines);
+    } else
       setPaymentDate(
         row,
         "latest",
         account.latest?.paymentDate,
         account.latest?.paymentTime,
       );
-    if (regional) setPaymentDate(row, "birthDate", p?.birthDate);
   }
   finishTable(summary);
   const details = startTable(
