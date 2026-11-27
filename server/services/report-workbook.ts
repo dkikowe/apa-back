@@ -3,6 +3,7 @@ import {
   AGE_LABELS,
   ageAt,
   ageGroup,
+  money,
   MEMBERSHIP_PAYMENT_LABEL,
   RECEIPT_TYPES,
   paymentCategoryLabel,
@@ -196,6 +197,79 @@ type RegionalReport = {
     description?: string | null;
   }[];
 };
+const provincialReceiptColumn = { header: "Чек", key: "receipt", width: 100 };
+
+function receiptText(payment: ReportPayment) {
+  const date = payment.paymentDate?.replace(
+    /^(\d{4})-(\d{2})-(\d{2})$/,
+    "$3.$2.$1",
+  );
+  const time = payment.paymentTime?.replace(/:(\d{2}):00$/, ":$1");
+  return [
+    [date, time].filter(Boolean).join(" "),
+    payment.receiptNumber && `№ ${payment.receiptNumber}`,
+    payment.amount == null ? "" : money(payment.amount),
+    paymentCategoryLabel(payment),
+    RECEIPT_TYPES[payment.receiptType as keyof typeof RECEIPT_TYPES],
+  ]
+    .filter(Boolean)
+    .join(" · ")
+    .replace(/\s*\n\s*/g, " ");
+}
+
+function fillProvincialReceipts(
+  sheet: ExcelJS.Worksheet,
+  firstRow: ExcelJS.Row,
+  payments: ReportPayment[],
+) {
+  // Split very long histories into continuation rows so every receipt stays
+  // readable within Excel's row-height limit. Amount totals appear only once.
+  let row = firstRow;
+  let receiptLines: string[] = [],
+    senders: string[] = [],
+    recipients: string[] = [];
+  let visualLines = 0;
+  function finishRow() {
+    for (const [key, lines] of [
+      ["receipt", receiptLines],
+      ["sender", senders],
+      ["recipient", recipients],
+    ] as const) {
+      const cell = row.getCell(key);
+      cell.value = lines.join("\n");
+      cell.alignment = { vertical: "top", wrapText: true };
+    }
+    row.height = Math.max(42, Math.min(409, visualLines * 22 + 4));
+  }
+  payments.forEach((payment, index) => {
+    const prefix = payments.length > 1 ? `${index + 1}. ` : "";
+    const receipt = prefix + receiptText(payment);
+    const sender =
+      prefix + (payment.payerName?.trim().replace(/\s+/g, " ") || "—");
+    const recipient =
+      prefix + (payment.recipientName?.trim().replace(/\s+/g, " ") || "—");
+    const height = Math.max(
+      1,
+      Math.ceil(receipt.length / 80),
+      Math.ceil(sender.length / 24),
+      Math.ceil(recipient.length / 40),
+    );
+    if (visualLines && visualLines + height > 17) {
+      finishRow();
+      row = sheet.addRow({});
+      receiptLines = [];
+      senders = [];
+      recipients = [];
+      visualLines = 0;
+    }
+    receiptLines.push(receipt);
+    senders.push(sender);
+    recipients.push(recipient);
+    visualLines += height;
+  });
+  if (visualLines) finishRow();
+}
+
 export function addPaymentTables(
   book: ExcelJS.Workbook,
   heading: ReportHeading,
@@ -203,6 +277,7 @@ export function addPaymentTables(
   payments: ReportPayment[],
   regional?: RegionalReport,
 ) {
+  const provincial = regional !== undefined && !regional.byRegion;
   const purposes = new Map<string, string>();
   if (!regional?.byRegion) purposes.set("membership", MEMBERSHIP_PAYMENT_LABEL);
   if (regional?.category)
@@ -213,6 +288,7 @@ export function addPaymentTables(
       person?: ParticipantInfo;
       sums: Map<string, number>;
       latest?: ReportPayment;
+      receipts?: ReportPayment[];
     }
   >();
   for (const p of regional?.people || [])
@@ -229,10 +305,10 @@ export function addPaymentTables(
       sums: new Map<string, number>(),
     };
     account.latest ??= p;
+    if (provincial) (account.receipts ??= []).push(p);
     received += p.amount || 0;
     if (
-      regional &&
-      !regional.byRegion &&
+      provincial &&
       key === "membership" &&
       p.amount === provincialMembershipAmount
     )
@@ -276,6 +352,19 @@ export function addPaymentTables(
             ]),
       ]
     : [{ label: "Төлемдер жиыны, ₸", amount: received }];
+  const areaColumns = [
+    { header: "Аймақ", key: "region", width: 34 },
+    { header: "Елді мекен", key: "village", width: 23 },
+  ];
+  const categoryColumns = categories.map(([key, header]) => ({
+    header:
+      provincial && key === "membership"
+        ? "Мүшелік жарна (6 500 ₸)"
+        : `${header}, ₸`,
+    key,
+    width: 24,
+    money: true,
+  }));
   const summary = startTable(
     book,
     "Қатысушылар",
@@ -287,29 +376,42 @@ export function addPaymentTables(
         key: "name",
         width: 36,
       },
-      ...(regional
+      ...(provincial
         ? [
-            { header: "Қазақша аты-жөні", key: "fullNameKk", width: 32 },
-            { header: "Орысша аты-жөні", key: "fullNameRu", width: 32 },
-            { header: "Телефон", key: "phone", width: 20 },
             { header: "Туған күні", key: "birthDate", width: 17 },
+            { header: "Телефон", key: "phone", width: 20 },
+            { header: "Жасы", key: "age", width: 16 },
             { header: "Жас санаты", key: "ageGroup", width: 23 },
           ]
+        : regional
+          ? [
+              { header: "Қазақша аты-жөні", key: "fullNameKk", width: 32 },
+              { header: "Орысша аты-жөні", key: "fullNameRu", width: 32 },
+              { header: "Телефон", key: "phone", width: 20 },
+              { header: "Туған күні", key: "birthDate", width: 17 },
+              { header: "Жас санаты", key: "ageGroup", width: 23 },
+            ]
+          : []),
+      ...(!provincial
+        ? [
+            ...areaColumns,
+            {
+              header: "Соңғы чек күні мен уақыты (Астана)",
+              key: "latest",
+              width: 25,
+            },
+          ]
         : []),
-      { header: "Аймақ", key: "region", width: 34 },
-      { header: "Елді мекен", key: "village", width: 23 },
-      {
-        header: "Соңғы чек күні мен уақыты (Астана)",
-        key: "latest",
-        width: 25,
-      },
-      ...categories.map(([key, header]) => ({
-        header: `${header}, ₸`,
-        key,
-        width: 24,
-        money: true,
-      })),
+      ...categoryColumns,
       { header: "Барлығы, ₸", key: "total", width: 22, money: true },
+      ...(provincial
+        ? [
+            provincialReceiptColumn,
+            { header: "Жіберуші", key: "sender", width: 30 },
+            { header: "Алушы", key: "recipient", width: 52 },
+            ...areaColumns,
+          ]
+        : []),
     ],
     totals,
   );
@@ -334,13 +436,15 @@ export function addPaymentTables(
   for (const account of accounts) {
     const p = account.person;
     const amounts = categories.map(([key]) => account.sums.get(key) || 0);
-    const group = regional ? ageGroup(ageAt(p?.birthDate || "")) : null;
+    const age = regional ? ageAt(p?.birthDate || "") : NaN;
+    const group = ageGroup(age);
     const row = summary.addRow({
       name: personName(p),
       ...(regional
         ? {
-            fullNameKk: p?.fullNameKk,
-            fullNameRu: p?.fullNameRu,
+            ...(provincial
+              ? { age: Number.isFinite(age) ? age : null }
+              : { fullNameKk: p?.fullNameKk, fullNameRu: p?.fullNameRu }),
             phone: p?.phone,
             ageGroup: group === null ? null : AGE_LABELS[group],
           }
@@ -352,12 +456,15 @@ export function addPaymentTables(
       ),
       total: amounts.reduce((a, b) => a + b, 0) / 100,
     });
-    setPaymentDate(
-      row,
-      "latest",
-      account.latest?.paymentDate,
-      account.latest?.paymentTime,
-    );
+    if (provincial)
+      fillProvincialReceipts(summary, row, account.receipts || []);
+    else
+      setPaymentDate(
+        row,
+        "latest",
+        account.latest?.paymentDate,
+        account.latest?.paymentTime,
+      );
     if (regional) setPaymentDate(row, "birthDate", p?.birthDate);
   }
   finishTable(summary);
@@ -376,12 +483,17 @@ export function addPaymentTables(
       { header: "Чек күні мен уақыты (Астана)", key: "paidAt", width: 24 },
       { header: "Төлем мақсаты", key: "purpose", width: 28 },
       { header: "Сома, ₸", key: "amount", width: 18, money: true },
-      { header: "Төлеген адам", key: "payerName", width: 28 },
+      {
+        header: provincial ? "Жіберуші" : "Төлеген адам",
+        key: "payerName",
+        width: 28,
+      },
       { header: "Алушы", key: "recipientName", width: 37 },
       { header: "Чек нөмірі", key: "receiptNumber", width: 29 },
       { header: "Төлем тәсілі", key: "method", width: 24 },
       { header: "Чек түрі", key: "receiptTypeLabel", width: 26 },
       { header: "Жарна жылы", key: "year", width: 15 },
+      ...(provincial ? [provincialReceiptColumn] : []),
     ],
   );
   for (const p of payments) {
@@ -392,6 +504,7 @@ export function addPaymentTables(
       receiptTypeLabel:
         RECEIPT_TYPES[p.receiptType as keyof typeof RECEIPT_TYPES] || "",
       amount: (p.amount || 0) / 100,
+      ...(provincial ? { receipt: receiptText(p) } : {}),
     });
     setPaymentDate(row, "paidAt", p.paymentDate, p.paymentTime);
   }

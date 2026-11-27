@@ -2715,6 +2715,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       await import("../server/models.js");
     const { REPORT_TITLES, reportFilename } =
       await import("../shared/report-names.js");
+    const { ageAt, ageGroup, AGE_LABELS, RECEIPT_TYPES } =
+      await import("../shared/domain.js");
     const year = 2044;
     const common = {
       lastName: "Есепсынақ",
@@ -2791,16 +2793,21 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       {
         ...payment,
         year: year + 1,
+        paymentDate: "2044-03-02",
         paymentTime: "10:35:22",
         amount: 648700,
+        receiptType: "urshyk",
+        recipientName: "Ұршық ұйымы",
         receiptNumber: "R-TWO",
       },
       {
         ...payment,
         amount: 650000,
+        paymentTime: "11:15",
         paymentKind: "additional",
         paymentCategoryId: show._id,
         paymentCategoryName: show.name,
+        payerName: "Көрме төлеушісі",
         receiptNumber: "R-EXTRA",
       },
       {
@@ -2808,6 +2815,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         participantId: b._id,
         amount: 560000,
         paymentTime: "",
+        receiptType: "",
         receiptNumber: "R-THREE",
       },
       {
@@ -2815,6 +2823,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         paymentKind: "additional",
         paymentCategoryId: villageFee._id,
         paymentCategoryName: villageFee.name,
+        paymentTime: "09:44",
         amount: 150075,
         receiptNumber: "R-PARTIAL",
       },
@@ -2823,6 +2832,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         paymentKind: "additional",
         paymentCategoryId: otherFee._id,
         paymentCategoryName: otherFee.name,
+        paymentTime: "09:21",
         amount: 560000,
         receiptNumber: "R-OTHER",
       },
@@ -2908,29 +2918,129 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     expect(registered).toHaveLength(4);
     const twin = registered.find((r) => r["Телефон"] === a.phone)!;
+    expect(Object.keys(twin)).toEqual([
+      "Аты-жөні (құжат бойынша)",
+      "Туған күні",
+      "Телефон",
+      "Жасы",
+      "Жас санаты",
+      "Мүшелік жарна (6 500 ₸)",
+      "Аудандық жарна, ₸",
+      "Басқа мақсат, ₸",
+      "Көрме, ₸",
+      "Барлығы, ₸",
+      "Чек",
+      "Жіберуші",
+      "Алушы",
+      "Аймақ",
+      "Елді мекен",
+    ]);
+    const age = ageAt(common.birthDate);
     expect(twin).toMatchObject({
       "Аты-жөні (құжат бойынша)": "Есепсынақ Үлгі Қызы",
-      "Қазақша аты-жөні": a.fullNameKk,
-      "Орысша аты-жөні": a.fullNameRu,
+      Жасы: age,
+      "Жас санаты": AGE_LABELS[ageGroup(age)!],
       "Елді мекен": "Атамекен",
-      "Мүшелік жарна, ₸": 12987,
+      "Мүшелік жарна (6 500 ₸)": 12987,
+      "Аудандық жарна, ₸": 1500.75,
+      "Басқа мақсат, ₸": 5600,
       "Көрме, ₸": 6500,
       "Барлығы, ₸": 26587.75,
-      "Соңғы чек күні мен уақыты (Астана)": new Date("2044-03-01T10:35:22Z"),
       "Туған күні": new Date("1990-02-01T00:00Z"),
     });
-    expect(registered.find((r) => r["Телефон"] === b.phone)).toMatchObject({
-      "Қазақша аты-жөні": null,
+    const receipts = String(twin["Чек"])
+      .replace(/[\u00a0\u202f]/g, " ")
+      .split("\n");
+    const expectedReceipts = [
+      [
+        "02.03.2044 10:35:22",
+        "R-TWO",
+        RECEIPT_TYPES.urshyk,
+        "6 487 ₸",
+        "Мүшелік жарна",
+      ],
+      [
+        "01.03.2044 11:15",
+        "R-EXTRA",
+        RECEIPT_TYPES.personal,
+        "6 500 ₸",
+        "Көрме",
+      ],
+      [
+        "01.03.2044 09:44",
+        "R-PARTIAL",
+        RECEIPT_TYPES.personal,
+        "1 500,75 ₸",
+        "Аудандық жарна",
+      ],
+      [
+        "01.03.2044 09:21",
+        "R-OTHER",
+        RECEIPT_TYPES.personal,
+        "5 600 ₸",
+        "Басқа мақсат",
+      ],
+      [
+        "01.03.2044 09:05",
+        "R-ONE",
+        RECEIPT_TYPES.personal,
+        "6 500 ₸",
+        "Мүшелік жарна",
+      ],
+    ];
+    expect(receipts).toHaveLength(expectedReceipts.length);
+    for (const [index, expected] of expectedReceipts.entries()) {
+      expect(receipts[index]).toMatch(new RegExp(`^${index + 1}\\. `));
+      for (const part of expected) expect(receipts[index]).toContain(part);
+      expect(receipts[index]).toContain("№");
+    }
+    expect(String(twin["Жіберуші"]).split("\n")).toEqual([
+      "1. —",
+      "2. Көрме төлеушісі",
+      "3. —",
+      "4. —",
+      "5. Сынақ төлеуші",
+    ]);
+    expect(String(twin["Алушы"]).split("\n")).toEqual([
+      "1. Ұршық ұйымы",
+      "2. —",
+      "3. —",
+      "4. —",
+      "5. Сынақ алушы",
+    ]);
+    const otherTwin = registered.find((r) => r["Телефон"] === b.phone)!;
+    expect(otherTwin).toMatchObject({
+      "Аты-жөні (құжат бойынша)": twin["Аты-жөні (құжат бойынша)"],
+      "Мүшелік жарна (6 500 ₸)": 5600,
       "Барлығы, ₸": 5600,
+      Жіберуші: "—",
+      Алушы: "—",
     });
-    expect(registered.find((r) => r["Елді мекен"] === c.village)).toMatchObject(
-      { "Барлығы, ₸": 0, "Жас санаты": null, "Туған күні": null },
-    );
+    expect(otherTwin["Чек"]).toContain("01.03.2044");
+    expect(otherTwin["Чек"]).toContain("R-THREE");
+    expect(otherTwin["Чек"]).not.toMatch(/\d\d:\d\d|R-ONE|Жеке|URSHYK/);
+    const unpaid = registered.find((r) => r["Елді мекен"] === c.village)!;
+    expect(unpaid).toMatchObject({
+      "Барлығы, ₸": 0,
+      Жасы: null,
+      "Жас санаты": null,
+      "Туған күні": null,
+    });
+    for (const key of ["Чек", "Жіберуші", "Алушы"])
+      expect(String(unpaid[key] ?? "")).toMatch(/^(?:—)?$/);
     const ledger = records(regional.worksheets[1]);
     expect(ledger).toHaveLength(7);
     expect(ledger[0]["Чек нөмірі"]).toBe("R-TWO");
+    expect(ledger[0]["Чек күні мен уақыты (Астана)"]).toEqual(
+      new Date("2044-03-02T10:35:22Z"),
+    );
+    for (const expected of expectedReceipts) {
+      const row = ledger.find((r) => r["Чек нөмірі"] === expected[1])!;
+      const statement = String(row["Чек"]).replace(/[\u00a0\u202f]/g, " ");
+      for (const part of expected) expect(statement).toContain(part);
+    }
     expect(ledger.find((r) => r["Чек нөмірі"] === "R-ONE")).toMatchObject({
-      "Төлеген адам": "Сынақ төлеуші",
+      Жіберуші: "Сынақ төлеуші",
       Алушы: "Сынақ алушы",
       "Төлем мақсаты": "Мүшелік жарна",
     });
@@ -2940,6 +3050,14 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "&region=" + encodeURIComponent(common.region),
     );
     expect(district.worksheets[0].getCell("B3").value).toBe(13600.75);
+    expect(district.worksheets[0].getRow(4).values).toContain(
+      "Қазақша аты-жөні",
+    );
+    expect(district.worksheets[0].getRow(4).values).toContain(
+      "Соңғы чек күні мен уақыты (Астана)",
+    );
+    expect(district.worksheets[1].getRow(3).values).toContain("Төлеген адам");
+    expect(district.worksheets[1].getRow(3).values).not.toContain("Чек");
     const districtTwins = records(district.worksheets[0]).filter((r) =>
       [a.phone, b.phone].includes(String(r["Телефон"])),
     );
