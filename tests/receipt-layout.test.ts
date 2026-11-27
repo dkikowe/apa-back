@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { textImage } from "./ocr-fixtures.js";
+import { textImage, textPdf } from "./ocr-fixtures.js";
 import {
   extractFields,
   receiptTextLines,
@@ -305,4 +305,35 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
       },
     );
   },
+);
+
+it.runIf(process.env.RUN_OCR_TESTS === "1")(
+  "recovers the exact alphanumeric receipt number from its printed row when no time exists",
+  async () => {
+    const source = textPdf([
+      "SYNTHETIC RECEIPT",
+      "TOTAL: 1234.00 KZT",
+      "DATE: 18.11.2026",
+      "RECIPIENT: DEMO ORGANIZATION",
+      "PAYER: DEMO PERSON",
+      "PAYMENT METHOD: TEST CARD",
+      "RECEIPT NUMBER: QA2786241",
+    ]);
+    const conflicts = ["receiptNumber"];
+    const fields = await recognize(source, "application/pdf", "receipt", {
+      recoveryStage: 3,
+      conflicts,
+    });
+    expect(fields).toMatchObject({
+      amount: 123400,
+      paymentDate: "2026-11-18",
+      recipientName: "DEMO ORGANIZATION",
+      payerName: "DEMO PERSON",
+      method: "TEST CARD",
+      receiptNumber: "QA2786241",
+    });
+    expect(fields.paymentTime).toBeUndefined();
+    expect(conflicts).toEqual([]);
+  },
+  120000,
 );

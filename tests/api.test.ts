@@ -2047,6 +2047,27 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
           fields: { firstName: "Сынақ" },
         });
       }
+      // A newer reader takes the next turn immediately when the user reopens
+      // a previously deferred upload, even if its next daily retry is far away.
+      await Document.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            status: "queued",
+            recognitionVersion: version - 1,
+            recoveryHasCheckpoint: true,
+            recoveryStage: 22,
+            nextReadAt: new Date(Date.now() + 86400000),
+          },
+        },
+      );
+      expect((await post(url, {})).body).toMatchObject({
+        status: "queued",
+        recognitionVersion: version,
+        recoveryStage: 0,
+        recoveryHasCheckpoint: false,
+        nextReadAt: null,
+      });
       await Document.updateOne(
         { _id: doc._id },
         { $set: { status: "failed", error: "read error" } },

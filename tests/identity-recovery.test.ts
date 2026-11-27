@@ -735,3 +735,101 @@ it("scales a physically oversized PDF page into the safe raster budget", async (
     expect(Math.max(w, h)).toBeLessThanOrEqual(8192);
   }
 });
+
+describe("printed Latin names on a photographed identity card", () => {
+  const checkpoint = {
+    lastName: "СЫНАҚ",
+    firstName: "ҮЛГІ",
+    birthDate: "1975-04-15",
+    iin: "750415400007",
+    documentNumber: "000005432",
+    issuedBy: "СЫНАҚ ОРГАНЫ",
+    issueDate: "2020-01-01",
+    expiryDate: "2030-01-01",
+  };
+  const labelled = "ЖСН: " + checkpoint.iin;
+  const primary = (iin: string, rows: string[]) => ({
+    data: {
+      text: [iin, ...rows].join("\n"),
+      blocks: [
+        {
+          paragraphs: [
+            {
+              lines: rows.map((text, index) => ({
+                text,
+                bbox: {
+                  x0: 10,
+                  x1: 90,
+                  y0: 10 + index * 20,
+                  y1: 25 + index * 20,
+                },
+              })),
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const mrz = "СЫНАҚ<ТЕСТ<<ҮЛГІ-ҚЫЗ<<<<<<<<<<<<";
+  const latin = "AK-SU<ALEM<<AI<ZHAN<<<<<<<<KKKK<";
+  it("uses two agreeing English reads of one MRZ strip, preserving hyphens and compound names", async () => {
+    const full = primary(labelled, [mrz]);
+    engine.recognize
+      .mockResolvedValueOnce(full)
+      .mockResolvedValueOnce(response([latin]))
+      .mockResolvedValueOnce(response([latin]))
+      .mockResolvedValue(full);
+    const jpg = await sharp(await image())
+      .jpeg({ quality: 84 })
+      .toBuffer();
+    expect(
+      await recognize(jpg, "image/jpeg", "identity", {
+        previousFields: checkpoint,
+        recoveryStage: 1,
+      }),
+    ).toMatchObject({
+      ...checkpoint,
+      lastNameLatin: "AK-SU ALEM",
+      firstNameLatin: "AI ZHAN",
+    });
+    expect(engine.recognize).toHaveBeenCalledTimes(3);
+  });
+  it.each([
+    [
+      "two different readings",
+      labelled,
+      [mrz],
+      latin,
+      latin.replace("ZHAN", "ZHEN"),
+    ],
+    [
+      "unprinted given name",
+      labelled,
+      [mrz],
+      "AK-SU<ALEM<<<<<<<<KKKK<",
+      "AK-SU<ALEM<<<<<<<<KKKK<",
+    ],
+    ["two different MRZ rows", labelled, [mrz, mrz], latin, latin],
+    ["missing IIN on this page", "", [mrz], latin, latin],
+    ["IIN of another identity", "ЖСН: 750415400015", [mrz], latin, latin],
+  ] as const)(
+    "keeps disputed or unprinted names out of the checkpoint (%s)",
+    async (_, iin, rows, first, second) => {
+      const full = primary(iin, [...rows]);
+      engine.recognize.mockImplementation(async (buffer: Buffer) => {
+        const frame = await sharp(buffer).metadata();
+        if (frame.height < 200)
+          return response([
+            engine.recognize.mock.calls.length % 2 ? second : first,
+          ]);
+        return full;
+      });
+      const result = await recognize(await image(), "image/png", "identity", {
+        previousFields: checkpoint,
+        recoveryStage: 5,
+      });
+      expect(result.firstNameLatin).toBeUndefined();
+      expect(result.lastNameLatin).toBeUndefined();
+    },
+  );
+});

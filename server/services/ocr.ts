@@ -340,6 +340,44 @@ function singleLabelledNumber(text: string, kind: string) {
   return typeof number === "string" && /\d/.test(number) ? number : undefined;
 }
 
+// Locate the unique printed value next to the native label. PDF.js may
+// combine the whole line into one text item or keep the number in its own
+// item. Font measurements only guide the crop; the value must match pixels.
+function labelledReceiptBox(items: PositionedText[], number: string) {
+  const rows = receiptRows(items);
+  const indices = rows.flatMap((r, i) =>
+    receiptHeadingFields(r.text).includes("receiptNumber") ? [i] : [],
+  );
+  if (indices.length !== 1) return;
+  const i = indices[0];
+  const row = rows[i].text.endsWith(number)
+    ? rows[i]
+    : rows[i + 1]?.text === number
+      ? rows[i + 1]
+      : undefined;
+  if (!row) return;
+  const matches = items.filter(
+    ({ text, bbox }) =>
+      text.trimEnd().endsWith(number) &&
+      bbox.y1 > row.bbox.y0 &&
+      bbox.y0 < row.bbox.y1 &&
+      bbox.x0 >= row.bbox.x0 - 1 &&
+      bbox.x1 <= row.bbox.x1 + 1,
+  );
+  if (matches.length !== 1) return;
+  const { text, bbox } = matches[0];
+  const line = text.trimEnd();
+  if (line === number) return bbox;
+  const split = line.length - number.length;
+  if (!/[\s:№#]/u.test(line[split - 1])) return;
+  const ctx = createCanvas(1, 1).getContext("2d");
+  ctx.font = "20px sans-serif";
+  const fraction =
+    ctx.measureText(line.slice(0, split)).width / ctx.measureText(line).width;
+  if (!(fraction > 0 && fraction < 1)) return;
+  return { ...bbox, x0: bbox.x0 + fraction * (bbox.x1 - bbox.x0) };
+}
+
 function qrPrefixMisread(value: string, qr: string) {
   const digits = qr.slice(2);
   return (
@@ -370,6 +408,18 @@ export async function recognize(
   observeReceiptNumber(previous.receiptNumber);
 
   let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
+  let latinWorker: typeof worker;
+  const workerOptions = {
+    langPath: process.env.OCR_LANG_PATH || ".local/tessdata",
+    cacheMethod: "none" as const,
+    gzip: true,
+    logger: () => {},
+    errorHandler: () => {},
+  };
+  const getLatinWorker = async () =>
+    (latinWorker ??= await createWorker("eng", 1, workerOptions));
+  const recoveredLatinKeys = new Set<string>();
+  let recoveredLatinIin: string | undefined;
   const scan = async (
     image: Buffer,
     mode = PSM.SPARSE_TEXT,
@@ -381,13 +431,7 @@ export async function recognize(
         (stage % 3 === 2 ? "eng+rus+kaz" : "kaz+rus+eng")
       ).split("+"),
       1,
-      {
-        langPath: process.env.OCR_LANG_PATH || ".local/tessdata",
-        cacheMethod: "none",
-        gzip: true,
-        logger: () => {},
-        errorHandler: () => {},
-      },
+      workerOptions,
     );
     await worker.setParameters({
       // Sparse mode keeps transfer label/value pairs in reading order instead
@@ -398,6 +442,115 @@ export async function recognize(
         : {}),
     });
     return (await worker.recognize(image, {}, { text: true, blocks })).data;
+  };
+  // Kazakhstan's printed MRZ has a surname and given names separated by
+  // double chevrons. Coloured security patterns after the padding can look
+  // like letters. Only read the two name groups before a long padding run.
+  const confirmMrzNames = async (image: Buffer, box: Tesseract.Bbox) => {
+    const { x0, x1, y0, y1 } = box;
+    const meta = await sharp(image).metadata();
+    const left = Math.max(0, Math.floor(x0) - 15),
+      top = Math.max(0, Math.floor(y0) - 12);
+    const width = Math.min(meta.width - left, Math.ceil(x1) + 15 - left);
+    const height = Math.min(meta.height - top, Math.ceil(y1) + 12 - top);
+    if (width <= 0 || height <= 0) return;
+    const crop = await sharp(image)
+      .extract({ left, top, width, height })
+      .png()
+      .toBuffer();
+    const latin = await getLatinWorker();
+    let first: { lastNameLatin: string; firstNameLatin: string } | undefined;
+    for (const [h, mode] of [
+      [60, PSM.SINGLE_LINE],
+      [78, PSM.SINGLE_BLOCK],
+    ] as const) {
+      const strip = await sharp(crop)
+        .resize({ width: 3000, height: h, fit: "inside" })
+        .grayscale()
+        .normalize()
+        .extend({
+          top: 15,
+          bottom: 15,
+          left: 15,
+          right: 15,
+          background: "white",
+        })
+        .png()
+        .toBuffer();
+      await latin.setParameters({
+        tessedit_pageseg_mode: mode,
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ<-'",
+      });
+      const text = (await latin.recognize(strip)).data.text.trim();
+      if (text.includes("\n")) return;
+      const names = text
+        .replace(/\s/g, "")
+        .match(/^([A-Z]+(?:[-'<][A-Z]+)*)<<([A-Z]+(?:[-'<][A-Z]+)*)<{6,}/);
+      if (!names) return;
+      const current = {
+        lastNameLatin: names[1].replaceAll("<", " "),
+        firstNameLatin: names[2].replaceAll("<", " "),
+      };
+      if (
+        first &&
+        (current.lastNameLatin !== first.lastNameLatin ||
+          current.firstNameLatin !== first.firstNameLatin)
+      )
+        return;
+      first = current;
+    }
+    return first;
+  };
+  const confirmReceiptToken = async (
+    rendered: Buffer,
+    items: PositionedText[],
+    number: string,
+  ) => {
+    const box = labelledReceiptBox(items, number);
+    if (!box || !/^[A-Z0-9][A-Z0-9./_-]*$/i.test(number)) return false;
+    const { width, height } = await sharp(rendered).metadata();
+    // Leave space for font metric differences and descenders in the source.
+    const margin = Math.ceil((box.y1 - box.y0) * 0.22);
+    const left = Math.max(0, Math.floor(box.x0) - margin);
+    const top = Math.max(0, Math.floor(box.y0) - margin);
+    const right = Math.min(width, Math.ceil(box.x1) + margin);
+    const bottom = Math.min(height, Math.ceil(box.y1) + margin);
+    if (right <= left || bottom <= top) return false;
+    const token = await sharp(rendered)
+      .extract({ left, top, width: right - left, height: bottom - top })
+      .png()
+      .toBuffer();
+    const latin = await getLatinWorker();
+    for (const [h, mode] of [
+      [58, PSM.SINGLE_LINE],
+      [78, PSM.SINGLE_WORD],
+    ] as const) {
+      const pixels = sharp(token)
+        .resize({ height: h, width: 3000, fit: "inside" })
+        .grayscale()
+        .normalize();
+      if (mode === PSM.SINGLE_WORD) pixels.sharpen();
+      const strip = await pixels
+        .extend({
+          top: 14,
+          bottom: 14,
+          left: 16,
+          right: 16,
+          background: "white",
+        })
+        .png()
+        .toBuffer();
+      await latin.setParameters({
+        tessedit_pageseg_mode: mode,
+        tessedit_char_whitelist:
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_/.:#",
+      });
+      const read = (await latin.recognize(strip)).data.text
+        .trim()
+        .replace(/^[:#]\s*/, "");
+      if (read.toUpperCase() !== number.toUpperCase()) return false;
+    }
+    return true;
   };
   const confirmRecipient = async (
     rendered: Buffer,
@@ -692,12 +845,16 @@ export async function recognize(
     image: Buffer,
     seed: Record<string, string | number> = {},
     nativeValues: PositionedText[] = [],
+    singlePage = true,
   ) => {
     const fields = mergeIdentityFields({ ...previous }, seed);
     const texts: string[] = [];
     const iins = new Set<string>();
     if (typeof seed.iin === "string") iins.add(seed.iin);
     if (typeof previous.iin === "string") iins.add(previous.iin);
+    const printedIins = new Set<string>();
+    if (typeof seed.iin === "string") printedIins.add(seed.iin);
+    let triedMrz = false;
     let successfulPasses = 0;
     let lastError: unknown;
     const meta = await sharp(image).metadata();
@@ -768,7 +925,8 @@ export async function recognize(
       )
         break;
       try {
-        const result = await scan(await pass.image(), pass.mode);
+        const rendered = await pass.image();
+        const result = await scan(rendered, pass.mode);
         if (isReceiptInsteadOfIdentity(result.text))
           throw new WrongDocumentKindError();
         successfulPasses++;
@@ -783,13 +941,79 @@ export async function recognize(
             ? extractIdentityLayout(nativeValues, anchors)
             : {}),
         };
-        for (const value of identityIinCandidates(result.text)) iins.add(value);
+        for (const value of identityIinCandidates(result.text)) {
+          iins.add(value);
+          printedIins.add(value);
+        }
         if (typeof found.iin === "string") iins.add(found.iin);
+        // A faded IIN heading can be lost while all twelve digits survive.
+        // Corroborate a checkpoint only when its independently read card
+        // number also matches this page. This cannot create a new IIN.
+        if (
+          typeof previous.iin === "string" &&
+          /^\d{12}$/.test(previous.iin) &&
+          typeof found.documentNumber === "string" &&
+          found.documentNumber === previous.documentNumber
+        ) {
+          const printed = new Set(
+            Array.from(
+              result.text.matchAll(/(?<!\d)\d(?:[ \t]*\d){11}(?![ \t]*\d)/g),
+              (m) => m[0].replace(/[ \t]/g, ""),
+            ),
+          );
+          if (printed.size === 1 && printed.has(previous.iin))
+            printedIins.add(previous.iin);
+        }
         mergeIdentityFields(fields, found);
         if (iins.size > 1 && !conflicts.includes("iin")) conflicts.push("iin");
         delete fields.iin;
         if (iins.size === 1 && !conflicts.includes("iin"))
           fields.iin = [...iins][0];
+        if (
+          stage > 0 &&
+          singlePage &&
+          !triedMrz &&
+          typeof fields.iin === "string" &&
+          printedIins.size === 1 &&
+          printedIins.has(fields.iin) &&
+          (!fields.firstNameLatin || !fields.lastNameLatin) &&
+          Date.now() < recoveryDeadline
+        ) {
+          const rows = anchors.filter(({ text }) => {
+            // The multilingual pass can confuse 5/S or 1/I. Use its text only
+            // to locate the strip. The English reads determine both names.
+            const row = text
+              .replace(/\s/g, "")
+              .match(
+                /^([\p{L}\d]+(?:[-'<][\p{L}\d]+)*)<<([\p{L}\d]+(?:[-'<][\p{L}\d]+)*)<{4,}/u,
+              );
+            return row && /\p{L}/u.test(row[1]) && /\p{L}/u.test(row[2]);
+          });
+          if (rows.length === 1) {
+            triedMrz = true;
+            // Contrast enhancement locates the line, but may remove thin
+            // character strokes. Use original pixels whenever coordinates align.
+            const names = await confirmMrzNames(
+              pass.positioned ? image : rendered,
+              rows[0].bbox,
+            );
+            if (
+              names &&
+              (!fields.firstNameLatin ||
+                fields.firstNameLatin === names.firstNameLatin) &&
+              (!fields.lastNameLatin ||
+                fields.lastNameLatin === names.lastNameLatin)
+            ) {
+              recoveredLatinIin = fields.iin;
+              for (const [key, value] of Object.entries(names)) {
+                if (!fields[key]) {
+                  fields[key] = value;
+                  recoveredLatinKeys.add(key);
+                }
+              }
+            }
+          }
+        }
       } catch (error) {
         if (error instanceof WrongDocumentKindError) throw error;
         lastError = error;
@@ -878,9 +1102,20 @@ export async function recognize(
             ).length === 0;
           const completeLayer =
             layer.replace(/\s/g, "").length > 40 && layerComplete;
+          const nativeNumber =
+            pdf.numPages === 1 ? singleLabelledNumber(layer, kind) : undefined;
+          const receiptCandidate =
+            kind === "receipt" &&
+            nativeNumber &&
+            singleLabelledNumber(streamText, kind) === nativeNumber &&
+            nativeNumber === layerFields.receiptNumber
+              ? nativeNumber
+              : undefined;
           const candidate =
-            pdf.numPages === 1 && completeLayer && conflicts.includes(numberKey)
-              ? singleLabelledNumber(layer, kind)
+            completeLayer && conflicts.includes(numberKey)
+              ? kind === "receipt"
+                ? receiptCandidate
+                : nativeNumber
               : undefined;
           if (completeLayer && !candidate) {
             text += layer + "\n";
@@ -942,9 +1177,11 @@ export async function recognize(
               )
                 resolvedNumber = candidate;
             }
-            text += layer + "\n";
-            Object.assign(nativeFields, layerFields);
-            continue;
+            if (resolvedNumber || kind !== "receipt") {
+              text += layer + "\n";
+              Object.assign(nativeFields, layerFields);
+              continue;
+            }
           }
           if (!streamText.trim() && (await emptySheet(rendered))) {
             blankPages++;
@@ -975,12 +1212,41 @@ export async function recognize(
               },
             ];
           });
+          // On an incomplete receipt, full-page OCR can introduce a spurious
+          // number even when the native layer has one clearly labelled value.
+          // Confirm it on the original row independently of any missing time.
+          const confirmNativeReceipt = async () => {
+            if (
+              receiptCandidate &&
+              (conflicts.includes("receiptNumber") || receiptNumbers.size > 1)
+            ) {
+              if (
+                await confirmReceiptToken(
+                  rendered,
+                  values,
+                  receiptCandidate,
+                ).catch(() => false)
+              )
+                resolvedNumber = receiptCandidate;
+            }
+          };
+          if (completeLayer && candidate && kind === "receipt") {
+            await confirmNativeReceipt();
+            text += layer + "\n";
+            Object.assign(nativeFields, layerFields);
+            continue;
+          }
           let scanned;
           try {
             scanned =
               kind === "receipt"
                 ? await scanReceipt(rendered, layerFields, values)
-                : await scanIdentity(rendered, layerFields, values);
+                : await scanIdentity(
+                    rendered,
+                    layerFields,
+                    values,
+                    pdf.numPages === 1,
+                  );
           } catch (error) {
             if (error instanceof WrongDocumentKindError) {
               if (kind !== "receipt") throw error;
@@ -996,6 +1262,7 @@ export async function recognize(
             Object.assign(nativeFields, layerFields);
             continue;
           }
+          if (kind === "receipt") await confirmNativeReceipt();
           text += scanned.text + "\n";
           if (kind === "receipt")
             Object.assign(
@@ -1091,8 +1358,10 @@ export async function recognize(
       const index = conflicts.indexOf(numberKey);
       if (index >= 0) conflicts.splice(index, 1);
     }
+    if (recoveredLatinIin && result.iin !== recoveredLatinIin)
+      for (const key of recoveredLatinKeys) delete result[key];
     return result;
   } finally {
-    await worker?.terminate();
+    await Promise.all([worker?.terminate(), latinWorker?.terminate()]);
   }
 }

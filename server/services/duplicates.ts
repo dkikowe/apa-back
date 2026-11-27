@@ -215,6 +215,7 @@ export function needsReaderUpgrade(doc: {
   error?: string | null;
   wrongDocumentKind?: boolean | null;
   permanentReadFailure?: boolean | null;
+  recoveryHasCheckpoint?: boolean | null;
 }) {
   if (
     (doc.kind !== "identity" && doc.kind !== "receipt") ||
@@ -223,6 +224,12 @@ export function needsReaderUpgrade(doc: {
     documentReadState(doc).wrongDocumentKind
   )
     return false;
+  // Reopening a paused older checkpoint gives the new reader an immediate turn.
+  if (doc.status === "queued")
+    return (
+      doc.recoveryHasCheckpoint === true &&
+      (doc.recognitionVersion ?? 0) < readerVersion(doc.kind)
+    );
   if (doc.status === "failed") {
     const error = documentErrorMessage(doc.error);
     return (

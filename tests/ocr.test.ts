@@ -279,3 +279,36 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
     });
   },
 );
+
+it.runIf(process.env.RUN_OCR_TESTS === "1")(
+  "recovers printed Latin names from the MRZ of a compressed JPEG",
+  async () => {
+    const jpg = await sharp(
+      textImage([
+        "ЖСН / ИИН: 750415400007",
+        "DOCUMENT NUMBER: 000005432",
+        "TEST<<AINA<<<<<<<<<<<<<<<<KKKA<",
+      ]),
+    )
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    const fields = await recognize(jpg, "image/jpeg", "identity", {
+      recoveryStage: 2,
+      previousFields: {
+        lastName: "СЫНАҚ",
+        firstName: "АЙНА",
+        iin: "750415400007",
+        documentNumber: "000005432",
+        issuedBy: "СЫНАҚ ОРГАНЫ",
+        birthDate: "1975-04-15",
+        issueDate: "2020-01-01",
+        expiryDate: "2030-01-01",
+      },
+    });
+    expect(fields).toMatchObject({
+      lastNameLatin: "TEST",
+      firstNameLatin: "AINA",
+    });
+  },
+  45000,
+);
