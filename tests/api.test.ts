@@ -208,7 +208,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const book = new ExcelJS.Workbook();
     await book.xlsx.load(response.body);
     expect(book.worksheets[0].rowCount).toBe(4);
-    expect(book.worksheets[0].getCell("B4").value).toBe("Меруерт");
+    expect(book.worksheets[0].getCell("C4").value).toBe("Меруерт");
   });
   it("records expenses without duplicating membership income", async () => {
     let r = await agent.get("/api/statistics?year=2026");
@@ -1115,7 +1115,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(sheet.getRow(3).values).toContain("Чек күні мен уақыты (Астана)");
     expect(
       [4, 5, 6, 7, 8].map((row) =>
-        (sheet.getCell(row, 2).value as Date).toISOString(),
+        (sheet.getCell(row, 3).value as Date).toISOString(),
       ),
     ).toEqual([
       "2026-10-16T15:08:03.000Z",
@@ -1124,9 +1124,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "2026-10-16T00:00:00.000Z",
       "2026-10-15T23:59:59.000Z",
     ]);
-    expect(sheet.getCell("B7").numFmt).toBe("dd.mm.yyyy");
-    expect(sheet.getCell("B5").numFmt).toBe("dd.mm.yyyy hh:mm");
-    expect(sheet.getCell("B4").numFmt).toBe("dd.mm.yyyy hh:mm:ss");
+    expect(sheet.getCell("C7").numFmt).toBe("dd.mm.yyyy");
+    expect(sheet.getCell("C5").numFmt).toBe("dd.mm.yyyy hh:mm");
+    expect(sheet.getCell("C4").numFmt).toBe("dd.mm.yyyy hh:mm:ss");
   });
   it("hides marked profiles without removing their identity, receipts or income", async () => {
     const { Admin, Document, Participant, Payment } =
@@ -2901,6 +2901,17 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         expect(sheet.getCell("A2").text.length).toBeGreaterThan(15);
         const view = sheet.views[0];
         const header = tableHeader(sheet);
+        expect(sheet.getRow(header).values).toContain("№");
+        expect(
+          (sheet.getRow(header).values as ExcelJS.CellValue[]).filter(
+            (value) => value === "№",
+          ),
+        ).toHaveLength(1);
+        expect(sheet.getCell(header, 1).value).toBe("№");
+        if (type !== "mangystau-oblast" || sheet.name === "Өзге кірістер") {
+          for (let row = header + 1; row <= sheet.rowCount; row++)
+            expect(sheet.getCell(row, 1).value).toBe(row - header);
+        }
         expect(view.state).toBe(header > 10 ? "normal" : "frozen");
         if (view.state === "frozen") expect(view.ySplit).toBe(header);
         expect(sheet.autoFilter).toBe(
@@ -3104,6 +3115,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       ["10 ₸ · 01.03.2044", "23,55 ₸ · 01.03.2044"],
     );
     expect(Object.keys(otherIncome[0])).toEqual([
+      "№",
       "Сомасы мен күні",
       "Санат",
       "Түсініктеме",
@@ -3112,7 +3124,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "mangystau-district",
       "&region=" + encodeURIComponent(common.region),
     );
-    expect(district.worksheets[0].getCell("B3").value).toBe(13600.75);
+    expect(district.worksheets[0].getCell("C3").value).toBe(13600.75);
     const districtHeader = district.worksheets[0].getRow(4)
       .values as ExcelJS.CellValue[];
     expect(
@@ -3122,7 +3134,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
           /аты-жөні|латынша|ағылшынша/iu.test(label),
       ),
     ).toEqual(["Аты-жөні (құжат бойынша)"]);
-    expect(district.worksheets[0].getColumn(1).width).toBeLessThan(36);
+    expect(district.worksheets[0].getColumn(2).width).toBeLessThan(36);
     expect(district.worksheets[0].getRow(4).values).toContain(
       "Соңғы чек күні мен уақыты (Астана)",
     );
@@ -3156,7 +3168,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
           category.id,
       );
       expect(book.worksheets[0].getCell("A2").text).toContain(category.name);
-      expect(book.worksheets[0].getCell("B3").value).toBe(expected);
+      expect(book.worksheets[0].getCell("C3").value).toBe(expected);
       const rows = records(book.worksheets[0]);
       expect(rows.find((r) => r["Телефон"] === a.phone)).toMatchObject({
         [category.name + ", ₸"]: expected,
@@ -3222,6 +3234,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(awards).toHaveLength(3);
     expect(awards[0]["Елді мекен"]).toBe("Өмірзақ");
     expect(Object.keys(awards[0])).toEqual([
+      "№",
       "Аты-жөні (құжат бойынша)",
       "Аймақ",
       "Елді мекен",
@@ -3238,6 +3251,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Шетел рекорд Гиннеса · 2044 жыл",
     );
     expect(Object.keys(international[0])).toEqual([
+      "№",
       "Аты-жөні (құжат бойынша)",
       "Туған күні",
       "Жынысы",
@@ -3335,7 +3349,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       const sheet = book.worksheets[0];
       if (region) expect(sheet.getCell("A2").text).toContain(region);
       expect(
-        ["B3", "D3", "F3"].map((address) => sheet.getCell(address).value),
+        ["C3", "E3", "G3"].map((address) => sheet.getCell(address).value),
       ).toEqual(expectedTotals);
       const headers = (
         sheet.getRow(tableHeader(sheet)).values as ExcelJS.CellValue[]
@@ -3373,7 +3387,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Барлығы, ₸": 14587,
     });
     expect(await republican(common.region, [12987, 1600, 14587])).toEqual([
-      memberA,
+      { ...memberA, "№": 1 },
     ]);
     expect(await republican("Ақтау", [0, 3200, 3200])).toEqual([
       expect.objectContaining({
@@ -3392,6 +3406,14 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       }),
     ]);
     expect(await republican("Қарақия ауданы", [0, 0, 0])).toEqual([]);
+    for (const type of [
+      "members",
+      "payments",
+      "income",
+      "expense",
+      "financial",
+    ] as const)
+      await exportBook(type);
   });
   it("omits hidden profiles from rosters and keeps their actual money in the ledger", async () => {
     const { Participant, Payment } = await import("../server/models.js");

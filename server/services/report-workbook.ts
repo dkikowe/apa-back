@@ -24,6 +24,7 @@ export type ReportColumn = {
 export type ReportHeading = { title: string; purpose: string };
 type IncomeTotal = { label: string; amount: number };
 const tengeFormat = "#,##0.00";
+const ordinalColumn: ReportColumn = { header: "№", key: "rowNumber", width: 6.5 };
 export const kkCollator = new Intl.Collator("kk", { numeric: true });
 
 export function startTable(
@@ -36,8 +37,12 @@ export function startTable(
   totalsOffset = 0,
   incomeByType: IncomeTotal[] = [],
 ) {
+  const needsOrdinal = !columns.some(
+    ({ header }) => header === ordinalColumn.header,
+  );
+  const tableColumns = needsOrdinal ? [ordinalColumn, ...columns] : columns;
   const sheet = book.addWorksheet(name);
-  sheet.columns = columns.map(({ key, width, money }) => ({
+  sheet.columns = tableColumns.map(({ key, width, money }) => ({
     key,
     width,
     style: {
@@ -48,7 +53,7 @@ export function startTable(
   }));
   sheet.addRow([`${heading.title} · ${year} жыл`]);
   sheet.addRow([heading.purpose]);
-  for (const n of [1, 2]) sheet.mergeCells(n, 1, n, columns.length);
+  for (const n of [1, 2]) sheet.mergeCells(n, 1, n, tableColumns.length);
   sheet.getRow(1).height = 35;
   sheet.getCell("A1").font = {
     name: "Calibri",
@@ -64,8 +69,9 @@ export function startTable(
     color: { argb: "FF344E45" },
   };
   if (totals.length) {
+    const offset = totalsOffset + Number(needsOrdinal);
     const line = sheet.addRow([
-      ...Array(totalsOffset).fill(null),
+      ...Array(offset).fill(null),
       ...totals.flatMap(({ label, amount }) => [label, amount / 100]),
     ]);
     line.height = incomeByType.length ? 57 : 44;
@@ -81,7 +87,7 @@ export function startTable(
         vertical: "middle",
         ...(incomeByType.length ? { indent: 1 } : {}),
       };
-      if ((column - totalsOffset) % 2 === 0) cell.numFmt = tengeFormat;
+      if ((column - offset) % 2 === 0) cell.numFmt = tengeFormat;
     });
   }
   if (incomeByType.length) {
@@ -118,7 +124,7 @@ export function startTable(
       });
     }
   }
-  const headers = sheet.addRow(columns.map((c) => c.header));
+  const headers = sheet.addRow(tableColumns.map((c) => c.header));
   const headerRow = headers.number;
   headers.height = 45;
   headers.eachCell((cell) => {
@@ -154,9 +160,22 @@ export function startTable(
 
 export function finishTable(sheet: ExcelJS.Worksheet) {
   const headerRow = Number(sheet.pageSetup.printTitlesRow?.split(":").at(-1));
+  const rowCount = sheet.rowCount;
+  const firstColumn = sheet.getColumn(1);
+  if (firstColumn.key === ordinalColumn.key) {
+    firstColumn.width = Math.max(
+      ordinalColumn.width,
+      String(rowCount - headerRow).length + 2,
+    );
+    for (let number = headerRow + 1; number <= rowCount; number++) {
+      const cell = sheet.getCell(number, 1);
+      cell.value = number - headerRow;
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+    }
+  }
   sheet.autoFilter = {
     from: { row: headerRow, column: 1 },
-    to: { row: Math.max(headerRow, sheet.rowCount), column: sheet.columnCount },
+    to: { row: Math.max(headerRow, rowCount), column: sheet.columnCount },
   };
 }
 
