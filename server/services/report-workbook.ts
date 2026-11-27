@@ -27,6 +27,7 @@ export function startTable(
   year: number,
   columns: ReportColumn[],
   totals: { label: string; amount: number }[] = [],
+  totalsOffset = 0,
 ) {
   const headerRow = totals.length ? 4 : 3;
   const sheet = book.addWorksheet(name);
@@ -57,9 +58,10 @@ export function startTable(
     color: { argb: "FF344E45" },
   };
   if (totals.length) {
-    const line = sheet.addRow(
-      totals.flatMap(({ label, amount }) => [label, amount / 100]),
-    );
+    const line = sheet.addRow([
+      ...Array(totalsOffset).fill(null),
+      ...totals.flatMap(({ label, amount }) => [label, amount / 100]),
+    ]);
     line.height = 44;
     line.eachCell((cell, column) => {
       cell.font = {
@@ -69,7 +71,7 @@ export function startTable(
         color: { argb: "FF173F35" },
       };
       cell.alignment = { wrapText: true, vertical: "middle" };
-      if (column % 2 === 0) cell.numFmt = tengeFormat;
+      if ((column - totalsOffset) % 2 === 0) cell.numFmt = tengeFormat;
     });
   }
   const headers = sheet.addRow(columns.map((c) => c.header));
@@ -136,6 +138,7 @@ export function setPaymentDate(
 }
 
 export type ParticipantInfo = {
+  registrationNumber?: number | null;
   lastName?: string | null;
   firstName?: string | null;
   middleName?: string | null;
@@ -178,6 +181,11 @@ function personName(p?: ParticipantInfo) {
     "Аты-жөні көрсетілмеген"
   );
 }
+function visibleRegistrationNumber(person?: ParticipantInfo) {
+  return person?.siteHiddenAt || person?.deletedAt
+    ? null
+    : (person?.registrationNumber ?? null);
+}
 function purposeKey(p: ReportPayment) {
   return p.paymentKind === "additional"
     ? `additional:${p.paymentCategoryId ?? paymentCategoryLabel(p)}`
@@ -198,6 +206,11 @@ type RegionalReport = {
   }[];
 };
 const provincialReceiptColumn = { header: "Чек", key: "receipt", width: 100 };
+const registrationNumberColumn = {
+  header: "№",
+  key: "registrationNumber",
+  width: 10,
+};
 
 function receiptText(payment: ReportPayment) {
   const date = payment.paymentDate?.replace(
@@ -371,6 +384,7 @@ export function addPaymentTables(
     heading,
     year,
     [
+      ...(provincial ? [registrationNumberColumn] : []),
       {
         header: regional ? "Аты-жөні (құжат бойынша)" : "Қатысушы",
         key: "name",
@@ -414,8 +428,14 @@ export function addPaymentTables(
         : []),
     ],
     totals,
+    provincial ? 1 : 0,
   );
   const accounts = [...people.values()].sort((a, b) => {
+    if (provincial) {
+      const first = visibleRegistrationNumber(a.person) ?? Infinity;
+      const second = visibleRegistrationNumber(b.person) ?? Infinity;
+      if (first !== second) return first - second;
+    }
     if (regional?.byRegion) {
       const location = kkCollator.compare(
         regionLabel(a.person?.region || ""),
@@ -439,6 +459,9 @@ export function addPaymentTables(
     const age = regional ? ageAt(p?.birthDate || "") : NaN;
     const group = ageGroup(age);
     const row = summary.addRow({
+      ...(provincial
+        ? { registrationNumber: visibleRegistrationNumber(p) }
+        : {}),
       name: personName(p),
       ...(regional
         ? {
@@ -479,6 +502,7 @@ export function addPaymentTables(
     },
     year,
     [
+      ...(provincial ? [registrationNumberColumn] : []),
       { header: "Қатысушы", key: "name", width: 36 },
       { header: "Чек күні мен уақыты (Астана)", key: "paidAt", width: 24 },
       { header: "Төлем мақсаты", key: "purpose", width: 28 },
@@ -504,7 +528,12 @@ export function addPaymentTables(
       receiptTypeLabel:
         RECEIPT_TYPES[p.receiptType as keyof typeof RECEIPT_TYPES] || "",
       amount: (p.amount || 0) / 100,
-      ...(provincial ? { receipt: receiptText(p) } : {}),
+      ...(provincial
+        ? {
+            registrationNumber: visibleRegistrationNumber(p.person),
+            receipt: receiptText(p),
+          }
+        : {}),
     });
     setPaymentDate(row, "paidAt", p.paymentDate, p.paymentTime);
   }

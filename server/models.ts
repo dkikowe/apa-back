@@ -1,4 +1,8 @@
 import mongoose, { Schema } from "mongoose";
+import {
+  initializeRegistrationNumbers,
+  reserveRegistrationNumbers,
+} from "./services/registration-numbers.js";
 const options = { timestamps: true };
 const admin = new Schema(
   {
@@ -9,6 +13,12 @@ const admin = new Schema(
 );
 const participant = new Schema(
   {
+    registrationNumber: {
+      type: Number,
+      min: 1,
+      validate: Number.isSafeInteger,
+      immutable: true,
+    },
     lastName: String,
     firstName: String,
     middleName: String,
@@ -40,6 +50,34 @@ const participant = new Schema(
   },
   options,
 );
+participant.index(
+  { registrationNumber: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { registrationNumber: { $type: "number" } },
+  },
+);
+participant.index(
+  { registrationNumber: 1, createdAt: 1, _id: 1 },
+  {
+    partialFilterExpression: { deletedAt: null, siteHiddenAt: null },
+  },
+);
+participant.pre("save", async function () {
+  if (this.isNew)
+    this.registrationNumber = await reserveRegistrationNumbers(
+      1,
+      this.$session(),
+    );
+});
+participant.pre("insertMany", async function (_next, input, options) {
+  const rows = Array.isArray(input) ? input : [input];
+  if (!rows.length) return;
+  const start = await reserveRegistrationNumbers(rows.length, options?.session);
+  rows.forEach((row, i) => {
+    row.registrationNumber = start + i;
+  });
+});
 participant.index({ iinKey: 1 }, { unique: true, sparse: true });
 participant.index({ archivedAt: 1, region: 1, birthDate: 1 });
 participant.index({ searchTokens: 1 });
@@ -203,4 +241,5 @@ export async function connect() {
       ImportDraft,
     ].map((m) => m.init()),
   );
+  await initializeRegistrationNumbers();
 }

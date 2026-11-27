@@ -39,6 +39,7 @@ import {
   normalizeParticipant,
 } from "./services/members.js";
 import { reportFilename } from "../shared/report-names.js";
+import { backfillRegistrationNumbers } from "./services/registration-numbers.js";
 import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
 import {
@@ -429,6 +430,7 @@ export function createApp() {
     res.status(201).json(result);
   });
   app.get("/api/participants/:id", async (req, res) => {
+    await backfillRegistrationNumbers();
     const [p] = await Participant.aggregate(
       memberPipeline(
         filtersSchema.parse({ year: req.query.year }),

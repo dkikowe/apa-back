@@ -2909,16 +2909,17 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "&region=" + encodeURIComponent(common.region),
     );
     const summary = regional.worksheets[0];
-    expect(summary.getCell("B3").value).toBe(32322.8);
-    expect(summary.getCell("D3").value).toBe(32289.25);
-    expect(summary.getCell("F3").value).toBe(33.55);
-    expect(summary.getCell("H3").value).toBe(6500);
+    expect(summary.getCell("C3").value).toBe(32322.8);
+    expect(summary.getCell("E3").value).toBe(32289.25);
+    expect(summary.getCell("G3").value).toBe(33.55);
+    expect(summary.getCell("I3").value).toBe(6500);
     const registered = records(summary).filter((r) =>
       String(r["Аты-жөні (құжат бойынша)"]).startsWith("Есепсынақ "),
     );
     expect(registered).toHaveLength(4);
     const twin = registered.find((r) => r["Телефон"] === a.phone)!;
     expect(Object.keys(twin)).toEqual([
+      "№",
       "Аты-жөні (құжат бойынша)",
       "Туған күні",
       "Телефон",
@@ -3029,6 +3030,16 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     for (const key of ["Чек", "Жіберуші", "Алушы"])
       expect(String(unpaid[key] ?? "")).toMatch(/^(?:—)?$/);
     const ledger = records(regional.worksheets[1]);
+    const numbers = registered.map((r) => r["№"]);
+    expect(numbers.every((n) => typeof n === "number" && n > 0)).toBe(true);
+    expect(new Set(numbers).size).toBe(numbers.length);
+    expect(numbers).toEqual([...numbers].sort((x, y) => Number(x) - Number(y)));
+    expect(ledger.find((r) => r["Чек нөмірі"] === "R-ONE")?.["№"]).toBe(
+      twin["№"],
+    );
+    expect(ledger.find((r) => r["Чек нөмірі"] === "R-THREE")?.["№"]).toBe(
+      otherTwin["№"],
+    );
     expect(ledger).toHaveLength(7);
     expect(ledger[0]["Чек нөмірі"]).toBe("R-TWO");
     expect(ledger[0]["Чек күні мен уақыты (Астана)"]).toEqual(
@@ -3261,13 +3272,154 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(cells).not.toContain("hidden-phone-fixture");
       const ledger = book.getWorksheet("Төлемдер");
       if (ledger) {
-        expect(ledger.getCell("A4").text).toBe("Жасырылған қатысушы");
-        expect(ledger.getCell("D4").value).toBe(6500);
-        expect(ledger.getCell("G4").text).toBe("LEDGER-FIXTURE");
+        const labels = ledger.getRow(3).values as ExcelJS.CellValue[];
+        const value = (label: string) =>
+          ledger.getCell(4, labels.indexOf(label)).value;
+        expect(value("Қатысушы")).toBe("Жасырылған қатысушы");
+        expect(value("Сома, ₸")).toBe(6500);
+        expect(value("Чек нөмірі")).toBe("LEDGER-FIXTURE");
+        if (type === "mangystau-oblast") expect(value("№")).toBeNull();
       } else {
         expect(cells).not.toContain("Жасырылған қатысушы");
       }
     }
+  });
+  it("keeps a server-issued participant number across edits, archiving and deletion", async () => {
+    const { Participant } = await import("../server/models.js");
+    const create = await post("/api/participants", {
+      firstName: "Numbered",
+      registrationNumber: 99999999,
+    });
+    expect(create.status).toBe(201);
+    const { _id, registrationNumber } = create.body;
+    expect(Number.isSafeInteger(registrationNumber)).toBe(true);
+    expect(registrationNumber).toBeGreaterThan(0);
+    expect(registrationNumber).not.toBe(99999999);
+    const url = `/api/participants/${_id}`;
+    const edit = await patch(url, {
+      firstName: "Renamed",
+      registrationNumber: registrationNumber + 1000,
+    });
+    expect(edit.status).toBe(200);
+    expect(edit.body).toMatchObject({
+      firstName: "Renamed",
+      registrationNumber,
+    });
+    const list = await agent.get("/api/participants").query({ q: "Renamed" });
+    expect(list.body.items).toContainEqual(
+      expect.objectContaining({ _id, registrationNumber }),
+    );
+    for (const restore of [false, true]) {
+      expect((await post(`${url}/archive`, { restore })).status).toBe(200);
+      expect((await agent.get(url)).body.registrationNumber).toBe(
+        registrationNumber,
+      );
+    }
+    expect((await agent.delete(url).set("x-csrf-token", csrf)).status).toBe(
+      200,
+    );
+    expect((await agent.get(url)).status).toBe(404);
+    const tombstone = await Participant.findById(_id).lean();
+    expect(tombstone).toMatchObject({
+      registrationNumber,
+      deletedAt: expect.any(Date),
+    });
+    const next = await post("/api/participants", { firstName: "Numbered" });
+    expect(next.status).toBe(201);
+    expect(next.body.registrationNumber).toBeGreaterThan(registrationNumber);
+  });
+  it("assigns distinct numbers to simultaneous registrations and preserves imported numbers on retries", async () => {
+    const { Participant } = await import("../server/models.js");
+    const created = await Promise.all(
+      ["Алма", "Балжан", "Сәуле", "Гүлнәр"].map((firstName) =>
+        post("/api/participants", {
+          lastName: "NumberConcurrencyFixture",
+          firstName,
+        }),
+      ),
+    );
+    for (const result of created) expect(result.status).toBe(201);
+    const numbers = created.map((r) => r.body.registrationNumber);
+    expect(numbers.every((n) => Number.isSafeInteger(n) && n > 0)).toBe(true);
+    expect(new Set(numbers).size).toBe(created.length);
+    const lastName = "NumberImportFixture";
+    const bytes = await workbookBytes(
+      [
+        [lastName, "Алма", "1970-05-04"],
+        [lastName, "Айша", "1982-01-01"],
+      ],
+      ["Фамилия", "Имя", "Дата рождения"],
+    );
+    const preview = await previewFile(bytes);
+    expect(preview.body).toMatchObject({ ready: 2, errorCount: 0 });
+    const url = `/api/participants/import/${preview.body.draftId}/commit`;
+    expect((await post(url, {})).body.created).toBe(2);
+    const imported = () =>
+      Participant.find({ lastName })
+        .select("_id registrationNumber")
+        .sort({ _id: 1 })
+        .lean();
+    const first = await imported();
+    expect(first).toHaveLength(2);
+    const importNumbers = first.map((p) => p.registrationNumber);
+    expect(
+      importNumbers.every(
+        (n) => Number.isSafeInteger(n) && Number(n) > Math.max(...numbers),
+      ),
+    ).toBe(true);
+    expect(new Set(importNumbers).size).toBe(2);
+    expect((await post(url, {})).status).toBe(200);
+    const retry = await previewFile(bytes);
+    expect(retry.body).toMatchObject({ ready: 0, duplicates: 2 });
+    expect(await imported()).toEqual(first);
+  });
+  it("backfills existing registrations in order and preserves numbers across a second migration", async () => {
+    const { Participant } = await import("../server/models.js");
+    const { initializeRegistrationNumbers, backfillRegistrationNumbers } =
+      await import("../server/services/registration-numbers.js");
+    const highest = await Participant.findOne()
+      .sort({ registrationNumber: -1 })
+      .lean();
+    const reserved = (highest?.registrationNumber ?? 0) + 20;
+    const started = new Date("2020-01-01T00:00:00Z");
+    const later = new Date("2021-01-01T00:00:00Z");
+    const result = await Participant.collection.insertMany([
+      { firstName: "Archived", archivedAt: started, createdAt: started },
+      { firstName: "Later", createdAt: later },
+      { firstName: "Earlier", createdAt: started },
+      { firstName: "Hidden", siteHiddenAt: started },
+      { deletedAt: started },
+      { registrationNumber: reserved, deletedAt: later },
+      { firstName: "AlreadyNumbered", registrationNumber: reserved - 1 },
+    ]);
+    const rows = async () => {
+      const people = await Participant.find({
+        _id: { $in: Object.values(result.insertedIds) },
+      }).lean();
+      expect(people).toHaveLength(result.insertedCount);
+      return Object.values(result.insertedIds).map(
+        (id) => people.find((p) => p._id.equals(id))?.registrationNumber,
+      );
+    };
+    await initializeRegistrationNumbers();
+    await backfillRegistrationNumbers();
+    const assigned = await rows();
+    expect(assigned[2]).toBeGreaterThan(reserved);
+    expect(assigned[1]).toBeGreaterThan(assigned[2]!);
+    expect(assigned[0]).toBeGreaterThan(assigned[1]!);
+    expect(assigned.slice(3)).toEqual([
+      undefined,
+      undefined,
+      reserved,
+      reserved - 1,
+    ]);
+    await backfillRegistrationNumbers();
+    expect(await rows()).toEqual(assigned);
+    const next = await post("/api/participants", {
+      firstName: "AfterMigration",
+    });
+    expect(next.status).toBe(201);
+    expect(next.body.registrationNumber).toBeGreaterThan(assigned[0]!);
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");

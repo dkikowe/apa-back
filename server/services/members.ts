@@ -1,6 +1,7 @@
 import mongoose, { type PipelineStage } from "mongoose";
 import { z } from "zod";
 import { Participant } from "../models.js";
+import { backfillRegistrationNumbers } from "./registration-numbers.js";
 import { FEE, today } from "../../shared/domain.js";
 export const filtersSchema = z.object({
   year: z.coerce
@@ -202,6 +203,7 @@ export function memberPipeline(
   return stages;
 }
 export async function listMembers(f: Filters) {
+  await backfillRegistrationNumbers();
   const field = {
     name: "lastName",
     age: "age",

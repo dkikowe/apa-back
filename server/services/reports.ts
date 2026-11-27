@@ -4,6 +4,7 @@ import { REPORT_TITLES, type ReportType } from "../../shared/report-names.js";
 import { regionLabel } from "../../shared/locations.js";
 import { Participant, Payment, Finance } from "../models.js";
 import { filtersSchema, memberPipeline, type Filters } from "./members.js";
+import { backfillRegistrationNumbers } from "./registration-numbers.js";
 import {
   AGE_LABELS,
   dateSchema,
@@ -168,6 +169,7 @@ export const reportTypes = Object.keys(REPORT_TITLES) as [
   ...ReportType[],
 ];
 const reportPersonProjection = {
+  registrationNumber: 1,
   lastName: 1,
   firstName: 1,
   middleName: 1,
@@ -431,6 +433,7 @@ export async function makeReport(
     finishTable(sheet);
   } else if (type === "mangystau-oblast" || type === "mangystau-district") {
     const byRegion = type === "mangystau-district";
+    if (!byRegion) await backfillRegistrationNumbers();
     const dateRange = { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` };
     const region = byRegion ? f.region : "";
     const [people, payments, otherIncome] = await Promise.all([
