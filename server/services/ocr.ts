@@ -505,16 +505,16 @@ export async function recognize(
       first = current;
     }
   };
-  const confirmReceiptToken = async (
+  const confirmPrintedToken = async (
     rendered: Buffer,
-    items: PositionedText[],
+    box: PositionedText["bbox"] | undefined,
     number: string,
+    digitsOnly = false,
   ) => {
-    const box = labelledReceiptBox(items, number);
     if (!box || !/^[A-Z0-9][A-Z0-9./_-]*$/i.test(number)) return false;
     const { width, height } = await sharp(rendered).metadata();
     // Leave space for font metric differences and descenders in the source.
-    const margin = Math.ceil((box.y1 - box.y0) * 0.22);
+    const margin = Math.ceil((box.y1 - box.y0) * (digitsOnly ? 0.08 : 0.22));
     const left = Math.max(0, Math.floor(box.x0) - margin);
     const top = Math.max(0, Math.floor(box.y0) - margin);
     const right = Math.min(width, Math.ceil(box.x1) + margin);
@@ -525,10 +525,13 @@ export async function recognize(
       .png()
       .toBuffer();
     const latin = await getLatinWorker();
-    for (const [h, mode] of [
+    const reads: [number, PSM][] = [
       [58, PSM.SINGLE_LINE],
       [78, PSM.SINGLE_WORD],
-    ] as const) {
+    ];
+    if (digitsOnly) reads.push([92, PSM.SINGLE_BLOCK]);
+    let matches = 0;
+    for (const [h, mode] of reads) {
       const pixels = sharp(token)
         .resize({ height: h, width: 3000, fit: "inside" })
         .grayscale()
@@ -546,15 +549,64 @@ export async function recognize(
         .toBuffer();
       await latin.setParameters({
         tessedit_pageseg_mode: mode,
-        tessedit_char_whitelist:
-          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_/.:#",
+        tessedit_char_whitelist: digitsOnly
+          ? "0123456789"
+          : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_/.:#",
       });
       const read = (await latin.recognize(strip)).data.text
         .trim()
         .replace(/^[:#]\s*/, "");
+      // A split glyph can produce 13 digits. Try another segmentation,
+      // but a different complete 12-digit reading remains a conflict.
+      if (digitsOnly && !/^\d{12}$/.test(read)) continue;
       if (read.toUpperCase() !== number.toUpperCase()) return false;
+      if (++matches === 2) return true;
     }
-    return true;
+    return false;
+  };
+  // Some digital IDs print the headings into the page background. The number
+  // is native text, but a full-page OCR pass can misread one of its digits.
+  const confirmInlineIin = async (image: Buffer, values: PositionedText[]) => {
+    const tokens = values.filter((item) => /^\d{12}$/.test(item.text.trim()));
+    const text = values.map((v) => v.text.trim()).join("\n");
+    if (
+      tokens.length !== 1 ||
+      [...text.matchAll(/(?<!\d)\d(?:[ \t]*\d){11}(?![ \t]*\d)/g)].length !==
+        1 ||
+      values.filter((v) => /^\d{9}$/.test(v.text.trim())).length !== 1
+    )
+      return;
+    const { bbox } = tokens[0];
+    const number = tokens[0].text.trim();
+    if (!printedBirthDate([text], { iin: number })) return;
+    const h = bbox.y1 - bbox.y0;
+    const left = Math.max(0, Math.floor(bbox.x0 - 5.5 * h));
+    const top = Math.max(0, Math.floor(bbox.y0));
+    const meta = await sharp(image).metadata();
+    const right = Math.min(meta.width, Math.floor(bbox.x0) - 2);
+    const bottom = Math.min(meta.height, Math.ceil(bbox.y1 + h * 0.1));
+    if (right <= left || bottom <= top) return;
+    const label = await sharp(image)
+      .extract({ left, top, width: right - left, height: bottom - top })
+      .resize({ height: 72 })
+      .grayscale()
+      .normalize()
+      .extend({ top: 14, bottom: 14, left: 16, right: 16, background: "white" })
+      .png()
+      .toBuffer();
+    const printedLabel = (
+      await scan(label, PSM.SINGLE_LINE, false)
+    ).text.trim();
+    const labels = printedLabel.split(/\s*[/|]\s*/);
+    if (
+      labels.length > 2 ||
+      !labels.some((part) => /^(?:ЖСН|ИИН|IIN)$/iu.test(part)) ||
+      !labels.every((part) =>
+        /^(?:ЖСН|ИИН|IIN|[ИIІНH]{2}[ИНNHН])$/iu.test(part),
+      )
+    )
+      return;
+    if (await confirmPrintedToken(image, bbox, number, true)) return number;
   };
   const confirmRecipient = async (
     rendered: Buffer,
@@ -852,6 +904,14 @@ export async function recognize(
     singlePage = true,
   ) => {
     const fields = mergeIdentityFields({ ...previous }, seed);
+    const confirmedIin = singlePage
+      ? await confirmInlineIin(image, nativeValues).catch(() => undefined)
+      : undefined;
+    if (confirmedIin) {
+      resolvedNumber = fields.iin = confirmedIin;
+      if (!missingDocumentFields("identity", fields).length)
+        return { text: "", fields };
+    }
     const texts: string[] = [];
     const iins = new Set<string>();
     if (typeof seed.iin === "string") iins.add(seed.iin);
@@ -971,7 +1031,8 @@ export async function recognize(
         mergeIdentityFields(fields, found);
         if (iins.size > 1 && !conflicts.includes("iin")) conflicts.push("iin");
         delete fields.iin;
-        if (iins.size === 1 && !conflicts.includes("iin"))
+        if (confirmedIin) fields.iin = confirmedIin;
+        else if (iins.size === 1 && !conflicts.includes("iin"))
           fields.iin = [...iins][0];
         if (
           stage > 0 &&
@@ -1225,9 +1286,9 @@ export async function recognize(
               (conflicts.includes("receiptNumber") || receiptNumbers.size > 1)
             ) {
               if (
-                await confirmReceiptToken(
+                await confirmPrintedToken(
                   rendered,
-                  values,
+                  labelledReceiptBox(values, receiptCandidate),
                   receiptCandidate,
                 ).catch(() => false)
               )

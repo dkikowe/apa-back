@@ -24,6 +24,21 @@ function delayFor(delays: number[], round: number) {
   return delays[Math.min(Math.max(round, 0), delays.length - 1)];
 }
 
+export async function wakeOutdatedIdentityReads(now = new Date()) {
+  const version = readerVersion("identity");
+  return Document.updateMany(
+    {
+      kind: "identity",
+      status: "queued",
+      recoveryHasCheckpoint: true,
+      recognitionVersion: { $lt: version },
+      "fields.iin": { $in: [null, ""] },
+      nextReadAt: { $gt: now },
+    },
+    { $set: { nextReadAt: now, recognitionVersion: version } },
+  );
+}
+
 export async function claimRead(now = new Date(), oldestFirst = false) {
   return Document.findOneAndUpdate(
     {

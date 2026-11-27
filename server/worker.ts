@@ -5,8 +5,10 @@ import {
   claimRead,
   processRead,
   reclaimInterruptedRead,
+  wakeOutdatedIdentityReads,
 } from "./services/recognition-jobs.js";
 await connect();
+await wakeOutdatedIdentityReads();
 let stopped = false;
 process.on("SIGTERM", () => {
   stopped = true;

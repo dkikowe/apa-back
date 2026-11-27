@@ -6,6 +6,7 @@ import {
   claimRead,
   processRead,
   reclaimInterruptedRead,
+  wakeOutdatedIdentityReads,
 } from "../server/services/recognition-jobs.js";
 import { resumeDraft, readerVersion } from "../server/services/duplicates.js";
 import { documentUnreadable } from "../server/services/document-errors.js";
@@ -39,6 +40,41 @@ const receipt = {
   receiptNumber: "TEST-01",
 };
 const fixture = { kind: "receipt", mime: "image/png", key: "test" };
+it("gives delayed IIN reads one immediate retry on a new reader version", async () => {
+  const now = new Date();
+  const later = new Date(+now + 86400000);
+  const version = readerVersion("identity");
+  const old = {
+    kind: "identity",
+    status: "queued",
+    recoveryStage: 8,
+    recoveryConflicts: ["iin"],
+    fields: { firstName: "Сынақ" },
+    recoveryHasCheckpoint: true,
+    recognitionVersion: version - 1,
+    nextReadAt: later,
+  };
+  const [waiting] = await Document.create([
+    old,
+    { ...old, kind: "receipt" },
+    { ...old, recognitionVersion: version },
+    { ...old, status: "processing" },
+    { ...old, fields: { iin: "000000000001" } },
+  ]);
+  expect((await wakeOutdatedIdentityReads(now)).modifiedCount).toBe(1);
+  expect(await Document.findById(waiting._id).lean()).toMatchObject({
+    fields: old.fields,
+    recoveryStage: 8,
+    recoveryConflicts: ["iin"],
+    nextReadAt: now,
+    recognitionVersion: version,
+  });
+  await Document.updateOne(
+    { _id: waiting._id },
+    { $set: { nextReadAt: later } },
+  );
+  expect((await wakeOutdatedIdentityReads(now)).modifiedCount).toBe(0);
+});
 it("checkpoints partial reads, yields to a waiting job, and stops immediately on completion", async () => {
   const original = await Document.create(fixture);
   const first = (await claimRead())!;
