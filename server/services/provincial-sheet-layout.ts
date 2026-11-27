@@ -7,10 +7,13 @@ const currency = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 
-export function prepareProvincialLayout(
+export function prepareCompactLayout(
   sheet: ExcelJS.Worksheet,
-  largestNumber: number,
-  totalTenge: number,
+  options: {
+    incomeBreakdown?: boolean;
+    largestNumber?: number;
+    moneyWidths?: Record<string, number>;
+  } = {},
 ) {
   const context = createCanvas(1, 1).getContext("2d");
   function selectFont(size: number, bold = false) {
@@ -21,10 +24,10 @@ export function prepareProvincialLayout(
     const needed = Math.ceil((widthOf(text) + 8) / excelWidthInPixels);
     column.width = Math.max(column.width ?? 0, needed);
   }
-  function lineCount(column: ExcelJS.Column, text: string, filter = false) {
+  function lineCount(width: number, text: string, filter = false) {
     const available = Math.max(
       12,
-      (column.width ?? 10) * excelWidthInPixels - (filter ? 24 : 7),
+      width * excelWidthInPixels - (filter ? 24 : 7),
     );
     const space = widthOf(" ");
     let lines = 0;
@@ -46,17 +49,20 @@ export function prepareProvincialLayout(
   }
 
   const headerRow = sheet.lastRow!.number;
-  sheet.getRow(1).height = 28;
-  sheet.getRow(2).height = 22;
-  sheet.getRow(4).height = 22;
+  if (options.incomeBreakdown) sheet.getRow(4).height = 22;
   selectFont(13);
-  ensureWidth(sheet.getColumn("registrationNumber"), String(largestNumber));
-  ensureWidth(sheet.getColumn("total"), currency.format(totalTenge));
+  if (options.largestNumber !== undefined)
+    ensureWidth(
+      sheet.getColumn("registrationNumber"),
+      String(options.largestNumber),
+    );
+  for (const [key, value] of Object.entries(options.moneyWidths ?? {}))
+    ensureWidth(sheet.getColumn(key), currency.format(value));
 
   // The age and date columns also hold money in the income summary.
   // Reserve room for the formatted figures before measuring any wrapped labels.
   for (let n = 3; n < headerRow; n++) {
-    if (n === 4) continue;
+    if (options.incomeBreakdown && n === 4) continue;
     const row = sheet.getRow(n);
     selectFont(n === 3 ? 14 : 13, true);
     row.eachCell((cell, index) => {
@@ -66,7 +72,7 @@ export function prepareProvincialLayout(
     });
   }
   for (let n = 3; n <= headerRow; n++) {
-    if (n === 4) continue;
+    if (options.incomeBreakdown && n === 4) continue;
     const size = n === 3 ? 14 : 13;
     selectFont(size, n === 3 || n === headerRow);
     const row = sheet.getRow(n);
@@ -75,13 +81,47 @@ export function prepareProvincialLayout(
       if (typeof cell.value === "string")
         lines = Math.max(
           lines,
-          lineCount(sheet.getColumn(index), cell.value, n === headerRow),
+          lineCount(
+            sheet.getColumn(index).width ?? 10,
+            cell.value,
+            n === headerRow,
+          ),
         );
     });
     row.height = Math.min(409, lines * (size + 4) + (n === headerRow ? 6 : 4));
   }
 
+  const tableWidth = sheet.columns.reduce(
+    (sum, column) => sum + (column.width ?? 10),
+    0,
+  );
+  selectFont(19, true);
+  sheet.getCell("A1").alignment = { vertical: "middle", wrapText: true };
+  sheet.getRow(1).height = Math.max(
+    28,
+    lineCount(tableWidth, sheet.getCell("A1").text) * 23 + 4,
+  );
   selectFont(13);
+  sheet.getRow(2).height = Math.max(
+    22,
+    lineCount(tableWidth, sheet.getCell("A2").text) * 17 + 3,
+  );
+
   return (key: string | number, text: string) =>
-    lineCount(sheet.getColumn(key), text);
+    lineCount(sheet.getColumn(key).width ?? 10, text);
 }
+
+export function compactRowLines(
+  row: ExcelJS.Row,
+  countLines: ReturnType<typeof prepareCompactLayout>,
+) {
+  let lines = 1;
+  row.eachCell((cell, column) => {
+    if (typeof cell.value === "string")
+      lines = Math.max(lines, countLines(column, cell.value));
+  });
+  return lines;
+}
+
+export const compactRowHeight = (lines: number) =>
+  Math.min(409, lines * 17 + 3);

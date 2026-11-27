@@ -3113,9 +3113,16 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "&region=" + encodeURIComponent(common.region),
     );
     expect(district.worksheets[0].getCell("B3").value).toBe(13600.75);
-    expect(district.worksheets[0].getRow(4).values).toContain(
-      "Қазақша аты-жөні",
-    );
+    const districtHeader = district.worksheets[0].getRow(4)
+      .values as ExcelJS.CellValue[];
+    expect(
+      districtHeader.filter(
+        (label) =>
+          typeof label === "string" &&
+          /аты-жөні|латынша|ағылшынша/iu.test(label),
+      ),
+    ).toEqual(["Аты-жөні (құжат бойынша)"]);
+    expect(district.worksheets[0].getColumn(1).width).toBeLessThan(36);
     expect(district.worksheets[0].getRow(4).values).toContain(
       "Соңғы чек күні мен уақыты (Астана)",
     );
@@ -3125,6 +3132,10 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       [a.phone, b.phone].includes(String(r["Телефон"])),
     );
     expect(districtTwins.map((r) => r["Телефон"])).toEqual([a.phone, b.phone]);
+    expect(districtTwins.map((r) => r["Аты-жөні (құжат бойынша)"])).toEqual([
+      "Есепсынақ Үлгі Қызы",
+      "Есепсынақ Үлгі Қызы",
+    ]);
     expect(
       records(district.worksheets[1])
         .map((r) => r["Чек нөмірі"])

@@ -173,8 +173,6 @@ const reportPersonProjection = {
   lastName: 1,
   firstName: 1,
   middleName: 1,
-  fullNameKk: 1,
-  fullNameRu: 1,
   phone: 1,
   birthDate: 1,
   lastNameLatin: 1,
