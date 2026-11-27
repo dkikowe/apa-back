@@ -657,11 +657,31 @@ export function createApp() {
       let fileHash: string | undefined;
       const receiptDocumentId =
         data.receiptDocumentId || before?.receiptDocumentId?.toString();
-      if (
-        (receiptDocumentId || data.receiptText) &&
-        !receiptKey(data.receiptNumber)
-      )
+      const numberKey = receiptKey(data.receiptNumber);
+      const sameSources =
+        before?.receiptDocumentId?.toString() === receiptDocumentId &&
+        (before?.receiptText || "") === (data.receiptText || "") &&
+        receiptKey(before?.receiptNumber) === numberKey;
+      if ((receiptDocumentId || data.receiptText) && !numberKey)
         throw new HttpError(400, "Қайталануын тексеру үшін чек нөмірі қажет.");
+      if (data.receiptText && !sameSources) {
+        let printedNumber: string;
+        try {
+          printedNumber = receiptKey(
+            extractReceiptText(data.receiptText).receiptNumber,
+          );
+        } catch {
+          throw new HttpError(400, "Бір чектің мәтінін ғана қойыңыз.");
+        }
+        if (
+          (printedNumber && printedNumber !== numberKey) ||
+          (receiptDocumentId && !printedNumber)
+        )
+          throw new HttpError(
+            400,
+            "Чек нөмірі мәтіндегі нөмірмен сәйкес келуі керек.",
+          );
+      }
       if (receiptDocumentId) {
         const doc = await Document.findOne({
           _id: receiptDocumentId,
@@ -680,27 +700,11 @@ export function createApp() {
           before?.receiptDocumentId?.toString(),
         );
         await checkDocumentDuplicate(doc, s);
-        const sameSources =
-          before?.receiptDocumentId?.toString() === receiptDocumentId &&
-          (before?.receiptText || "") === (data.receiptText || "") &&
-          receiptKey(before?.receiptNumber) === receiptKey(data.receiptNumber);
         if (["queued", "processing"].includes(doc.status!) && !sameSources)
           throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
         if (data.receiptText && !sameSources) {
-          let textNumber: string;
-          try {
-            textNumber = receiptKey(
-              extractReceiptText(data.receiptText).receiptNumber,
-            );
-          } catch {
-            throw new HttpError(400, "Бір чектің мәтінін ғана қойыңыз.");
-          }
           const fileNumber = receiptKey(doc.fields?.receiptNumber);
-          if (
-            !fileNumber ||
-            fileNumber !== textNumber ||
-            textNumber !== receiptKey(data.receiptNumber)
-          )
+          if (fileNumber !== numberKey)
             throw new HttpError(
               400,
               "Файлдағы және мәтіндегі чек нөмірлерін тексеріңіз. Бір төлемге бір чек қажет.",
@@ -723,7 +727,6 @@ export function createApp() {
           { session: s },
         );
       }
-      const numberKey = receiptKey(data.receiptNumber);
       const duplicate = await paymentConflict(
         data.receiptNumber,
         fileHash,

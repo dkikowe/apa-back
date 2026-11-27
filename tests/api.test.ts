@@ -1249,6 +1249,58 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         .status,
     ).toBe(409);
   });
+  it("posts a copied multiline Kaspi receipt once against its printed number", async () => {
+    const source = [
+      "Оплата 6 487 ₸",
+      "ОО Сынақ бірлестігі",
+      'шеберлер "URSHYK" (Ұршық)',
+      "№ чека QR00000094721",
+      "ИИН/БИН продавца 000000000001",
+      "ФИО покупателя Үлгі А.",
+      "Дата и время",
+      "по Астане",
+      "12.08.2026 10:00",
+      "Оплачено с Kaspi Gold",
+      "Адрес г. Астана",
+    ].join("\\\n");
+    const readUrl = "/api/receipts/recognize-text";
+    const { body } = await post(readUrl, { text: source }).expect(200);
+    const fields = {
+      amount: 648700,
+      receiptNumber: "QR00000094721",
+      payerName: "Үлгі А.",
+      recipientName: 'ОО Сынақ бірлестігі шеберлер "URSHYK" (Ұршық)',
+      method: "с Kaspi Gold",
+      receiptType: "urshyk",
+      paymentDate: "2026-08-12",
+      paymentTime: "10:00",
+    };
+    expect(body.fields).toMatchObject(fields);
+    const member = await post("/api/participants", {
+      firstName: "КөшірмеСынақ",
+    }).expect(201);
+    const payments = "/api/participants/" + member.body._id + "/payments";
+    const payload = { ...body.fields, receiptText: source, year: 2026 };
+    await post(payments, { ...payload, receiptNumber: "QR00000094722" }).expect(
+      400,
+    );
+    const saved = await post(payments, payload).expect(201);
+    await post(readUrl, { text: source }).expect(409);
+    await post(payments, payload).expect(409);
+    await patch("/api/payments/" + saved.body._id, {
+      ...payload,
+      receiptNumber: "QR00000094722",
+    }).expect(400);
+    const profile = await agent
+      .get("/api/participants/" + member.body._id + "?year=2026")
+      .expect(200);
+    expect(profile.body.payments).toHaveLength(1);
+    expect(profile.body.payments[0]).toMatchObject({
+      ...fields,
+      receiptText: source,
+    });
+    expect(profile.body.totalPaid).toBe(fields.amount);
+  });
   it("loads document bytes only on request and enforces ownership without caching", async () => {
     const { Admin, Document } = await import("../server/models.js");
     const { storage } = await import("../server/services/storage.js");

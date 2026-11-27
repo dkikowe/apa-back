@@ -865,13 +865,17 @@ export function extractFields(text: string, kind: string) {
 // WhatsApp can flatten a receipt into one line and prepend unrelated profile
 // details. Rebuild labeled receipt lines without treating that preamble as money.
 export function extractReceiptText(message: string) {
+  // A copied Markdown hard break can leave a backslash at the end of a line.
+  message = message.replace(/\\[ \t]*(?:\r?\n|$)/g, " ");
+  if (/\\\s*(?:№\s*чека|ИИН\/БИН продавца)/iu.test(message))
+    message = message.replaceAll("\\", " ");
   message = normalizeReceiptLabels(message)
     .normalize("NFC")
     .replace(/\s+/g, " ")
     .trim();
-  const success =
-    /Оплата совершена|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Т[өео]лем жасалды|Төлем сәтті орындалды|С[әа]тті аударылды/giu;
-  const matches = [...message.matchAll(success)];
+  const receiptStart =
+    /(?<![\p{L}\p{N}])(?:Оплата совершена|Оплата(?=\s+\d[\d\s.,'’]*?\s*(?:₸|KZT|тенге|тг)\.?(?=\s|$))|Перевод выполнен успешно|Перевод успешно соверш[её]н|Плат[её]ж выполнен|Т[өео]лем жасалды|Төлем сәтті орындалды|С[әа]тті аударылды)/giu;
+  const matches = [...message.matchAll(receiptStart)];
   if (matches.length > 1)
     throw new Error("Бір уақытта бір чектің мәтінін ғана қойыңыз.");
   let text = matches.length
@@ -907,13 +911,19 @@ export function extractReceiptText(message: string) {
     "\n$1 ",
   );
   if (matches.length) {
+    const shortHeader = /^Оплата$/iu.test(matches[0][0]);
+    if (
+      shortHeader &&
+      !text.split("\n").some((line) => prefix(labels.receiptNumber).test(line))
+    )
+      return extractFields(text, "receipt");
     text = text
       .trim()
       .replace(
         /^(\d[\d\s.,'’]*?\s*(?:₸|KZT|тенге|тг|Т|T)[.]?)(?=\s|$)\s*/iu,
         "$1\n",
       );
-    text = matches[0][0] + "\n" + text;
+    text = (shortHeader ? "Сумма" : matches[0][0]) + "\n" + text;
   }
   return extractFields(text, "receipt");
 }

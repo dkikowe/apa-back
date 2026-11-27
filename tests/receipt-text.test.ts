@@ -3,6 +3,42 @@ import { extractReceiptText } from "../server/services/document-fields.js";
 const receipt =
   'Оплата совершена 6 437 ₸ ОО Сынақ ұйымы "TEST" № чека QR-TEXT-001 ИИН/БИН продавца 000000000001 ФИО покупателя Үлгі А. сіңлісі төлепті Дата и время по Астане 01.08.2026 16:00 Оплачено с Kaspi Gold Адрес г. Астана, Е 15';
 describe("WhatsApp receipt text", () => {
+  const shortReceipt = [
+    "Оплата 6 245 ₸",
+    "ОО Сынақ бірлестігі",
+    'Қолөнершілер "URSHYK" (Ұршық)',
+    "№ чека QR00000001425",
+    "ИИН/БИН продавца 000000000001",
+    "ФИО покупателя Үлгі А.",
+    "Дата и время",
+    "по Астане",
+    "17.06.2026 09:03",
+    "Оплачено с Kaspi Gold",
+    "Адрес Тест көшесі, 15",
+  ];
+  it.each(["\n", "\\\n", "\\", " "])(
+    "reads the short Kaspi heading and the entire wrapped merchant with separator %j",
+    (separator) => {
+      expect(extractReceiptText(shortReceipt.join(separator))).toEqual({
+        amount: 624500,
+        paymentDate: "2026-06-17",
+        paymentTime: "09:03",
+        receiptNumber: "QR00000001425",
+        payerName: "Үлгі А.",
+        recipientName: 'ОО Сынақ бірлестігі Қолөнершілер "URSHYK" (Ұршық)',
+        receiptType: "urshyk",
+        method: "с Kaspi Gold",
+      });
+    },
+  );
+  it("requires a receipt number heading to interpret a short payment message as a receipt amount", () => {
+    expect(extractReceiptText("Оплата 6 245 ₸ до 17 июня")).toEqual({});
+  });
+  it("rejects a short receipt combined with another payment", () => {
+    expect(() =>
+      extractReceiptText(receipt + "\n" + shortReceipt.join("\n")),
+    ).toThrow("бір чектің");
+  });
   it.each([
     receipt,
     receipt.replace("№ чека", "№чека"),
