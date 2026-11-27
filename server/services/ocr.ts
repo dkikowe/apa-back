@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { invalidIdentityFields } from "../../shared/domain.js";
 import { missingDocumentFields } from "../../shared/document-recognition.js";
 import {
+  addCitizenCardEvidence,
   extractFields,
   extractIdentityLayout,
   identityIinCandidates,
@@ -125,6 +126,8 @@ const foldRecipientU = (name: string) =>
   name.replace(/[үұ]/gu, "у").replace(/[ҮҰ]/gu, "У");
 
 type Fields = Record<string, string | number>;
+const hasDemographics = (fields: Fields) =>
+  Boolean(fields.sex && fields.citizenship && fields.birthplace);
 // A printed start/end pair supplies stronger evidence than one previously
 // recognized endpoint. Keep all other accepted readings, including an
 // explicitly absent patronymic, across pages and recovery rounds.
@@ -909,7 +912,10 @@ export async function recognize(
       : undefined;
     if (confirmedIin) {
       resolvedNumber = fields.iin = confirmedIin;
-      if (!missingDocumentFields("identity", fields).length)
+      if (
+        !missingDocumentFields("identity", fields).length &&
+        hasDemographics(fields)
+      )
         return { text: "", fields };
     }
     const texts: string[] = [];
@@ -1097,7 +1103,8 @@ export async function recognize(
     const nativeFields: Record<string, string | number> = {};
     const identitySources: string[] = [];
     if (mime === "application/pdf") {
-      const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      const { getDocument, OPS } =
+        await import("pdfjs-dist/legacy/build/pdf.mjs");
       const pdf = await getDocument({
         data: new Uint8Array(buffer),
         useSystemFonts: true,
@@ -1182,7 +1189,20 @@ export async function recognize(
                 ? receiptCandidate
                 : nativeNumber
               : undefined;
-          if (completeLayer && !candidate) {
+          // A hybrid ID can have all mandatory values as native text while
+          // the labels for sex, birthplace or citizenship are printed pixels.
+          const hasUnscannedLabels =
+            kind === "identity" &&
+            completeLayer &&
+            !hasDemographics({ ...previous, ...layerFields }) &&
+            (await page.getOperatorList()).fnArray.some((op: number) =>
+              [
+                OPS.paintImageXObject,
+                OPS.paintInlineImageXObject,
+                OPS.paintImageMaskXObject,
+              ].includes(op),
+            );
+          if (completeLayer && !candidate && !hasUnscannedLabels) {
             text += layer + "\n";
             Object.assign(nativeFields, layerFields);
             continue;
@@ -1242,7 +1262,7 @@ export async function recognize(
               )
                 resolvedNumber = candidate;
             }
-            if (resolvedNumber || kind !== "receipt") {
+            if (!hasUnscannedLabels && (resolvedNumber || kind !== "receipt")) {
               text += layer + "\n";
               Object.assign(nativeFields, layerFields);
               continue;
@@ -1398,6 +1418,7 @@ export async function recognize(
         ? mergeIdentityFields({ ...previous }, nativeFields)
         : { ...extractFields(text, kind), ...nativeFields, ...previous };
     if (kind === "identity") {
+      addCitizenCardEvidence(result, identitySources.join("\n"));
       const candidates = new Set(
         identityIinCandidates(identitySources.join("\n")),
       );

@@ -12,11 +12,12 @@ vi.mock("tesseract.js", async (original) => ({
 import { recognize } from "../server/services/ocr.js";
 import { missingDocumentFields } from "../shared/document-recognition.js";
 import {
+  addCitizenCardEvidence,
   extractFields,
   extractIdentityLayout,
   printedBirthDate,
 } from "../server/services/document-fields.js";
-import { textPdf } from "./ocr-fixtures.js";
+import { imagePdf, textPdf } from "./ocr-fixtures.js";
 const core = [
   "SURNAME: TEST",
   "GIVEN NAMES: PERSON",
@@ -45,6 +46,96 @@ beforeEach(() => {
   engine.terminate.mockResolvedValue(undefined);
 });
 describe("Automatic identity recovery", () => {
+  it("reads demographics in a hybrid PDF even when its native layer has every mandatory field", async () => {
+    const overlay = [...core, ...details]
+      .map((line, i) => `\nBT /F1 6 Tf 5 ${130 - i * 8} Td (${line}) Tj ET`)
+      .join("");
+    engine.recognize.mockResolvedValue(
+      response(["SEX: F", "CITIZENSHIP: CANADA", "PLACE OF BIRTH: MONTRÉAL"]),
+    );
+    const fields = await recognize(
+      await imagePdf(await image(), false, overlay),
+      "application/pdf",
+      "identity",
+    );
+    expect(fields).toMatchObject({
+      sex: "Әйел",
+      citizenship: "CANADA",
+      birthplace: "MONTRÉAL",
+    });
+    expect(engine.recognize).toHaveBeenCalled();
+  });
+  it("distinguishes citizenship from ethnicity, the issuer and location", () => {
+    const text =
+      "ТУҒАН ЖЕРІ / МЕСТОРОЖДЕНИЯ\nҚЫЗЫЛОРДА ОБЛ.\nҰЛТЫ / НАЦИОНАЛЬНОСТЬ\nҚАЗАҚ\nЖЫНЫСЫ / ПОЛ\nЖ\nАЗАМАТТЫҒЫ / ГРАЖДАНСТВО\nҚАЗАҚСТАН";
+    expect(extractFields(text, "identity")).toMatchObject({
+      sex: "Әйел",
+      citizenship: "Қазақстан Республикасы",
+      birthplace: "ҚЫЗЫЛОРДА ОБЛ.",
+    });
+    const unrelated = extractFields(
+      "ҰЛТЫ / NATIONALITY\nҚАЗАҚ\nКЕМ ВЫДАН: МВД РК\nИИН: 000123456789",
+      "identity",
+    );
+    expect(unrelated.sex).toBeUndefined();
+    expect(unrelated.citizenship).toBeUndefined();
+    expect(unrelated.birthplace).toBeUndefined();
+  });
+  it("reads the labelled one-letter sex in a separate column and the original native birthplace", () => {
+    const item = (text: string, x: number, y: number, width: number) => ({
+      text,
+      bbox: { x0: x, y0: y, x1: x + width, y1: y + 10 },
+    });
+    const found = extractIdentityLayout(
+      [
+        item("14.12.1996", 0, 30, 60),
+        item("М", 168, 30, 11),
+        item("СЕМЕЙ, ҚАЗАҚСТАН", 0, 80, 80),
+      ],
+      [
+        item("ТУҒАН КҮНІ / ДАТА РОЖДЕНИЯ", 0, 12, 100),
+        item("ЖЫНЫСЫ / ПОЛ", 135, 12, 85),
+        item("ГУҒАН ЖЕРІ / МЕСТОРОЖДЕНИЯ", 0, 65, 130),
+      ],
+    );
+    expect(found).toMatchObject({
+      sex: "Ер",
+      birthplace: "СЕМЕЙ, ҚАЗАҚСТАН",
+      birthDate: "1996-12-14",
+    });
+  });
+  it("uses the nationality position of a checked MRZ and skips damaged or conflicting rows", () => {
+    const td1 = "7408122F1204159UT0<<<<<<<<<<<6".replace("UT0", "CAN");
+    expect(extractFields(td1, "identity")).toMatchObject({
+      sex: "Әйел",
+      citizenship: "CAN",
+    });
+    for (const damaged of [
+      td1.replace("8122", "8121"),
+      td1 + "\n" + td1.replace("CAN", "KAZ"),
+      "I<KAZ".padEnd(30, "<"),
+    ]) {
+      const fields = extractFields(damaged, "identity");
+      expect(fields.sex).toBeUndefined();
+      expect(fields.citizenship).toBeUndefined();
+    }
+  });
+  it("uses the country and specific citizen ID title together on older cards", () => {
+    const title = "РЕСПУБЛИКА КАЗАХСТАН\nУДОСТОВЕРЕНИЕ ЛИЧНОСТИ";
+    const found: Record<string, string> = {};
+    addCitizenCardEvidence(found, title);
+    expect(found.citizenship).toBe("Қазақстан Республикасы");
+    for (const other of [
+      "РЕСПУБЛИКА КАЗАХСТАН",
+      "УДОСТОВЕРЕНИЕ ЛИЧНОСТИ",
+      title + "\nВИД НА ЖИТЕЛЬСТВО",
+      title + " МОРЯКА",
+    ]) {
+      const fields: Record<string, string> = {};
+      addCitizenCardEvidence(fields, other);
+      expect(fields.citizenship).toBeUndefined();
+    }
+  });
   it("continues after names/IIN until issuer, number and validity are recovered, retaining prior values", async () => {
     engine.recognize
       .mockResolvedValueOnce(response([...core, "PATRONYMIC: -"]))

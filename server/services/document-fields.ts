@@ -27,6 +27,21 @@ const labels = {
     "ДАТА РОЖДЕНИЯ",
     "DATE OF BIRTH",
   ],
+  sex: ["ЖЫНЫСЫ", "ПОЛ", "SEX", "GENDER"],
+  citizenship: [
+    "(?:АЗАМАТТЫҒЫ|ГРАЖДАНСТВО|CITIZENSHIP)\\s*[/|]\\s*NATIONALITY",
+    "АЗАМАТТЫҒЫ",
+    "ГРАЖДАНСТВО",
+    "CITIZENSHIP",
+  ],
+  birthplace: [
+    "ТУҒАН ЖЕРІ",
+    "ТУҒАН ЖЕР",
+    "МЕСТО РОЖДЕНИЯ",
+    "МЕСТОРОЖДЕНИЯ",
+    "PLACE OF BIRTH",
+    "BIRTHPLACE",
+  ],
   iin: ["ЖСН", "ИИН", "IIN"],
   documentNumber: [
     "КУӘЛІК НӨМІРІ",
@@ -140,17 +155,124 @@ export function receiptHeadingFields(line: string): string[] {
 const anyLabel = prefix(Object.values(labels).flat());
 // Either language can remain readable when OCR damages the other half of a
 // bilingual heading. Never use such a heading as the value of an empty name.
-const identityExtraLabel = prefix([
-  "ТУҒАН ЖЕРІ",
-  "МЕСТО РОЖДЕНИЯ",
-  "PLACE OF BIRTH",
-  "ҰЛТЫ",
-  "НАЦИОНАЛЬНОСТЬ",
-  "NATIONALITY",
-  "ЖЫНЫСЫ",
-  "ПОЛ",
-  "SEX",
-]);
+const identityExtraLabel = prefix(["ҰЛТЫ", "НАЦИОНАЛЬНОСТЬ", "NATIONALITY"]);
+const demographicKeys = ["sex", "birthplace", "citizenship"] as const;
+type DemographicKey = (typeof demographicKeys)[number];
+const kazakhCitizenship = "Қазақстан Республикасы";
+function sexValue(value: string) {
+  const parts = value
+    .toUpperCase()
+    .split(/\s*[/|]\s*/u)
+    .map((part) => {
+      if (/^(?:F|Ж|Ә|ӘЙЕЛ|ӘЙЕЛ АДАМ|ЖЕН\.?|ЖЕНСКИЙ|FEMALE)$/u.test(part))
+        return "Әйел";
+      if (/^(?:M|М|Е|ЕР|ЕР АДАМ|МУЖ\.?|МУЖСКОЙ|MALE)$/u.test(part)) return "Ер";
+      return "";
+    });
+  if (parts[0] && parts.every((part) => part === parts[0])) return parts[0];
+}
+function demographicValue(key: DemographicKey, raw: string) {
+  const value = raw.trim().replace(/\s+/gu, " ");
+  if (key === "sex") return sexValue(value);
+  if (
+    value.length < 2 ||
+    value.length > 160 ||
+    !/^\p{L}[\p{L}\p{M}\s.,’'()-]*$/u.test(value) ||
+    isIdentityFieldLabel(value)
+  )
+    return;
+  if (
+    key === "citizenship" &&
+    /^(?:ҚАЗАҚСТАН(?: РЕСПУБЛИКАСЫ)?|(?:РЕСПУБЛИКА )?КАЗАХСТАН|(?:REPUBLIC OF )?KAZAKHSTAN|KAZ)$/iu.test(
+      value,
+    )
+  )
+    return kazakhCitizenship;
+  return value;
+}
+// Both printed headings identify the specific citizen ID. Ethnic origin, an
+// issuing authority and the name of the issuing country alone do not.
+function isKazakhCitizenCard(text: string) {
+  if (
+    /ВИД\s+НА\s+ЖИТЕЛЬСТВО|ТҰРУҒА\s+ЫҚТИЯРХАТ|ЫҚТИЯРХАТ|БЕЗ\s+ГРАЖДАНСТВА|АЗАМАТТЫҒЫ\s+ЖОҚ|RESIDENCE\s+PERMIT|STATELESS/iu.test(
+      text,
+    )
+  )
+    return false;
+  const lines = text
+    .toUpperCase()
+    .split(/\r?\n/u)
+    .map((line) => line.trim().replace(/[\s/|]+/gu, " "))
+    .filter(Boolean);
+  const country =
+    /^(?:ҚАЗАҚСТАН РЕСПУБЛИКАСЫ(?: РЕСПУБЛИКА КАЗАХСТАН)?|РЕСПУБЛИКА КАЗАХСТАН)$/u;
+  const card =
+    /^(?:ЖЕКЕ КУӘЛІК(?: УДОСТОВЕРЕНИЕ ЛИЧНОСТИ)?|УДОСТОВЕРЕНИЕ ЛИЧНОСТИ(?: ГРАЖДАНИНА РЕСПУБЛИКИ КАЗАХСТАН)?)$/u;
+  return lines.some(
+    (line, i) =>
+      country.test(line) &&
+      lines
+        .slice(Math.max(0, i - 3), i + 4)
+        .some((nearby) => card.test(nearby)),
+  );
+}
+export function addCitizenCardEvidence(
+  result: Record<string, string | number>,
+  text: string,
+) {
+  if (!result.citizenship && isKazakhCitizenCard(text))
+    result.citizenship = kazakhCitizenship;
+}
+// ICAO 9303 TD1/TD2/TD3 data rows. Require exact columns and both date
+// check digits. The issuing-state code in the header is a different field.
+function mrzDemographics(lines: string[]) {
+  const result: Record<string, string> = {};
+  const candidates = new Set<string>();
+  const checkedDate = (record: string) => {
+    const weights = [7, 3, 1];
+    return (
+      Number(record[6]) ===
+        [...record.slice(0, 6)].reduce(
+          (sum, digit, i) => sum + Number(digit) * weights[i % 3],
+          0,
+        ) %
+          10 &&
+      Number(record.slice(2, 4)) >= 1 &&
+      Number(record.slice(2, 4)) <= 12 &&
+      Number(record.slice(4, 6)) >= 1 &&
+      Number(record.slice(4, 6)) <= 31
+    );
+  };
+  for (const line of lines) {
+    const row = line.replace(/\s/gu, "");
+    if (!/^[A-Z0-9<]+$/u.test(row)) continue;
+    const td1 = row.length === 30;
+    if (!td1 && row.length !== 36 && row.length !== 44) continue;
+    const birth = row.slice(td1 ? 0 : 13, td1 ? 7 : 20),
+      sex = row[td1 ? 7 : 20];
+    const expiry = row.slice(td1 ? 8 : 21, td1 ? 15 : 28);
+    const country = row.slice(td1 ? 15 : 10, td1 ? 18 : 13);
+    if (
+      /^\d{7}$/u.test(birth) &&
+      /^\d{7}$/u.test(expiry) &&
+      checkedDate(birth) &&
+      checkedDate(expiry) &&
+      /^[MF<]$/u.test(sex) &&
+      /^(?:[A-Z]{3}|<<<)$/u.test(country) &&
+      /^\d$/u.test(row.at(-1)!)
+    )
+      candidates.add(sex + country);
+  }
+  if (candidates.size === 1) {
+    const raw = [...candidates][0];
+    const sex = sexValue(raw[0]);
+    if (sex) result.sex = sex;
+    const country = raw.slice(1);
+    if (country !== "<<<")
+      result.citizenship = country === "KAZ" ? kazakhCitizenship : country;
+  }
+  return result;
+}
 // Match OCR's common substitutions in field headings only. Keep dates and
 // institution names in their printed spelling.
 function foldHeading(value: string) {
@@ -262,10 +384,13 @@ export function extractIdentityLayout(
     "iin",
     "documentNumber",
     "issuedBy",
+    ...demographicKeys,
     "issueDate",
     "expiryDate",
   ] as const) {
     const found: string[] = [];
+    const heading = prefix(labels[key]);
+    const demographic = demographicKeys.find((field) => field === key);
     for (const anchor of anchors) {
       const validity =
         (key === "issueDate" || key === "expiryDate") &&
@@ -273,7 +398,13 @@ export function extractIdentityLayout(
       if (
         validity
           ? !(key === "issueDate" ? validity.issue : validity.expiry)
-          : !prefix(labels[key]).test(anchor.text.trim())
+          : !(
+              heading.test(anchor.text.trim()) ||
+              (demographic &&
+                anchor.text
+                  .split(/[/|]/u)
+                  .some((part) => heading.test(part.trim())))
+            )
       )
         continue;
       const height = Math.max(1, anchor.bbox.y1 - anchor.bbox.y0);
@@ -285,7 +416,10 @@ export function extractIdentityLayout(
             !isIdentityFieldLabel(value.text.trim()) &&
             gap >= -height * 0.3 &&
             gap <= height * 5 &&
-            Math.abs(value.bbox.x0 - anchor.bbox.x0) <= height * 2 &&
+            (Math.abs(value.bbox.x0 - anchor.bbox.x0) <= height * 2 ||
+              (key === "sex" &&
+                value.bbox.x0 >= anchor.bbox.x0 &&
+                value.bbox.x1 <= anchor.bbox.x1 + height)) &&
             ![...anchors, ...values].some(
               (other) =>
                 other !== anchor &&
@@ -313,21 +447,27 @@ export function extractIdentityLayout(
       )
         continue;
       if (
-        key.endsWith("Date")
-          ? Boolean(dateValue(value))
-          : key === "iin"
-            ? /^\d{12}$/.test(value)
-            : key === "documentNumber"
-              ? /^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(value)
-              : key === "issuedBy"
-                ? validIdentityIssuer(value) &&
-                  value.length >= 3 &&
-                  value.length <= 200
-                : /^[\p{Script=Cyrillic}A-Za-z\s’'-]{2,100}$/u.test(value)
+        demographic
+          ? Boolean(demographicValue(demographic, value))
+          : key.endsWith("Date")
+            ? Boolean(dateValue(value))
+            : key === "iin"
+              ? /^\d{12}$/.test(value)
+              : key === "documentNumber"
+                ? /^[A-Za-zА-Яа-я0-9 -]{3,30}$/.test(value)
+                : key === "issuedBy"
+                  ? validIdentityIssuer(value) &&
+                    value.length >= 3 &&
+                    value.length <= 200
+                  : /^[\p{Script=Cyrillic}A-Za-z\s’'-]{2,100}$/u.test(value)
       )
         found.push(value);
     }
     if (new Set(found).size === 1) {
+      if (demographic) {
+        result[demographic] = demographicValue(demographic, found[0])!;
+        continue;
+      }
       Object.assign(
         result,
         extractFields(labels[key][0] + "\n" + found[0], "identity"),
@@ -606,9 +746,19 @@ export function extractFields(text: string, kind: string) {
     Object.assign(
       fields,
       machineReadableNames(text),
+      mrzDemographics(lines),
       identityDetails(text),
       readValidity(lines),
     );
+    for (const key of demographicKeys) {
+      const value = labeled(
+        labels[key],
+        false,
+        false,
+        (v) => !!demographicValue(key, v),
+      );
+      if (value) fields[key] = demographicValue(key, value)!;
+    }
     for (const key of ["lastName", "firstName", "middleName"] as const) {
       // PDF text order may put English name rows before the native names.
       const allowEmpty = key === "middleName";
