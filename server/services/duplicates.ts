@@ -51,12 +51,13 @@ export async function participantConflict(
   })
     .session(session || null)
     .lean();
-  return p
-    ? {
-        message: `Бұл ЖСН бұрын тіркелген: ${name(p) || "қатысушы"}. Қайта қосуға болмайды.`,
-        participantId: String(p._id),
-      }
-    : null;
+  if (!p) return null;
+  if (p.siteHiddenAt)
+    return { message: "Бұл ЖСН бұрын тіркелген. Қайта қосуға болмайды." };
+  return {
+    message: `Бұл ЖСН бұрын тіркелген: ${name(p) || "қатысушы"}. Қайта қосуға болмайды.`,
+    participantId: String(p._id),
+  };
 }
 export async function paymentConflict(
   number: string,
@@ -89,6 +90,7 @@ export async function savedPaymentConflict(
   const p = await Participant.findOne({
     _id: pay.participantId,
     deletedAt: null,
+    siteHiddenAt: null,
   })
     .select("lastName firstName")
     .session(session || null)
@@ -106,13 +108,16 @@ export async function currentDocumentDuplicate(
   session?: mongoose.ClientSession,
 ) {
   const cached = doc.duplicate;
-  const removed =
-    cached?.participantId &&
-    (await Participant.exists({
-      _id: cached.participantId,
-      deletedAt: { $ne: null },
-    }).session(session || null));
-  if (cached && !removed) return cached;
+  if (
+    cached &&
+    (!cached.participantId ||
+      (await Participant.exists({
+        _id: cached.participantId,
+        deletedAt: null,
+        siteHiddenAt: null,
+      }).session(session || null)))
+  )
+    return cached;
   return recognitionConflict(doc, doc.fields || {}, session);
 }
 // Uploads are drafts until a participant/payment actually references them.
@@ -131,7 +136,7 @@ export async function savedDocumentConflict(
     if (person)
       return {
         message: "Бұл құжат сақталған жазбаға тіркелген.",
-        participantId: String(person._id),
+        ...(!person.siteHiddenAt ? { participantId: String(person._id) } : {}),
       };
   }
   return doc.kind === "receipt"

@@ -1075,6 +1075,91 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(sheet.getCell("B5").numFmt).toBe("dd.mm.yyyy hh:mm");
     expect(sheet.getCell("B4").numFmt).toBe("dd.mm.yyyy hh:mm:ss");
   });
+  it("hides marked profiles without removing their identity, receipts or income", async () => {
+    const { Admin, Document, Participant, Payment } =
+      await import("../server/models.js");
+    const privateName = "VisibilityHidden";
+    const input = { ...person, lastName: privateName, iin: "980101400147" };
+    const created = (await post("/api/participants", input).expect(201)).body;
+    const path = "/api/participants/" + created._id;
+    const paid = {
+      ...base,
+      receiptNumber: "HIDDEN-427",
+      year: 2082,
+      paymentDate: "2082-03-04",
+    };
+    const payment = (await post(path + "/payments", paid).expect(201)).body;
+    const before = (await agent.get("/api/statistics?year=2082")).body;
+    const admin = await Admin.findOne({ username: "test-admin" }).orFail();
+    const stale = await Document.create({
+      ownerId: admin._id,
+      kind: "identity",
+      status: "duplicate",
+      fields: { iin: input.iin },
+      duplicate: { participantId: created._id, message: privateName },
+    });
+    await Participant.updateOne(
+      { _id: created._id },
+      { $set: { siteHiddenAt: new Date() } },
+    );
+
+    for (const archived of [false, true]) {
+      const list = await agent
+        .get("/api/participants")
+        .query({ q: privateName, archived })
+        .expect(200);
+      expect(list.body).toMatchObject({ items: [], total: 0 });
+    }
+    await agent.get(path).expect(404);
+    await patch(path, { notes: "stale" }).expect(404);
+    await post(path + "/archive", { restore: true }).expect(404);
+    await agent.delete(path).set("x-csrf-token", csrf).expect(404);
+    await post(path + "/payments", base).expect(404);
+    await patch("/api/payments/" + payment._id, paid).expect(404);
+    await post("/api/payments/" + payment._id + "/void", {}).expect(404);
+    const after = (await agent.get("/api/statistics?year=2082")).body;
+    expect(after.totals.count).toBe(before.totals.count - 1);
+    expect(after.finance).toEqual(before.finance);
+    expect(await Participant.findById(created._id).lean()).toMatchObject(input);
+    expect(await Payment.findById(payment._id).lean()).toMatchObject({
+      amount: paid.amount,
+      receiptNumber: paid.receiptNumber,
+      voidedAt: null,
+    });
+
+    const fresh = (
+      await post("/api/participants", { lastName: "VisibilityNew" }).expect(201)
+    ).body;
+    await agent.get("/api/participants/" + fresh._id).expect(200);
+    const repeatedIin = (await post("/api/participants", input).expect(409))
+      .body;
+    const repeatedReceipt = (
+      await post("/api/participants/" + fresh._id + "/payments", paid).expect(
+        409,
+      )
+    ).body;
+    const cached = (await agent.get("/api/documents/" + stale._id).expect(200))
+      .body;
+    for (const duplicate of [repeatedIin, repeatedReceipt, cached.duplicate]) {
+      expect(duplicate.participantId).toBeUndefined();
+      expect(duplicate.message).toBeTruthy();
+      expect(duplicate.message).not.toContain(privateName);
+    }
+    expect(cached.error).not.toContain(privateName);
+    const preview = await previewFile(
+      await workbookBytes([["NewImportName", input.iin]], ["Фамилия", "ИИН"]),
+    ).expect(200);
+    expect(preview.body).toMatchObject({ duplicates: 1, ready: 0 });
+    expect(JSON.stringify(preview.body)).not.toContain(privateName);
+    await Participant.updateOne(
+      { _id: created._id },
+      { $unset: { siteHiddenAt: 1 } },
+    );
+    const restored = await agent.get(path).expect(200);
+    expect(restored.body.payments.map((p: any) => p._id)).toEqual([
+      payment._id,
+    ]);
+  });
   it("recognizes pasted receipts without writes, saves the source and detects duplicates", async () => {
     const { Payment, Document } = await import("../server/models.js");
     const before = [
@@ -2868,6 +2953,59 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     ).toMatchObject({ "Латынша аты": "ULGI", "Туған жылы": 1990 });
     for (const key of ["Телефон", "Аймақ", "Төленген мүшелік жарна, ₸"])
       expect(international[0]).not.toHaveProperty(key);
+  });
+  it("omits hidden profiles from rosters and keeps their actual money in the ledger", async () => {
+    const { Participant, Payment } = await import("../server/models.js");
+    const { makeReport, financialSummary } =
+      await import("../server/services/reports.js");
+    const { filtersSchema } = await import("../server/services/members.js");
+    const profile = await Participant.create({
+      lastName: "HiddenReportFixture",
+      phone: "hidden-phone-fixture",
+      region: "Ақтау",
+      siteHiddenAt: new Date(),
+    });
+    const year = 2094;
+    await Payment.create({
+      participantId: profile._id,
+      year,
+      paymentDate: "2094-03-01",
+      amount: 650000,
+      paymentKind: "additional",
+      paymentCategoryName: "Есеп сынағы",
+      receiptNumber: "LEDGER-FIXTURE",
+    });
+    expect((await financialSummary(year)).totalIncome).toBe(650000);
+    const types = [
+      "members",
+      "awards",
+      "urshyk",
+      "international",
+      "payments",
+      "mangystau-oblast",
+      "mangystau-district",
+    ] as const;
+    for (const type of types) {
+      const filters = filtersSchema.parse({
+        year,
+        region: type === "mangystau-district" ? "Ақтау" : "",
+      });
+      const book = new ExcelJS.Workbook();
+      await book.xlsx.load(await makeReport(type, filters));
+      const cells = book.worksheets.flatMap((sheet) =>
+        sheet.getSheetValues().flat(2),
+      );
+      expect(cells).not.toContain("HiddenReportFixture");
+      expect(cells).not.toContain("hidden-phone-fixture");
+      const ledger = book.getWorksheet("Төлемдер");
+      if (ledger) {
+        expect(ledger.getCell("A4").text).toBe("Жасырылған қатысушы");
+        expect(ledger.getCell("D4").value).toBe(6500);
+        expect(ledger.getCell("G4").text).toBe("LEDGER-FIXTURE");
+      } else {
+        expect(cells).not.toContain("Жасырылған қатысушы");
+      }
+    }
   });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");

@@ -428,6 +428,7 @@ export function createApp() {
       const before = await Participant.findOne({
         _id: id,
         deletedAt: null,
+        siteHiddenAt: null,
       }).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
       // Merge against the current row inside the transaction. A form can
@@ -486,7 +487,7 @@ export function createApp() {
         );
       }
       const after = await Participant.findOneAndUpdate(
-        { _id: id, deletedAt: null },
+        { _id: id, deletedAt: null, siteHiddenAt: null },
         {
           $set: {
             ...normalized,
@@ -517,10 +518,11 @@ export function createApp() {
       const before = await Participant.findOne({
         _id: id,
         deletedAt: null,
+        siteHiddenAt: null,
       }).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
       const after = await Participant.findOneAndUpdate(
-        { _id: id, deletedAt: null },
+        { _id: id, deletedAt: null, siteHiddenAt: null },
         { $set: { archivedAt: restore ? null : new Date() } },
         { new: true, session: s },
       );
@@ -539,7 +541,10 @@ export function createApp() {
   app.delete("/api/participants/:id", async (req, res) => {
     const id = checkId(req.params.id);
     await atomic(async (s) => {
-      const before = await Participant.findById(id).session(s);
+      const before = await Participant.findOne({
+        _id: id,
+        siteHiddenAt: null,
+      }).session(s);
       if (!before) throw new HttpError(404, "Қатысушы табылмады.");
       if (before.deletedAt) return;
       const deletedAt = new Date();
@@ -552,7 +557,7 @@ export function createApp() {
         "searchTokens",
       ];
       await Participant.updateOne(
-        { _id: id, deletedAt: null },
+        { _id: id, deletedAt: null, siteHiddenAt: null },
         {
           $set: { deletedAt },
           $unset: Object.fromEntries(profileKeys.map((key) => [key, 1])),
@@ -617,7 +622,7 @@ export function createApp() {
     s: mongoose.ClientSession,
   ) {
     const p = await Participant.findOneAndUpdate(
-      { _id: id, deletedAt: null },
+      { _id: id, deletedAt: null, siteHiddenAt: null },
       { $inc: { __v: 1 } },
       { session: s, timestamps: false, projection: { archivedAt: 1 } },
     ).lean();

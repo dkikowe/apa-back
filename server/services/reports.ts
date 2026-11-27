@@ -178,6 +178,7 @@ const reportPersonProjection = {
   region: 1,
   village: 1,
   deletedAt: 1,
+  siteHiddenAt: 1,
 };
 async function reportPayments(
   match: Record<string, unknown>,
@@ -206,7 +207,14 @@ async function reportPayments(
     {
       $project: {
         participantId: 1,
-        person: 1,
+        // Keep the ledger entry and its region filter while omitting hidden profile details.
+        person: {
+          $cond: [
+            { $ifNull: ["$person.siteHiddenAt", false] },
+            { siteHiddenAt: "$person.siteHiddenAt" },
+            "$person",
+          ],
+        },
         year: 1,
         amount: 1,
         paymentKind: 1,
@@ -376,6 +384,7 @@ export async function makeReport(
       Participant.find({
         deletedAt: null,
         archivedAt: null,
+        siteHiddenAt: null,
         ...(region ? { region } : {}),
       })
         .select(reportPersonProjection)

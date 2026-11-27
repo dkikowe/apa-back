@@ -33,6 +33,7 @@ const participant = new Schema(
     identityDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },
     archivedAt: { type: Date, default: null },
     deletedAt: Date,
+    siteHiddenAt: Date,
   },
   options,
 );

@@ -147,6 +147,7 @@ export type ParticipantInfo = {
   region?: string | null;
   village?: string | null;
   deletedAt?: Date | null;
+  siteHiddenAt?: Date | null;
 };
 export type ReportPayment = {
   participantId: unknown;
@@ -169,6 +170,7 @@ export function documentName(p: ParticipantInfo) {
 }
 function personName(p?: ParticipantInfo) {
   if (!p || p.deletedAt) return "Жойылған қатысушы";
+  if (p.siteHiddenAt) return "Жасырылған қатысушы";
   return (
     documentName(p) ||
     [p.lastNameLatin, p.firstNameLatin].filter(Boolean).join(" ") ||
