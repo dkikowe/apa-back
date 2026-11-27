@@ -170,14 +170,11 @@ export async function resumeDraft(doc: any) {
           _id: doc._id,
           status: doc.status,
           participantId: null,
-          $or: [
-            { recognitionVersion: { $exists: false } },
-            { recognitionVersion: { $lt: version } },
-          ],
+          recognitionVersion: doc.recognitionVersion ?? null,
         },
         {
           $set: { ...newReadCycle, recognitionVersion: version },
-          $unset: { error: 1 },
+          $unset: { error: 1, completedAt: 1 },
         },
         { new: true },
       ).lean()) ||
@@ -195,6 +192,9 @@ export const newReadCycle = {
   recoveryStage: 0,
   wrongDocumentKind: false,
   recoveryFailures: 0,
+  recoveryStalls: 0,
+  recoveryHasCheckpoint: false,
+  permanentReadFailure: false,
   recoveryConflicts: [],
   nextReadAt: null,
   readLease: null,
@@ -213,15 +213,22 @@ export function needsReaderUpgrade(doc: {
   fields?: Record<string, unknown>;
   recognitionVersion?: number | null;
   error?: string | null;
+  wrongDocumentKind?: boolean | null;
+  permanentReadFailure?: boolean | null;
 }) {
   if (
     (doc.kind !== "identity" && doc.kind !== "receipt") ||
-    (doc.recognitionVersion ?? 0) >= readerVersion(doc.kind)
+    (doc.recognitionVersion ?? 0) > readerVersion(doc.kind) ||
+    doc.permanentReadFailure ||
+    documentReadState(doc).wrongDocumentKind
   )
     return false;
   if (doc.status === "failed") {
     const error = documentErrorMessage(doc.error);
-    return error === readingInterrupted || error === documentUnreadable;
+    return (
+      (doc.recognitionVersion ?? 0) < readerVersion(doc.kind) &&
+      (error === readingInterrupted || error === documentUnreadable)
+    );
   }
   if (doc.status !== "done") return false;
   const fields = doc.fields || {};
@@ -241,6 +248,9 @@ export function uploadResult(doc: any, reused = false) {
     fields: doc.fields || {},
     ...documentReadState(doc),
     attempts: doc.attempts,
+    recoveryStage: doc.recoveryStage ?? 0,
+    recoveryHasCheckpoint: doc.recoveryHasCheckpoint === true,
+    nextReadAt: doc.nextReadAt ?? null,
     reused,
   };
 }
@@ -287,7 +297,12 @@ export async function recognitionConflict(
 export async function completeRecognition(
   doc: any,
   fields: Record<string, unknown>,
-  recovery?: { nextStage?: number; conflicts: string[] },
+  recovery?: {
+    nextStage?: number;
+    nextReadAt?: Date;
+    stalls?: number;
+    conflicts: string[];
+  },
 ) {
   const conflict = await recognitionConflict(doc, fields);
   const filter = {
@@ -300,12 +315,15 @@ export async function completeRecognition(
     fields,
     recognitionVersion: readerVersion(doc.kind),
     recoveryFailures: 0,
+    recoveryStalls: recovery?.stalls ?? 0,
+    recoveryHasCheckpoint: true,
+    permanentReadFailure: false,
+    wrongDocumentKind: false,
     recoveryConflicts: recovery?.conflicts ?? [],
   };
   const released = {
     readLease: 1,
     leaseUntil: 1,
-    nextReadAt: 1,
     recognitionKey: 1,
   };
   if (!conflict && recovery?.nextStage !== undefined) {
@@ -314,6 +332,7 @@ export async function completeRecognition(
         ...checkpoint,
         status: "queued",
         recoveryStage: recovery.nextStage,
+        nextReadAt: recovery.nextReadAt ?? new Date(),
       },
       $unset: { ...released, completedAt: 1, duplicate: 1, error: 1 },
     });
@@ -326,6 +345,10 @@ export async function completeRecognition(
       completedAt: new Date(),
       ...(conflict ? { error: conflict.message, duplicate: conflict } : {}),
     },
-    $unset: { ...released, ...(!conflict ? { error: 1, duplicate: 1 } : {}) },
+    $unset: {
+      ...released,
+      nextReadAt: 1,
+      ...(!conflict ? { error: 1, duplicate: 1 } : {}),
+    },
   });
 }

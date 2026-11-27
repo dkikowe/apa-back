@@ -121,6 +121,9 @@ const document = new Schema(
     wrongDocumentKind: Boolean,
     recoveryStage: Number,
     recoveryFailures: Number,
+    recoveryStalls: Number,
+    recoveryHasCheckpoint: Boolean,
+    permanentReadFailure: Boolean,
     recoveryConflicts: [String],
     nextReadAt: Date,
     readLease: String,
@@ -146,6 +149,7 @@ document.index({ uploadHash: 1 }, { unique: true, sparse: true });
 document.index({ recognitionKey: 1 }, { unique: true, sparse: true });
 document.index({ status: 1, createdAt: 1 });
 document.index({ status: 1, updatedAt: 1 });
+document.index({ status: 1, nextReadAt: 1, updatedAt: 1, _id: 1 });
 document.index({ hash: 1 });
 const audit = new Schema(
   {

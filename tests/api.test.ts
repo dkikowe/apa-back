@@ -281,7 +281,15 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       error: "Құжат оқылмады.",
     });
     const refreshed = await post(`/api/documents/${doc._id}/refresh`, {});
-    expect(refreshed.body.error).toBe("Құжат оқылмады.");
+    expect(refreshed.body).toMatchObject({
+      status: "queued",
+      recoveryHasCheckpoint: false,
+    });
+    // Simulate an older terminal worker failure for the manual-correction path below.
+    await Document.updateOne(
+      { _id: doc._id },
+      { $set: { status: "failed", error: doc.error } },
+    );
     const { uploadResult } = await import("../server/services/duplicates.js");
     expect(uploadResult(doc, true).error).toBe("Құжат оқылмады.");
     const created = await post("/api/participants", {
@@ -378,6 +386,36 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         participantId: { $ne: null },
       }),
     ).toBe(0);
+    await Document.updateMany(
+      { _id: { $in: [originalId._id, originalReceipt._id] } },
+      {
+        $set: {
+          status: "queued",
+          recoveryStage: 8,
+          recoveryHasCheckpoint: true,
+        },
+      },
+    );
+    expect((await patch(url, { notes: "unchanged document" })).status).toBe(
+      200,
+    );
+    expect((await patch(url, { iin: "000000000840" })).status).toBe(400);
+    expect(
+      (
+        await patch("/api/payments/" + pay.body._id, {
+          ...payload,
+          notes: "unchanged receipt",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await patch("/api/payments/" + pay.body._id, {
+          ...payload,
+          receiptNumber: "CHANGED-WHILE-READING",
+        })
+      ).status,
+    ).toBe(400);
     await Document.updateOne(
       { _id: originalId._id },
       { $set: { status: "failed" } },
@@ -1349,14 +1387,41 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     await Document.updateOne(
       { _id: doc._id },
-      { $set: { status: "done", attempts: 3 } },
+      { $set: { status: "done", attempts: 19 } },
     );
     expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
-      400,
+      200,
     );
+    for (const flags of [
+      { permanentReadFailure: true },
+      { wrongDocumentKind: true },
+    ]) {
+      await Document.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            status: "failed",
+            permanentReadFailure: false,
+            wrongDocumentKind: false,
+            ...flags,
+          },
+        },
+      );
+      expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
+        400,
+      );
+    }
     await Document.updateOne(
       { _id: doc._id },
-      { $set: { attempts: 1, ownerId: new mongoose.Types.ObjectId() } },
+      {
+        $set: {
+          status: "done",
+          permanentReadFailure: false,
+          wrongDocumentKind: false,
+          attempts: 1,
+          ownerId: new mongoose.Types.ObjectId(),
+        },
+      },
     );
     expect((await post(`/api/documents/${doc._id}/retry`, {})).status).toBe(
       400,
@@ -1901,6 +1966,10 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(first.status).toBe(201);
       const fields = {
         receiptNumber: "CANCEL-THEN-SAVE",
+        paymentTime: "08:15",
+        payerName: "Сынақ А.",
+        recipientName: "Сынақ Б.",
+        method: "Аударым",
         amount: 120000,
         paymentDate: "2026-11-26",
       };
@@ -1949,7 +2018,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       put.mockRestore();
     }
   });
-  it("refreshes an older attached partial identity only once even at the manual retry limit", async () => {
+  it("resumes partial attached identities atomically, including checkpoints left by an interrupted deployment", async () => {
     const { Admin, Document, Participant } =
       await import("../server/models.js");
     const { IDENTITY_RECOGNITION_VERSION: version } =
@@ -1963,7 +2032,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       fields: { firstName: "Сынақ" },
     });
     const url = `/api/documents/${doc._id}/refresh`;
-    expect((await post(url, {})).body.status).toBe("done");
+    expect((await post(url, {})).body.status).toBe("queued");
     const person = await Participant.create({
       firstName: "Сынақ",
       identityDocumentId: doc._id,
@@ -1984,7 +2053,11 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       );
       expect((await post(url, {})).body.status).toBe("failed");
       await Document.updateOne({ _id: doc._id }, { $set: { status: "done" } });
-      expect((await post(url, {})).body.status).toBe("done");
+      expect((await post(url, {})).body).toMatchObject({
+        status: "queued",
+        recoveryHasCheckpoint: false,
+        recoveryStage: 0,
+      });
       await Document.updateOne(
         { _id: doc._id },
         { $set: { ownerId: new mongoose.Types.ObjectId() } },
@@ -2029,6 +2102,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       await completeRecognition(doc, {
         ...fields,
         recipientName: "Оқылған алушы",
+        payerName: "Сынақ Т.",
+        paymentDate: "2026-10-15",
+        paymentTime: "12:30",
         method: "Аударым",
       });
       const read = await post(url, {});
@@ -2074,8 +2150,11 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     await completeRecognition(doc, { lastName: "Сынақ" });
     const updated = await Document.findById(doc._id);
-    expect(updated!.recognitionVersion).toBe(6);
-    expect((await resumeDraft(updated)).status).toBe("done");
+    expect(updated!.recognitionVersion).toBe(
+      (await import("../shared/document-recognition.js"))
+        .IDENTITY_RECOGNITION_VERSION,
+    );
+    expect((await resumeDraft(updated)).status).toBe("queued");
     expect(await Document.countDocuments({ _id: doc._id })).toBe(1);
   });
   it("recovers legacy drafts marked duplicate of another unsaved upload", async () => {
@@ -2126,6 +2205,54 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(put).not.toHaveBeenCalled();
     } finally {
       put.mockRestore();
+    }
+  });
+  it("restores missing draft storage from a matching re-upload and shares its new reading cycle", async () => {
+    const sharp = (await import("sharp")).default;
+    const { createHash } = await import("node:crypto");
+    const { Document, Admin } = await import("../server/models.js");
+    const { storage } = await import("../server/services/storage.js");
+    const { originalFileMissing } =
+      await import("../server/services/document-errors.js");
+    const put = vi.spyOn(storage, "put").mockResolvedValue();
+    const owner = await Admin.findOne({ username: "test-admin" });
+    const bytes = await sharp({
+      create: { width: 41, height: 29, channels: 3, background: "cyan" },
+    })
+      .png()
+      .toBuffer();
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const key = "receipt/missing-test.png";
+    const doc = await Document.create({
+      kind: "receipt",
+      key,
+      hash,
+      ownerId: owner!._id,
+      status: "failed",
+      permanentReadFailure: true,
+      error: originalFileMissing,
+    });
+    try {
+      const upload = () =>
+        agent
+          .post("/api/documents")
+          .set("x-csrf-token", csrf)
+          .field("kind", "receipt")
+          .attach("file", bytes, "restored.png");
+      expect((await upload()).body).toMatchObject({
+        id: String(doc._id),
+        reused: true,
+        status: "queued",
+        recoveryStage: 0,
+        recoveryHasCheckpoint: false,
+        permanentReadFailure: false,
+      });
+      expect(put).toHaveBeenCalledWith(key, bytes, "image/png");
+      expect((await upload()).body.status).toBe("queued");
+      expect(put).toHaveBeenCalledTimes(1);
+    } finally {
+      put.mockRestore();
+      await Document.deleteOne({ _id: doc._id });
     }
   });
   it("does not expose another administrator's unfinished document when uploading identical bytes", async () => {
@@ -2313,7 +2440,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(historical).toHaveLength(1);
       expect(historical[0]).toContain("Жойылған қатысушы");
       const identityStatus = await agent.get(staleIdentityUrl).expect(200);
-      expect(identityStatus.body.status).toBe("done");
+      expect(identityStatus.body.status).toBe("queued");
       expect(identityStatus.body.duplicate).toBeFalsy();
       expect(identityStatus.body.error).toBeFalsy();
       for (const status of [
@@ -2329,6 +2456,21 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         expect(status.body.error).not.toContain(marker);
         expect(status.body.hash).toBeUndefined();
       }
+      const { completeRecognition } =
+        await import("../server/services/duplicates.js");
+      const complete = {
+        iin,
+        lastName: "Тегі",
+        firstName: "Аты",
+        lastNameLatin: "TEGI",
+        firstNameLatin: "ATY",
+        birthDate: "1980-01-01",
+        documentNumber: "123456789",
+        issuedBy: "МВД РК",
+        issueDate: "2022-01-01",
+        expiryDate: "2032-01-01",
+      };
+      await completeRecognition(duplicateIdentity, complete);
       const replacement = await post("/api/participants", {
         ...participant,
         identityDocumentId: String(

@@ -1,11 +1,12 @@
 import { fork } from "node:child_process";
 import type { recognize } from "./ocr.js";
-import { WrongDocumentKindError } from "./ocr-policy.js";
+import { InvalidDocumentError, WrongDocumentKindError } from "./ocr-policy.js";
 
 type Arguments = Parameters<typeof recognize>;
 type Fields = Awaited<ReturnType<typeof recognize>>;
 type Result =
-  { fields: Fields; conflicts: string[] } | { error: "wrong-kind" | "failed" };
+  | { fields: Fields; conflicts: string[] }
+  | { error: "wrong-kind" | "invalid" | "failed" };
 
 // Native PDF rendering and a Tesseract worker can hang inside a single pass,
 // beyond the engine's between-pass deadline. Isolate this stage so it can be
@@ -35,7 +36,9 @@ export const isolatedRecognition: typeof recognize = (...args) =>
             ? new WrongDocumentKindError(
                 args[2] === "receipt" ? "receipt" : "identity",
               )
-            : new Error("OCR failed"),
+            : result.error === "invalid"
+              ? new InvalidDocumentError()
+              : new Error("OCR failed"),
         );
       } else {
         const conflicts = args[3]?.conflicts;
@@ -62,7 +65,16 @@ if (process.argv[2] === "--ocr-child" && process.send) {
     } catch (error) {
       result = {
         error:
-          error instanceof WrongDocumentKindError ? "wrong-kind" : "failed",
+          error instanceof WrongDocumentKindError
+            ? "wrong-kind"
+            : error instanceof InvalidDocumentError ||
+                (error instanceof Error &&
+                  (["InvalidPDFException", "PasswordException"].includes(
+                    error.name,
+                  ) ||
+                    error.message === "PDF_PAGE_LIMIT"))
+              ? "invalid"
+              : "failed",
       };
     }
     process.send!(result);

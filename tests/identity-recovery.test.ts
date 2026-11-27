@@ -494,3 +494,244 @@ describe("later OCR strategies", () => {
     ).toBeUndefined();
   });
 });
+
+describe("continued recovery from the original file", () => {
+  const printedReceipt = {
+    amount: 500000,
+    paymentDate: "2026-11-20",
+    paymentTime: "12:34",
+    receiptNumber: "TEST-500",
+    payerName: "TEST PERSON",
+    recipientName: "TEST ORGANIZATION",
+  };
+  const markedPage = () =>
+    sharp({
+      create: { width: 320, height: 120, channels: 3, background: "#ffffff" },
+    })
+      .composite([
+        {
+          input: {
+            create: {
+              width: 36,
+              height: 120,
+              channels: 3,
+              background: "#000000",
+            },
+          },
+          left: 242,
+          top: 0,
+        },
+      ])
+      .png()
+      .toBuffer();
+
+  it("uses the rotated frame for a labelled strip below the original image height", async () => {
+    const heading = "PAYMENT METHOD";
+    const lines = [
+      { text: heading, bbox: { x0: 12, y0: 1900, x1: 400, y1: 1922 } },
+    ];
+    let sawPrintedStrip = false;
+    engine.recognize.mockImplementation(async (input: Buffer) => {
+      const meta = await sharp(input).metadata();
+      if (meta.height! > meta.width!)
+        return {
+          data: { text: heading, blocks: [{ paragraphs: [{ lines }] }] },
+        };
+      const { channels } = await sharp(input).stats();
+      if (meta.width! > meta.height! * 6 && channels[0].mean < 5) {
+        sawPrintedStrip = true;
+        return response(["PAYMENT METHOD: TEST CARD"]);
+      }
+      return response([]);
+    });
+    const fields = await recognize(await markedPage(), "image/png", "receipt", {
+      previousFields: printedReceipt,
+      recoveryStage: 3,
+    });
+    expect(sawPrintedStrip).toBe(true);
+    expect(fields).toMatchObject({ ...printedReceipt, method: "TEST CARD" });
+  });
+  it("changes the actual pixels and geometry after earlier recovery stages", async () => {
+    const sample = await sharp(await markedPage())
+        .composite([
+          {
+            input: {
+              create: {
+                width: 40,
+                height: 20,
+                channels: 3,
+                background: "#208130",
+              },
+            },
+            left: 10,
+            top: 8,
+          },
+        ])
+        .png()
+        .toBuffer(),
+      frames: Buffer[] = [];
+    engine.recognize.mockImplementation(async (input: Buffer) => {
+      frames.push(input);
+      return response(["PAYMENT METHOD: TEST CARD"]);
+    });
+    for (const stage of [2, 3, 4, 5, 6]) {
+      expect(
+        await recognize(sample, "image/png", "receipt", {
+          recoveryStage: stage,
+          previousFields: printedReceipt,
+        }),
+      ).toMatchObject({ method: "TEST CARD" });
+    }
+    expect(frames).toHaveLength(5);
+    for (let i = 1; i < frames.length; i++)
+      expect(frames[i].equals(frames[i - 1])).toBe(false);
+    const shapes = await Promise.all(frames.map((f) => sharp(f).metadata()));
+    expect(shapes[1].height).toBeGreaterThan(shapes[1].width!);
+    const rotated = await sharp(frames[1]).stats();
+    expect(rotated.channels[1].mean).toBeGreaterThan(rotated.channels[0].mean);
+    expect(shapes[3].height).toBeLessThan(shapes[0].height!);
+    expect(shapes[4].width).not.toBe(shapes[1].width);
+  });
+  it("identifies a broken file and a completely blank original while preserving faint print", async () => {
+    const { InvalidDocumentError } =
+      await import("../server/services/ocr-policy.js");
+    const blank = await sharp({
+      create: { width: 210, height: 320, channels: 3, background: "white" },
+    })
+      .png()
+      .toBuffer();
+    for (const [file, mime] of [
+      [blank, "image/png"],
+      [Buffer.from("%PDF-1.7\nbroken"), "application/pdf"],
+      [Buffer.from("not an image"), "image/png"],
+    ] as const)
+      await expect(recognize(file, mime, "identity")).rejects.toBeInstanceOf(
+        InvalidDocumentError,
+      );
+    expect(engine.recognize).not.toHaveBeenCalled();
+    const faint = await sharp(blank)
+      .composite([
+        {
+          input: {
+            create: {
+              width: 20,
+              height: 10,
+              channels: 3,
+              background: "#f4f4f4",
+            },
+          },
+          left: 10,
+          top: 10,
+        },
+      ])
+      .png()
+      .toBuffer();
+    engine.recognize.mockResolvedValue(response(["PAYMENT METHOD: TEST CARD"]));
+    expect(
+      await recognize(faint, "image/png", "receipt", {
+        previousFields: printedReceipt,
+        recoveryStage: 4,
+      }),
+    ).toMatchObject({ method: "TEST CARD" });
+  });
+});
+
+describe("identifier disputes in complete digital originals", () => {
+  const receiptLines = [
+    "TOTAL: 2000 KZT",
+    "DATE: 14.11.2026 18:45",
+    "RECIPIENT: EXAMPLE",
+    "SENDER: TEST PERSON",
+    "RECEIPT NUMBER: TX-1234",
+    "PAYMENT METHOD: TEST CARD",
+  ];
+  it.each([
+    [
+      "identity",
+      "iin",
+      "000123456789",
+      [...core, ...details],
+      "IIN: 000123456789",
+      "IIN: 000123456788",
+    ],
+    [
+      "receipt",
+      "receiptNumber",
+      "TX-1234",
+      receiptLines,
+      "RECEIPT NUMBER: TX-1234",
+      "RECEIPT NUMBER: TX-1235",
+    ],
+  ] as const)(
+    "unlocks a %s number only with two matching labelled pixel readings",
+    async (kind, key, value, source, heading, other) => {
+      const pdf = textPdf([...source]),
+        conflicts: string[] = [key];
+      engine.recognize
+        .mockResolvedValueOnce(response([heading]))
+        .mockResolvedValueOnce(response([other]));
+      expect(
+        (
+          await recognize(pdf, "application/pdf", kind, {
+            conflicts,
+            recoveryStage: 4,
+          })
+        )[key],
+      ).toBeUndefined();
+      expect(conflicts).toEqual([key]);
+      engine.recognize.mockResolvedValue(response([heading]));
+      expect(
+        (
+          await recognize(pdf, "application/pdf", kind, {
+            conflicts,
+            recoveryStage: 5,
+          })
+        )[key],
+      ).toBe(value);
+      expect(conflicts).toEqual([]);
+      for (const doc of [
+        textPdf([...source], [...source]),
+        textPdf([...source, other]),
+      ]) {
+        const disputed: string[] = [key];
+        expect(
+          (
+            await recognize(doc, "application/pdf", kind, {
+              conflicts: disputed,
+              recoveryStage: 6,
+            })
+          )[key],
+        ).toBeUndefined();
+        expect(disputed).toEqual([key]);
+      }
+    },
+  );
+});
+
+it("scales a physically oversized PDF page into the safe raster budget", async () => {
+  const file = textPdf(["SURNAME: TEST"]);
+  // Equal-length replacement preserves PDF cross-reference offsets.
+  const oversized = Buffer.from(
+    file.toString("latin1").replace("[0 0 850 1000]", "[0 0 999 9999]"),
+    "latin1",
+  );
+  const renders: number[][] = [];
+  engine.recognize.mockImplementation(async (input: Buffer) => {
+    const { width, height } = await sharp(input).metadata();
+    renders.push([width, height]);
+    return response([...core, ...details]);
+  });
+  for (const stage of [0, 1])
+    expect(
+      (
+        await recognize(oversized, "application/pdf", "identity", {
+          recoveryStage: stage,
+        })
+      ).documentNumber,
+    ).toBe("123456789");
+  expect(renders).toHaveLength(2);
+  for (const [w, h] of renders) {
+    expect(w * h).toBeLessThanOrEqual(25_000_000);
+    expect(Math.max(w, h)).toBeLessThanOrEqual(8192);
+  }
+});

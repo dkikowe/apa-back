@@ -1,5 +1,5 @@
-import { OCR_LAST_ROUND, WrongDocumentKindError } from "./ocr-policy.js";
-export { OCR_LAST_ROUND, WrongDocumentKindError } from "./ocr-policy.js";
+import { InvalidDocumentError, WrongDocumentKindError } from "./ocr-policy.js";
+export { WrongDocumentKindError } from "./ocr-policy.js";
 import { createWorker, PSM } from "tesseract.js";
 import { createCanvas, DOMMatrix, ImageData, Path2D } from "@napi-rs/canvas";
 import sharp from "sharp";
@@ -179,42 +179,165 @@ function recoveryPasses(image: Buffer, stage: number): RecoveryPass[] {
       })),
     ];
   }
-  // The earlier reader covered landscape rotation but not an upside-down scan.
-  // Individual color channels can separate blue/green security printing from ink.
-  return [
-    {
+  if (stage === 2) {
+    // The earlier reader covered landscape rotation but not an upside-down scan.
+    // Individual color channels can separate blue/green security printing from ink.
+    return [
+      {
+        render: () =>
+          sharp(image)
+            .toColourspace("srgb")
+            .extractChannel("red")
+            .normalize()
+            .png()
+            .toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+        aligned: true,
+      },
+      {
+        render: () =>
+          sharp(image)
+            .toColourspace("srgb")
+            .extractChannel("blue")
+            .normalize()
+            .png()
+            .toBuffer(),
+        mode: PSM.AUTO,
+        aligned: true,
+      },
+      {
+        render: () => gray().rotate(180).png().toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+        aligned: false,
+      },
+      {
+        render: () => gray().rotate(180).sharpen().png().toBuffer(),
+        mode: PSM.AUTO,
+        aligned: false,
+      },
+    ];
+  }
+  // Revisit small print by changing orientation, lighting correction and
+  // segmentation independently. Only compare PDF anchors in their own frame.
+  const group = (stage - 3) % 3;
+  const cycle = Math.floor((stage - 3) / 3);
+  const variant = cycle % 4;
+  if (group === 0) {
+    const angle = [0, 2, -2, 4][variant];
+    return [90, 270, 180, 0].map((rotation, i) => ({
       render: () =>
+        // Bank receipts can print a white success title on a coloured panel.
+        // Preserve colour for the layout engine when correcting orientation.
         sharp(image)
-          .toColourspace("srgb")
-          .extractChannel("red")
-          .normalize()
+          .flatten({ background: "white" })
+          .rotate(rotation + angle, { background: "white" })
           .png()
           .toBuffer(),
-      mode: PSM.SPARSE_TEXT,
-      aligned: true,
+      mode: (i + cycle) % 2 ? PSM.SINGLE_BLOCK : PSM.SPARSE_TEXT,
+      aligned: rotation === 0 && angle === 0,
+    }));
+  }
+  if (group === 1) {
+    const tile = [64, 48, 96, 32][variant];
+    return [
+      {
+        render: () =>
+          gray()
+            .clahe({ width: tile, height: tile, maxSlope: 4 })
+            .sharpen()
+            .png()
+            .toBuffer(),
+        mode: PSM.SPARSE_TEXT,
+        aligned: true,
+      },
+      {
+        // Light text on a dark screenshot or oversaturated security background.
+        render: () =>
+          gray().negate({ alpha: false }).normalize().png().toBuffer(),
+        mode: PSM.AUTO,
+        aligned: true,
+      },
+      {
+        render: () =>
+          gray()
+            .linear(1.4, -[48, 36, 24, 60][variant])
+            .sharpen()
+            .png()
+            .toBuffer(),
+        mode: PSM.SINGLE_BLOCK,
+        aligned: true,
+      },
+    ];
+  }
+  // Overlapping strips preserve a heading and its value together while
+  // making small characters readable without enlarging the entire page.
+  const offsets = variant % 2 ? [1, 0.5, 0] : [0, 0.5, 1];
+  return offsets.map((offset) => ({
+    render: async () => {
+      const { width, height } = await sharp(image).metadata();
+      const stripHeight = Math.max(
+        1,
+        Math.ceil(height * (0.44 + 0.03 * variant)),
+      );
+      return gray()
+        .extract({
+          left: 0,
+          top: Math.round((height - stripHeight) * offset),
+          width,
+          height: stripHeight,
+        })
+        .resize({ width: 2800, height: 1800, fit: "inside" })
+        .sharpen()
+        .png()
+        .toBuffer();
     },
-    {
-      render: () =>
-        sharp(image)
-          .toColourspace("srgb")
-          .extractChannel("blue")
-          .normalize()
-          .png()
-          .toBuffer(),
-      mode: PSM.AUTO,
-      aligned: true,
-    },
-    {
-      render: () => gray().rotate(180).png().toBuffer(),
-      mode: PSM.SPARSE_TEXT,
-      aligned: false,
-    },
-    {
-      render: () => gray().rotate(180).sharpen().png().toBuffer(),
-      mode: PSM.AUTO,
-      aligned: false,
-    },
-  ];
+    mode: cycle % 2 ? PSM.SPARSE_TEXT : PSM.AUTO,
+    aligned: false,
+  }));
+}
+
+// Only a perfectly uniform white or black sheet positively proves the absence
+// of print. Faint content and incomplete sides remain eligible for recovery.
+async function emptySheet(image: Buffer) {
+  const input = sharp(image, { limitInputPixels: 25_000_000 });
+  const flattened = (await input.metadata()).hasAlpha
+    ? sharp(await input.flatten({ background: "white" }).png().toBuffer())
+    : input;
+  const { channels } = await flattened.stats();
+  const colour = channels.slice(0, 3);
+  return colour.every((c) => c.min === 255) || colour.every((c) => c.max === 0);
+}
+
+// Dispute resolution is stricter than field extraction. Accept one explicit
+// heading only and read the number at that heading, never an unrelated code.
+function singleLabelledNumber(text: string, kind: string) {
+  const lines = text
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const idHeading = /^(?:ЖСН|ИИН|IIN)(?=[:/\s]|$)/iu;
+  const headings = lines.flatMap((line, index) =>
+    (
+      kind === "identity"
+        ? idHeading.test(line)
+        : receiptHeadingFields(line).includes("receiptNumber")
+    )
+      ? [index]
+      : [],
+  );
+  if (headings.length !== 1) return;
+  const index = headings[0];
+  const block = lines.slice(index, index + 2).join("\n");
+  if (kind === "identity") {
+    const printed = identityIinCandidates(block);
+    const all = identityIinCandidates(text);
+    if (printed.length === 1 && all.length === 1 && all[0] === printed[0])
+      return printed[0];
+    return;
+  }
+  const number = extractFields(block, "receipt").receiptNumber;
+  return typeof number === "string" && /\d/.test(number) ? number : undefined;
 }
 
 function qrPrefixMisread(value: string, qr: string) {
@@ -237,6 +360,8 @@ export async function recognize(
     for (const key of invalidIdentityFields(previous)) delete previous[key];
   }
   const conflicts = options.conflicts ?? [];
+  const numberKey = kind === "identity" ? "iin" : "receiptNumber";
+  let resolvedNumber: string | undefined;
   const receiptNumbers = new Set<string>();
   function observeReceiptNumber(value: unknown) {
     if (typeof value === "string" && value.trim())
@@ -253,7 +378,7 @@ export async function recognize(
     worker ??= await createWorker(
       (
         process.env.OCR_LANGUAGES ||
-        (stage === OCR_LAST_ROUND ? "eng+rus+kaz" : "kaz+rus+eng")
+        (stage % 3 === 2 ? "eng+rus+kaz" : "kaz+rus+eng")
       ).split("+"),
       1,
       {
@@ -268,7 +393,7 @@ export async function recognize(
       // Sparse mode keeps transfer label/value pairs in reading order instead
       // of concatenating the entire left column before the right column.
       tessedit_pageseg_mode: mode,
-      ...(stage === 1
+      ...(stage === 1 || (stage >= 3 && stage % 3 === 1)
         ? { thresholding_method: "2", user_defined_dpi: "300" }
         : {}),
     });
@@ -381,7 +506,9 @@ export async function recognize(
       }),
     );
     let checkedRecipient = false;
-    let bestLines = positioned;
+    let bestBands = receiptBands(positioned, height);
+    let bandImage = image;
+    let bandWidth = width;
     let read = false;
     for (let i = 0; i < queue.length; i++) {
       if (
@@ -492,12 +619,17 @@ export async function recognize(
                 found.recipientName === fields.recipientName))
           )
             fields[key] = value;
-        if (
-          pass.collectRows &&
-          receiptBands(lines, height).length >
-            receiptBands(bestLines, height).length
-        )
-          bestLines = lines;
+        if (pass.collectRows && lines.length) {
+          // OCR boxes belong to the actual buffer Tesseract saw. A rotated
+          // page or enlarged strip has a different origin and dimensions.
+          const frame = await sharp(rendered).metadata();
+          const bands = receiptBands(lines, frame.height);
+          if (bands.length > bestBands.length) {
+            bestBands = bands;
+            bandImage = rendered;
+            bandWidth = frame.width;
+          }
+        }
       } catch (error) {
         if (error instanceof WrongDocumentKindError) throw error;
         await worker?.terminate().catch(() => {});
@@ -512,7 +644,7 @@ export async function recognize(
         // Deduplicate by missing field to bound work on repeated PDF headings.
         const targeted: Pass[] = [];
         const seen = new Set<string>();
-        for (const band of receiptBands(bestLines, height)) {
+        for (const band of bestBands) {
           const keys = band.keys.filter(
             (key) => fields[key] === undefined && !seen.has(key),
           );
@@ -523,15 +655,17 @@ export async function recognize(
               mode,
               keys,
               render: () => {
-                const strip = gray()
+                const strip = sharp(bandImage)
+                  .grayscale()
+                  .normalize()
                   .extract({
                     left: 0,
                     top: band.top,
-                    width,
+                    width: bandWidth,
                     height: band.height,
                   })
                   .resize({
-                    width: Math.min(3000, width * 2),
+                    width: Math.min(3000, bandWidth * 2),
                     height: 1600,
                     fit: "inside",
                   });
@@ -678,10 +812,18 @@ export async function recognize(
       const pdf = await getDocument({
         data: new Uint8Array(buffer),
         useSystemFonts: true,
-      }).promise;
+      }).promise.catch((error: unknown) => {
+        if (
+          error instanceof Error &&
+          /^(InvalidPDFException|PasswordException)$/.test(error.name)
+        )
+          throw new InvalidDocumentError();
+        throw error;
+      });
       try {
         let identityPageInReceipt = false;
-        if (pdf.numPages > 10) throw new Error("PDF_PAGE_LIMIT");
+        let blankPages = 0;
+        if (pdf.numPages > 10) throw new InvalidDocumentError();
         for (let n = 1; n <= pdf.numPages; n++) {
           const page = await pdf.getPage(n);
           const content = await page.getTextContent();
@@ -734,26 +876,38 @@ export async function recognize(
               kind === "identity" ? "identity" : "receipt",
               layerFields,
             ).length === 0;
-          if (layer.replace(/\s/g, "").length > 40 && layerComplete) {
+          const completeLayer =
+            layer.replace(/\s/g, "").length > 40 && layerComplete;
+          const candidate =
+            pdf.numPages === 1 && completeLayer && conflicts.includes(numberKey)
+              ? singleLabelledNumber(layer, kind)
+              : undefined;
+          if (completeLayer && !candidate) {
             text += layer + "\n";
             Object.assign(nativeFields, layerFields);
             continue;
           }
           const baseScale = kind === "identity" ? 3 : 2;
           const base = page.getViewport({ scale: baseScale });
-          // Preserve the original input limit. Recovery increases raster detail
-          // only while there is headroom under the same pixel budget.
-          const recoveryScale = Math.min(
-            stage === 1 ? 1.6 : 1.2,
-            Math.sqrt(12_000_000 / (base.width * base.height)),
+          // Oversized paper coordinates need a smaller raster, even on the
+          // first pass. Keep an explicit margin for rounding canvas edges.
+          const extraDetail = stage
+            ? Math.max(
+                1,
+                Math.min(
+                  stage === 1 ? 1.6 : 1.2,
+                  Math.sqrt(12_000_000 / (base.width * base.height)),
+                ),
+              )
+            : 1;
+          const ratio = Math.min(
+            extraDetail,
+            8192 / Math.max(base.width, base.height),
+            Math.sqrt(24_000_000 / (base.width * base.height)),
           );
-          const viewport = stage
-            ? page.getViewport({
-                scale: baseScale * Math.max(1, recoveryScale),
-              })
-            : base;
-          if (viewport.width * viewport.height > 25000000)
-            throw new Error("PDF_PAGE_LIMIT");
+          if (!Number.isFinite(ratio) || ratio <= 0)
+            throw new InvalidDocumentError();
+          const viewport = page.getViewport({ scale: baseScale * ratio });
           const canvas = createCanvas(
             Math.ceil(viewport.width),
             Math.ceil(viewport.height),
@@ -764,6 +918,38 @@ export async function recognize(
             viewport,
           }).promise;
           const rendered = canvas.toBuffer("image/png");
+          if (candidate && candidate === layerFields[numberKey]) {
+            // A complete digital original and two visual reads must independently
+            // agree before overriding any earlier identifier disagreement.
+            if (
+              singleLabelledNumber(
+                (await scan(rendered, PSM.SPARSE_TEXT, false)).text,
+                kind,
+              ) === candidate &&
+              Date.now() < recoveryDeadline
+            ) {
+              const enhanced = await sharp(rendered)
+                .grayscale()
+                .normalize()
+                .sharpen()
+                .png()
+                .toBuffer();
+              if (
+                singleLabelledNumber(
+                  (await scan(enhanced, PSM.AUTO, false)).text,
+                  kind,
+                ) === candidate
+              )
+                resolvedNumber = candidate;
+            }
+            text += layer + "\n";
+            Object.assign(nativeFields, layerFields);
+            continue;
+          }
+          if (!streamText.trim() && (await emptySheet(rendered))) {
+            blankPages++;
+            continue;
+          }
           const values: PositionedText[] = content.items.flatMap((item) => {
             if (
               !("str" in item) ||
@@ -822,6 +1008,7 @@ export async function recognize(
             Object.assign(nativeFields, scanned.fields);
           }
         }
+        if (blankPages === pdf.numPages) throw new InvalidDocumentError();
         if (
           identityPageInReceipt &&
           !(
@@ -844,10 +1031,27 @@ export async function recognize(
             ? { width: 3200, height: 3800, fit: "inside" }
             : { width: 2400, height: 3200, fit: "inside" },
         );
-      if (kind === "receipt" && !stage) prepared.grayscale().normalize();
-      const image = await prepared.png().toBuffer();
+
+      const image = await prepared
+        .png()
+        .toBuffer()
+        .catch((error: unknown) => {
+          if (
+            error instanceof Error &&
+            /unsupported image format|corrupt|pixel limit|invalid.*header|premature end|unexpected end|end of stream|incomplete (?:image|buffer)/i.test(
+              error.message,
+            )
+          )
+            throw new InvalidDocumentError();
+          throw error;
+        });
+      if ((await emptySheet(image)) && (await emptySheet(buffer)))
+        throw new InvalidDocumentError();
       if (kind === "receipt") {
-        const scanned = await scanReceipt(image);
+        const original = stage
+          ? image
+          : await sharp(image).grayscale().normalize().png().toBuffer();
+        const scanned = await scanReceipt(original);
         text = scanned.text;
         Object.assign(nativeFields, scanned.fields);
       } else {
@@ -881,6 +1085,11 @@ export async function recognize(
       if (receiptNumbers.size > 1 && !conflicts.includes("receiptNumber"))
         conflicts.push("receiptNumber");
       if (conflicts.includes("receiptNumber")) delete result.receiptNumber;
+    }
+    if (resolvedNumber) {
+      result[numberKey] = resolvedNumber;
+      const index = conflicts.indexOf(numberKey);
+      if (index >= 0) conflicts.splice(index, 1);
     }
     return result;
   } finally {

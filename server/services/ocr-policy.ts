@@ -12,4 +12,10 @@ export class WrongDocumentKindError extends Error {
     this.name = "WrongDocumentKindError";
   }
 }
-export const OCR_LAST_ROUND = 2;
+
+export class InvalidDocumentError extends Error {
+  constructor() {
+    super("Бұл файлды оқу мүмкін емес. Құжаттың басқа көшірмесін жүктеңіз.");
+    this.name = "InvalidDocumentError";
+  }
+}

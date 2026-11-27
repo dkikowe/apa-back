@@ -53,7 +53,10 @@ import {
   readerVersion,
   uploadResult,
 } from "./services/duplicates.js";
-import { documentReadState } from "./services/document-errors.js";
+import {
+  documentReadState,
+  originalFileMissing,
+} from "./services/document-errors.js";
 import { extractReceiptText } from "./services/document-fields.js";
 import {
   previewImport,
@@ -84,8 +87,9 @@ function checkFailedAttachment(
   previousId?: string,
 ) {
   if (doc.status !== "failed" || nextId === previousId) return;
-  const { wrongDocumentKind, error } = documentReadState(doc);
-  if (wrongDocumentKind || previousId)
+  const { wrongDocumentKind, permanentReadFailure, error } =
+    documentReadState(doc);
+  if (wrongDocumentKind || permanentReadFailure || previousId)
     throw new HttpError(400, error || "Құжат оқылмады. Файлды қайта таңдаңыз.");
 }
 async function checkDocumentDuplicate(
@@ -95,21 +99,39 @@ async function checkDocumentDuplicate(
   if (doc.status !== "duplicate") return;
   const duplicate = await currentDocumentDuplicate(doc, session);
   if (duplicate) throw new DuplicateError(duplicate);
+  if (needsReaderUpgrade({ ...doc.toObject(), status: "done" }))
+    throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
   await Document.updateOne(
     { _id: doc._id, status: "duplicate" },
     { $set: { status: "done" }, $unset: { duplicate: 1, error: 1 } },
     { session },
   );
 }
+const documentStatusFields =
+  "kind status fields error wrongDocumentKind permanentReadFailure duplicate participantId mime originalName size attempts recognitionVersion recoveryStage recoveryHasCheckpoint nextReadAt hash";
+
 async function publicDocumentStatus({ hash, ...doc }: any) {
   if (doc.status === "duplicate") {
     const duplicate = await currentDocumentDuplicate({ ...doc, hash });
-    doc = {
-      ...doc,
-      duplicate,
-      status: duplicate ? "duplicate" : "done",
-      error: duplicate?.message,
-    };
+    if (!duplicate) {
+      // A previously conflicting record can be deleted while the form is open.
+      // Resume any missing fields before the released upload can be attached.
+      const released = { ...doc, status: "done", error: null };
+      const update = needsReaderUpgrade(released)
+        ? { ...newReadCycle, recognitionVersion: readerVersion(doc.kind) }
+        : { status: "done" };
+      await Document.updateOne(
+        { _id: doc._id, status: "duplicate" },
+        { $set: update, $unset: { duplicate: 1, error: 1, recognitionKey: 1 } },
+      );
+      const current = await Document.findById(doc._id)
+        .select(documentStatusFields)
+        .lean();
+      if (!current) throw new HttpError(404, "Құжат табылмады.");
+      const { hash: _hash, ...result } = current;
+      return { ...result, ...documentReadState(result) };
+    }
+    doc = { ...doc, duplicate, error: duplicate.message };
   }
   return { ...doc, ...documentReadState(doc) };
 }
@@ -451,7 +473,11 @@ export function createApp() {
           before.identityDocumentId?.toString(),
         );
         await checkDocumentDuplicate(doc, s);
-        if (["queued", "processing"].includes(doc.status!))
+        if (
+          ["queued", "processing"].includes(doc.status!) &&
+          (String(before.identityDocumentId) !== data.identityDocumentId ||
+            before.iin !== data.iin)
+        )
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
         await Document.updateOne(
           { _id: doc._id },
@@ -649,12 +675,12 @@ export function createApp() {
           before?.receiptDocumentId?.toString(),
         );
         await checkDocumentDuplicate(doc, s);
-        if (["queued", "processing"].includes(doc.status!))
-          throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
         const sameSources =
           before?.receiptDocumentId?.toString() === receiptDocumentId &&
-          before?.receiptText === data.receiptText &&
+          (before?.receiptText || "") === (data.receiptText || "") &&
           receiptKey(before?.receiptNumber) === receiptKey(data.receiptNumber);
+        if (["queued", "processing"].includes(doc.status!) && !sameSources)
+          throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
         if (data.receiptText && !sameSources) {
           let textNumber: string;
           try {
@@ -800,11 +826,31 @@ export function createApp() {
       )
         throw new HttpError(400, "Тек PDF, JPG және PNG файлдары қабылданады.");
       if (type.mime.startsWith("image/"))
-        await sharp(req.file.buffer, { limitInputPixels: 25000000 }).metadata();
+        await sharp(req.file.buffer, { limitInputPixels: 25000000 })
+          .metadata()
+          .catch(() => {
+            throw new HttpError(
+              400,
+              "Суретті ашу мүмкін емес. Басқа көшірмесін жүктеңіз.",
+            );
+          });
       else {
         const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
-        const pdf = await getDocument({ data: new Uint8Array(req.file.buffer) })
-          .promise;
+        const pdf = await getDocument({
+          data: new Uint8Array(req.file.buffer),
+        }).promise.catch((error: unknown) => {
+          if (error instanceof Error && error.name === "PasswordException")
+            throw new HttpError(
+              400,
+              "PDF құпиясөзбен қорғалған. Ашық көшірмесін жүктеңіз.",
+            );
+          if (error instanceof Error && error.name === "InvalidPDFException")
+            throw new HttpError(
+              400,
+              "PDF ашылмады. Құжаттың басқа көшірмесін жүктеңіз.",
+            );
+          throw error;
+        });
         try {
           if (pdf.numPages > 10)
             throw new HttpError(400, "PDF 10 беттен аспауы керек.");
@@ -820,11 +866,45 @@ export function createApp() {
         const conflict = await savedDocumentConflict(doc);
         if (conflict) throw new DuplicateError(conflict);
       }
+      async function resumeUpload(doc: (typeof previous)[number]) {
+        const draft = await resumeDraft(doc);
+        if (
+          draft.status !== "failed" ||
+          draft.error !== originalFileMissing ||
+          !draft.key ||
+          draft.participantId
+        )
+          return draft;
+        // This owner has just supplied the exact original bytes again.
+        await storage.put(draft.key, req.file!.buffer, type!.mime);
+        return (
+          (await Document.findOneAndUpdate(
+            {
+              _id: draft._id,
+              ownerId: req.session.adminId,
+              hash,
+              participantId: null,
+              status: "failed",
+              error: originalFileMissing,
+            },
+            {
+              $set: {
+                ...newReadCycle,
+                recognitionVersion: readerVersion(kind),
+              },
+              $unset: { error: 1, completedAt: 1 },
+            },
+            { new: true },
+          ).lean()) ||
+          (await Document.findById(draft._id).lean()) ||
+          draft
+        );
+      }
       const draft = previous.find(
         (doc) => String(doc.ownerId) === req.session.adminId,
       );
       if (draft) {
-        res.json(uploadResult(await resumeDraft(draft), true));
+        res.json(uploadResult(await resumeUpload(draft), true));
         return;
       }
       const key = [
@@ -856,7 +936,7 @@ export function createApp() {
             ownerId: req.session.adminId,
           }).lean();
           if (original) {
-            res.json(uploadResult(await resumeDraft(original), true));
+            res.json(uploadResult(await resumeUpload(original), true));
             return;
           }
         }
@@ -864,8 +944,6 @@ export function createApp() {
       }
     },
   );
-  const documentStatusFields =
-    "kind status fields error wrongDocumentKind duplicate participantId mime originalName size attempts recognitionVersion hash";
   app.get("/api/documents/:id", async (req, res) => {
     const d = await Document.findOne({
       _id: checkId(req.params.id),
@@ -883,15 +961,7 @@ export function createApp() {
     let doc = await current();
     if (!doc) throw new HttpError(404, "Құжат табылмады.");
     const version = readerVersion(doc.kind);
-    if (
-      needsReaderUpgrade(doc) &&
-      (doc.kind === "identity"
-        ? await Participant.exists({
-            identityDocumentId: doc._id,
-            deletedAt: null,
-          })
-        : await Payment.exists({ receiptDocumentId: doc._id }))
-    ) {
+    if (needsReaderUpgrade(doc)) {
       // Claim the current reader version when queueing. Concurrent editors,
       // including after a failed scan, share this attempt.
       doc =
@@ -906,7 +976,7 @@ export function createApp() {
               ...newReadCycle,
               recognitionVersion: version,
             },
-            $unset: { error: 1 },
+            $unset: { error: 1, completedAt: 1 },
           },
           { new: true },
         )
@@ -917,14 +987,26 @@ export function createApp() {
     res.json(await publicDocumentStatus(doc));
   });
   app.post("/api/documents/:id/retry", async (req, res) => {
+    const owned = { _id: checkId(req.params.id), ownerId: req.session.adminId };
+    const current = await Document.findOne(owned)
+      .select(documentStatusFields)
+      .lean();
+    if (
+      !current ||
+      !["failed", "done"].includes(current.status ?? "") ||
+      current.permanentReadFailure ||
+      documentReadState(current).wrongDocumentKind
+    )
+      throw new HttpError(400, "Қайта оқу мүмкін емес.");
     const doc = await Document.findOneAndUpdate(
+      { ...owned, status: current.status },
       {
-        _id: checkId(req.params.id),
-        ownerId: req.session.adminId,
-        status: { $in: ["failed", "done"] },
-        attempts: { $lt: 3 },
+        $set: {
+          ...newReadCycle,
+          recognitionVersion: readerVersion(current.kind),
+        },
+        $unset: { error: 1, completedAt: 1 },
       },
-      { $set: { ...newReadCycle, error: null } },
       { new: true },
     );
     if (!doc) throw new HttpError(400, "Қайта оқу мүмкін емес.");

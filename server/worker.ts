@@ -15,11 +15,13 @@ process.on("SIGINT", () => {
   stopped = true;
 });
 console.info("OCR worker ready (local processing)");
+let claims = 0;
 while (!stopped) {
   try {
     await reclaimInterruptedRead();
-    const job = await claimRead();
+    const job = await claimRead(new Date(), claims % 4 === 3);
     if (job) {
+      claims++;
       await processRead(job);
       continue;
     }

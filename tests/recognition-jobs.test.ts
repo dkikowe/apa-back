@@ -9,7 +9,10 @@ import {
 } from "../server/services/recognition-jobs.js";
 import { resumeDraft, readerVersion } from "../server/services/duplicates.js";
 import { documentUnreadable } from "../server/services/document-errors.js";
-import { WrongDocumentKindError } from "../server/services/ocr.js";
+import {
+  WrongDocumentKindError,
+  InvalidDocumentError,
+} from "../server/services/ocr-policy.js";
 
 let mongo: MongoMemoryServer;
 beforeAll(async () => {
@@ -67,26 +70,108 @@ it("checkpoints partial reads, yields to a waiting job, and stops immediately on
   });
   expect(await claimRead()).toBeNull();
 });
-it("bounds fruitless refinements while keeping ambiguous identifiers withheld on subsequent rounds", async () => {
+it.each(["identity", "receipt"] as const)(
+  "keeps %s checkpoints beyond the fast rounds, backs off on stalls, and accelerates on verified progress",
+  async (kind) => {
+    const doc = await Document.create({ ...fixture, kind });
+    const complete: Record<string, string | number> =
+      kind === "receipt"
+        ? receipt
+        : {
+            firstName: "Үлгі",
+            lastName: "Сынақ",
+            firstNameLatin: "ULGI",
+            lastNameLatin: "SYNAQ",
+            birthDate: "1990-01-01",
+            iin: "900101000011",
+            issuedBy: "ҚР ІШКІ ІСТЕР МИНИСТРЛІГІ",
+            documentNumber: "123456789",
+            issueDate: "2020-01-01",
+            expiryDate: "2030-01-01",
+          };
+    const late = kind === "receipt" ? "recipientName" : "issuedBy";
+    const last = kind === "receipt" ? "method" : "documentNumber";
+    const initial = { ...complete };
+    delete initial[late];
+    delete initial[last];
+    let due = new Date();
+    for (let stage = 0; stage <= 12; stage++) {
+      const job = (await claimRead(due))!;
+      expect(String(job._id)).toBe(String(doc._id));
+      const before = Date.now();
+      await processRead(job, load, async (_b, _m, _k, options) => {
+        expect(options?.recoveryStage).toBe(stage);
+        if (stage > 0)
+          expect(options?.previousFields).toEqual(
+            stage === 12 ? { ...initial, [late]: complete[late] } : initial,
+          );
+        if (stage === 12) return complete;
+        if (stage === 11) return { ...initial, [late]: complete[late] };
+        return initial;
+      });
+      const saved = (await Document.findById(doc._id).lean())!;
+      expect(saved.attempts).toBe(1);
+      if (stage === 12) {
+        expect(saved).toMatchObject({ status: "done", fields: complete });
+        expect(saved.nextReadAt).toBeUndefined();
+      } else {
+        expect(saved).toMatchObject({
+          status: "queued",
+          recoveryStage: stage + 1,
+        });
+        due = saved.nextReadAt!;
+        if (stage >= 4 && stage < 11) {
+          expect(+due - before).toBeGreaterThanOrEqual(10_000);
+          expect(await claimRead(new Date(+due - 1))).toBeNull();
+          if (stage === 10)
+            expect(+due - before).toBeGreaterThanOrEqual(86_400_000);
+        } else {
+          expect(+due).toBeLessThanOrEqual(Date.now());
+        }
+      }
+    }
+    expect(await claimRead()).toBeNull();
+  },
+);
+
+it("keeps an ambiguous identifier withheld even while an unreadable source remains queued", async () => {
   const doc = await Document.create({ ...fixture, kind: "identity" });
-  for (let stage = 0; stage < 3; stage++) {
+  let due = new Date();
+  for (let stage = 0; stage < 7; stage++) {
     await processRead(
-      (await claimRead())!,
+      (await claimRead(due))!,
       load,
       async (_b, _m, _k, options) => {
-        expect(options?.recoveryStage).toBe(stage);
         if (!stage) options?.conflicts?.push("iin");
         else expect(options?.conflicts).toEqual(["iin"]);
         return { firstName: "Үлгі" };
       },
     );
+    const saved = (await Document.findById(doc._id).lean())!;
+    expect(saved).toMatchObject({
+      status: "queued",
+      fields: { firstName: "Үлгі" },
+      recoveryConflicts: ["iin"],
+    });
+    expect(saved.fields.iin).toBeUndefined();
+    due = saved.nextReadAt!;
   }
-  expect(await Document.findById(doc._id).lean()).toMatchObject({
-    status: "done",
-    attempts: 1,
-    fields: { firstName: "Үлгі" },
+});
+
+it("gives both new uploads and overdue recoveries a turn", async () => {
+  const due = new Date(Date.now() - 60_000);
+  const old = await Document.create({
+    ...fixture,
+    recoveryStage: 9,
+    nextReadAt: due,
+    updatedAt: due,
   });
-  expect(await claimRead()).toBeNull();
+  const fresh = await Document.create(fixture);
+  expect(String((await claimRead())?._id)).toBe(String(fresh._id));
+  await Document.create(fixture);
+  expect(String((await claimRead(new Date(), true))?._id)).toBe(
+    String(old._id),
+  );
 });
 it("resumes after storage failures and expired workers; stale results cannot overwrite a takeover", async () => {
   const doc = await Document.create(fixture);
@@ -143,21 +228,34 @@ it("never retries the wrong document kind; upgrades an old transiently failed dr
     recoveryStage: 0,
     recognitionVersion: readerVersion("receipt"),
   });
-  for (let i = 0; i < 3; i++)
+  let due = new Date();
+  for (let i = 0; i < 8; i++) {
     await processRead(
-      (await claimRead(new Date(Date.now() + 60_000)))!,
+      (await claimRead(due))!,
       async () => {
         throw Error("offline");
       },
       async () => receipt,
     );
-  expect(
-    await resumeDraft(await Document.findById(failed._id).lean()),
-  ).toMatchObject({ status: "failed", attempts: 4 });
-  expect(await claimRead(new Date(Date.now() + 60_000))).toBeNull();
+    const paused = (await Document.findById(failed._id).lean())!;
+    expect(paused).toMatchObject({
+      status: "queued",
+      attempts: 4,
+      recoveryStage: 0,
+      recoveryFailures: i + 1,
+    });
+    expect(+paused.nextReadAt!).toBeGreaterThan(Date.now());
+    due = paused.nextReadAt!;
+  }
+  await processRead((await claimRead(due))!, load, async () => receipt);
+  expect(await Document.findById(failed._id).lean()).toMatchObject({
+    status: "done",
+    attempts: 4,
+    fields: receipt,
+  });
 });
 
-it("uses a different strategy after an engine crash and serves the last successful checkpoint on exhaustion", async () => {
+it("uses a different strategy after repeated native crashes without erasing checkpoints or treating them as complete", async () => {
   const doc = await Document.create({
     ...fixture,
     fields: { recipientName: "Old cached guess" },
@@ -167,18 +265,76 @@ it("uses a different strategy after an engine crash and serves the last successf
   };
   await processRead((await claimRead())!, load, fail);
   const future = () => new Date(Date.now() + 60_000);
+  expect(await Document.findById(doc._id).lean()).toMatchObject({
+    fields: { recipientName: "Old cached guess" },
+    recoveryHasCheckpoint: false,
+  });
   const next = (await claimRead(future()))!;
   expect(next.recoveryStage).toBe(1);
   await processRead(next, load, async (_b, _m, _k, options) => {
     expect(options?.previousFields).toEqual({});
     return { amount: receipt.amount };
   });
-  for (let i = 0; i < 3; i++)
-    await processRead((await claimRead(future()))!, load, fail);
+  let due = new Date();
+  for (let i = 0; i < 5; i++) {
+    await processRead((await claimRead(due))!, load, fail);
+    const paused = (await Document.findById(doc._id).lean())!;
+    expect(paused).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      fields: { amount: receipt.amount },
+      recoveryStage: i + 3,
+    });
+    due = paused.nextReadAt!;
+  }
+  await processRead(
+    (await claimRead(due))!,
+    load,
+    async (_b, _m, _k, options) => {
+      expect(options?.previousFields).toEqual({ amount: receipt.amount });
+      return receipt;
+    },
+  );
   expect(await Document.findById(doc._id).lean()).toMatchObject({
     status: "done",
     attempts: 1,
-    fields: { amount: receipt.amount },
+    fields: receipt,
   });
-  expect(await claimRead(future())).toBeNull();
+});
+
+it("moves to a different strategy if worker restarts repeatedly interrupt the same stage", async () => {
+  const doc = await Document.create(fixture);
+  const start = Date.now();
+  for (let i = 0; i < 2; i++) {
+    const now = start + i * 300_000;
+    expect((await claimRead(new Date(now)))?._id).toEqual(doc._id);
+    await reclaimInterruptedRead(new Date(now + 120_000));
+  }
+  expect(await Document.findById(doc._id).lean()).toMatchObject({
+    status: "queued",
+    recoveryStage: 1,
+    recoveryFailures: 2,
+    attempts: 1,
+  });
+});
+
+it("stops confirmed invalid sources and missing original objects without requeueing them", async () => {
+  for (const failure of ["invalid", "missing"] as const) {
+    const doc = await Document.create(fixture);
+    const loadSrc =
+      failure === "invalid"
+        ? load
+        : async () => {
+            throw Object.assign(new Error(), { name: "NoSuchKey" });
+          };
+    await processRead((await claimRead())!, loadSrc, async () => {
+      throw new InvalidDocumentError();
+    });
+    expect(await Document.findById(doc._id).lean()).toMatchObject({
+      status: "failed",
+      permanentReadFailure: true,
+      wrongDocumentKind: false,
+    });
+  }
+  expect(await claimRead(new Date(Date.now() + 86_400_000))).toBeNull();
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import sharp from "sharp";
 import {
+  InvalidDocumentError,
   identityInsteadOfReceipt,
   receiptInsteadOfIdentity,
 } from "../server/services/ocr-policy.js";
@@ -266,10 +267,11 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
       expect(fields.middleName).toBe("");
       expect(fields.iin).toBe("000123456789");
     });
-    it("leaves a blank image empty", async () =>
-      expect(await recognize(textImage([""]), "image/png", "identity")).toEqual(
-        {},
-      ));
+    it("recognizes a completely blank original as unreadable", async () => {
+      await expect(
+        recognize(textImage([""]), "image/png", "identity"),
+      ).rejects.toBeInstanceOf(InvalidDocumentError);
+    });
     it("allows error handling for an unreadable image", async () => {
       await expect(
         recognize(Buffer.from("bad-image"), "image/png", "identity"),
