@@ -207,8 +207,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(response.status).toBe(200);
     const book = new ExcelJS.Workbook();
     await book.xlsx.load(response.body);
-    expect(book.worksheets[0].rowCount).toBe(2);
-    expect(book.worksheets[0].getCell("B2").value).toBe("Меруерт");
+    expect(book.worksheets[0].rowCount).toBe(4);
+    expect(book.worksheets[0].getCell("B4").value).toBe("Меруерт");
   });
   it("records expenses without duplicating membership income", async () => {
     let r = await agent.get("/api/statistics?year=2026");
@@ -515,7 +515,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       });
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(exported.body);
-    expect(workbook.worksheets[0].rowCount).toBe(4);
+    expect(workbook.worksheets[0].rowCount).toBe(6);
   });
   it("removes stale receipt fingerprints when correcting a receipt number", async () => {
     const personRow = await post("/api/participants", {
@@ -1020,15 +1020,22 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         filtersSchema.parse({ year: 2026, q: "УақытСынақ" }),
       )) as any,
     );
-    const sheet = book.worksheets[0];
-    expect(sheet.getRow(1).values).toContain("Төлем уақыты");
-    expect(sheet.getColumn(4).values.slice(2)).toEqual([
-      "15:08:03",
-      "15:08",
-      "09:30",
-      "",
-      "23:59:59",
+    const sheet = book.getWorksheet("Төлемдер")!;
+    expect(sheet.getRow(3).values).toContain("Чек күні мен уақыты (Астана)");
+    expect(
+      [4, 5, 6, 7, 8].map((row) =>
+        (sheet.getCell(row, 2).value as Date).toISOString(),
+      ),
+    ).toEqual([
+      "2026-10-16T15:08:03.000Z",
+      "2026-10-16T15:08:00.000Z",
+      "2026-10-16T09:30:00.000Z",
+      "2026-10-16T00:00:00.000Z",
+      "2026-10-15T23:59:59.000Z",
     ]);
+    expect(sheet.getCell("B7").numFmt).toBe("dd.mm.yyyy");
+    expect(sheet.getCell("B5").numFmt).toBe("dd.mm.yyyy hh:mm");
+    expect(sheet.getCell("B4").numFmt).toBe("dd.mm.yyyy hh:mm:ss");
   });
   it("recognizes pasted receipts without writes, saves the source and detects duplicates", async () => {
     const { Payment, Document } = await import("../server/models.js");
@@ -1102,8 +1109,12 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         filtersSchema.parse({ year: 2026, q: "МәтінСынақ" }),
       )) as any,
     );
-    expect(book.worksheets[0].getRow(1).values).toContain("Төлеген адам");
-    expect(book.worksheets[0].getRow(2).values).toContain("Үлгі Ә.");
+    expect(book.getWorksheet("Төлемдер")!.getRow(3).values).toContain(
+      "Төлеген адам",
+    );
+    expect(book.getWorksheet("Төлемдер")!.getRow(4).values).toContain(
+      "Үлгі Ә.",
+    );
 
     expect(found.body.payments[0]).toMatchObject({
       receiptText: text,
@@ -2295,7 +2306,8 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(exported.status).toBe(200);
       const book = new ExcelJS.Workbook();
       await book.xlsx.load(exported.body);
-      const historical = book.worksheets[0]
+      const historical = book
+        .getWorksheet("Төлемдер")!
         .getSheetValues()
         .filter((r: any) => r?.includes(paid.receiptNumber));
       expect(historical).toHaveLength(1);
@@ -2345,6 +2357,355 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       expect(attached.body.participantId).toBeUndefined();
     },
   );
+  it("exports five distinct workbooks with actual receipts, totals, local names and audience-specific columns", async () => {
+    const { Participant, Payment, Finance, PaymentCategory } =
+      await import("../server/models.js");
+    const { REPORT_TITLES, reportFilename } =
+      await import("../shared/report-names.js");
+    const year = 2044;
+    const common = {
+      lastName: "Есепсынақ",
+      firstName: "Үлгі",
+      middleName: "Қызы",
+      region: "Мұнайлы ауданы",
+      village: "Атамекен",
+      birthDate: "1990-02-01",
+      searchTokens: ["есепсынақ", "үлгі"],
+    };
+    const [a, b, c] = await Participant.create([
+      {
+        ...common,
+        fullNameKk: "Қазақша Үлгі",
+        fullNameRu: "Русское написание",
+        lastNameLatin: "ESEPSYNAQ",
+        firstNameLatin: "ULGI",
+        phone: "+70000000001",
+        iin: "001122000007",
+        documentNumber: "012345678",
+        issuedBy: "ҚР ІШКІ ІСТЕР МИНИСТРЛІГІ",
+        issueDate: "2020-01-01",
+        expiryDate: "2030-01-01",
+      },
+      // A different person with an identical native name must have a separate row.
+      { ...common, phone: "+70000000002" },
+      {
+        ...common,
+        region: "Ақтау",
+        village: "Өмірзақ",
+        firstName: "Әсел",
+        birthDate: "",
+      },
+    ]);
+    const archived = await Participant.create({
+      ...common,
+      firstName: "Мұрағат",
+      archivedAt: new Date(),
+    });
+    const [show, villageFee, otherFee, emptyFee] = await PaymentCategory.create(
+      [
+        { name: "Көрме", nameKey: "regional-test-show", amount: 650000 },
+        {
+          name: "Аудандық жарна",
+          nameKey: "regional-test-village",
+          amount: 560000,
+        },
+        {
+          name: "Басқа мақсат",
+          nameKey: "regional-test-other",
+          amount: 560000,
+        },
+        { name: "Жаңа төлем", nameKey: "regional-test-empty", amount: 560000 },
+      ],
+    );
+    const payment = {
+      participantId: a._id,
+      year,
+      paymentDate: "2044-03-01",
+      paymentTime: "09:05",
+      amount: 650000,
+      receiptType: "personal",
+    };
+    await Payment.create([
+      {
+        ...payment,
+        payerName: "Сынақ төлеуші",
+        recipientName: "Сынақ алушы",
+        receiptNumber: "R-ONE",
+      },
+      {
+        ...payment,
+        year: year + 1,
+        paymentTime: "10:35:22",
+        amount: 648700,
+        receiptNumber: "R-TWO",
+      },
+      {
+        ...payment,
+        amount: 650000,
+        paymentKind: "additional",
+        paymentCategoryId: show._id,
+        paymentCategoryName: show.name,
+        receiptNumber: "R-EXTRA",
+      },
+      {
+        ...payment,
+        participantId: b._id,
+        amount: 560000,
+        paymentTime: "",
+        receiptNumber: "R-THREE",
+      },
+      {
+        ...payment,
+        paymentKind: "additional",
+        paymentCategoryId: villageFee._id,
+        paymentCategoryName: villageFee.name,
+        amount: 150075,
+        receiptNumber: "R-PARTIAL",
+      },
+      {
+        ...payment,
+        paymentKind: "additional",
+        paymentCategoryId: otherFee._id,
+        paymentCategoryName: otherFee.name,
+        amount: 560000,
+        receiptNumber: "R-OTHER",
+      },
+      { ...payment, amount: 888000, voidedAt: new Date() },
+      {
+        ...payment,
+        participantId: archived._id,
+        amount: 10150,
+        receiptNumber: "R-ARCHIVED",
+      },
+    ]);
+    await Finance.create([
+      {
+        type: "income",
+        date: "2044-03-01",
+        category: "Өзге сынақ",
+        amount: 3355,
+      },
+      { type: "expense", date: "2044-03-01", category: "Шығыс", amount: 1100 },
+      {
+        type: "income",
+        date: "2044-03-01",
+        category: "Алып тасталды",
+        amount: 9900,
+        voidedAt: new Date(),
+      },
+    ]);
+    const exportBook = async (
+      type: keyof typeof REPORT_TITLES,
+      filter = "",
+    ) => {
+      const result = await agent
+        .get(`/api/reports/${type}?year=${year}&limit=1${filter}`)
+        .buffer(true)
+        .parse((res, cb) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk) => chunks.push(chunk));
+          res.on("end", () => cb(null, Buffer.concat(chunks)));
+        });
+      expect(result.status).toBe(200);
+      expect(
+        decodeURIComponent(result.headers["content-disposition"]),
+      ).toContain(reportFilename(type, year));
+      const book = new ExcelJS.Workbook();
+      await book.xlsx.load(result.body);
+      for (const sheet of book.worksheets) {
+        expect(sheet.getCell("A1").text).toContain(REPORT_TITLES[type]);
+        expect(sheet.getCell("A1").text).toContain(String(year));
+        expect(sheet.getCell("A2").text.length).toBeGreaterThan(15);
+        const view = sheet.views[0];
+        expect(view.state).toBe("frozen");
+        const header = view.state === "frozen" ? Number(view.ySplit) : 0;
+        expect(sheet.autoFilter).toBe(
+          `A${header}:${sheet.getCell(sheet.rowCount, sheet.columnCount).address}`,
+        );
+      }
+      return book;
+    };
+    const records = (sheet: ExcelJS.Worksheet) => {
+      const view = sheet.views[0];
+      const header = view.state === "frozen" ? Number(view.ySplit) : 0;
+      const rows = [];
+      for (let n = header + 1; n <= sheet.rowCount; n++) {
+        const row: Record<string, ExcelJS.CellValue> = {};
+        sheet.getRow(header).eachCell((cell, i) => {
+          row[cell.text] = sheet.getCell(n, i).value;
+        });
+        rows.push(row);
+      }
+      return rows;
+    };
+    const regional = await exportBook(
+      "mangystau-oblast",
+      "&region=" + encodeURIComponent(common.region),
+    );
+    const summary = regional.worksheets[0];
+    expect(summary.getCell("B3").value).toBe(32322.8);
+    expect(summary.getCell("D3").value).toBe(32289.25);
+    expect(summary.getCell("F3").value).toBe(33.55);
+    expect(summary.getCell("H3").value).toBe(6500);
+    const registered = records(summary).filter((r) =>
+      String(r["Аты-жөні (құжат бойынша)"]).startsWith("Есепсынақ "),
+    );
+    expect(registered).toHaveLength(4);
+    const twin = registered.find((r) => r["Телефон"] === a.phone)!;
+    expect(twin).toMatchObject({
+      "Аты-жөні (құжат бойынша)": "Есепсынақ Үлгі Қызы",
+      "Қазақша аты-жөні": a.fullNameKk,
+      "Орысша аты-жөні": a.fullNameRu,
+      "Елді мекен": "Атамекен",
+      "Мүшелік жарна, ₸": 12987,
+      "Көрме, ₸": 6500,
+      "Барлығы, ₸": 26587.75,
+      "Соңғы чек күні мен уақыты (Астана)": new Date("2044-03-01T10:35:22Z"),
+      "Туған күні": new Date("1990-02-01T00:00Z"),
+    });
+    expect(registered.find((r) => r["Телефон"] === b.phone)).toMatchObject({
+      "Қазақша аты-жөні": null,
+      "Барлығы, ₸": 5600,
+    });
+    expect(registered.find((r) => r["Елді мекен"] === c.village)).toMatchObject(
+      { "Барлығы, ₸": 0, "Жас санаты": null, "Туған күні": null },
+    );
+    const ledger = records(regional.worksheets[1]);
+    expect(ledger).toHaveLength(7);
+    expect(ledger[0]["Чек нөмірі"]).toBe("R-TWO");
+    expect(ledger.find((r) => r["Чек нөмірі"] === "R-ONE")).toMatchObject({
+      "Төлеген адам": "Сынақ төлеуші",
+      Алушы: "Сынақ алушы",
+      "Төлем мақсаты": "Мүшелік жарна",
+    });
+    expect(records(regional.worksheets[2])).toHaveLength(1);
+    const district = await exportBook(
+      "mangystau-district",
+      "&region=" + encodeURIComponent(common.region),
+    );
+    expect(district.worksheets[0].getCell("B3").value).toBe(13600.75);
+    const districtTwins = records(district.worksheets[0]).filter((r) =>
+      [a.phone, b.phone].includes(String(r["Телефон"])),
+    );
+    expect(districtTwins.map((r) => r["Телефон"])).toEqual([a.phone, b.phone]);
+    expect(
+      records(district.worksheets[1])
+        .map((r) => r["Чек нөмірі"])
+        .sort(),
+    ).toEqual(["R-EXTRA", "R-OTHER", "R-PARTIAL"]);
+    expect(district.worksheets[0].getRow(4).values).not.toContain(
+      "Мүшелік жарна, ₸",
+    );
+    for (const [category, expected] of [
+      [villageFee, 1500.75],
+      [emptyFee, 0],
+    ] as const) {
+      const book = await exportBook(
+        "mangystau-district",
+        "&region=" +
+          encodeURIComponent(common.region) +
+          "&paymentCategoryId=" +
+          category.id,
+      );
+      expect(book.worksheets[0].getCell("A2").text).toContain(category.name);
+      expect(book.worksheets[0].getCell("B3").value).toBe(expected);
+      const rows = records(book.worksheets[0]);
+      expect(rows.find((r) => r["Телефон"] === a.phone)).toMatchObject({
+        [category.name + ", ₸"]: expected,
+        "Барлығы, ₸": expected,
+      });
+      expect(rows.find((r) => r["Телефон"] === b.phone)).toMatchObject({
+        [category.name + ", ₸"]: 0,
+        "Барлығы, ₸": 0,
+      });
+      expect(records(book.worksheets[1]).map((r) => r["Чек нөмірі"])).toEqual(
+        expected ? ["R-PARTIAL"] : [],
+      );
+    }
+    expect(
+      (
+        await agent.get(
+          "/api/reports/mangystau-district?paymentCategoryId=wrong-id",
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await agent.get(
+          "/api/reports/mangystau-district?paymentCategoryId=" +
+            new mongoose.Types.ObjectId(),
+        )
+      ).status,
+    ).toBe(404);
+    for (const book of [regional, district]) {
+      const all = JSON.stringify(
+        book.worksheets.map((s) => s.getSheetValues()),
+      );
+      for (const privateField of [
+        "ЖСН",
+        "Куәлік нөмірі",
+        "Кім берді",
+        "Жарамдылық мерзімі",
+        a.iin,
+        a.documentNumber,
+      ])
+        expect(all).not.toContain(privateField);
+    }
+    const ourPeople = (sheet: ExcelJS.Worksheet) =>
+      records(sheet).filter((row) =>
+        String(row["Аты-жөні (құжат бойынша)"]).startsWith(
+          common.lastName + " ",
+        ),
+      );
+    const withNames = "&status=paid"; // Lists include unpaid members, even if an obsolete client sends a financial filter.
+    const awards = ourPeople(
+      (await exportBook("awards", withNames)).worksheets[0],
+    );
+    for (const type of ["awards", "urshyk", "international"] as const) {
+      const byTerritory = await exportBook(
+        type,
+        "&region=" + encodeURIComponent(common.region),
+      );
+      expect(byTerritory.worksheets[0].getCell("A2").text).toContain(
+        common.region,
+      );
+      expect(ourPeople(byTerritory.worksheets[0])).toHaveLength(2);
+    }
+    expect(awards).toHaveLength(3);
+    expect(awards[0]["Елді мекен"]).toBe("Өмірзақ");
+    expect(Object.keys(awards[0])).toEqual([
+      "Аты-жөні (құжат бойынша)",
+      "Аймақ",
+      "Елді мекен",
+    ]);
+    const urshyk = ourPeople(
+      (await exportBook("urshyk", withNames)).worksheets[0],
+    );
+    expect(urshyk).toHaveLength(3);
+    expect(urshyk.find((r) => r["ЖСН"] === a.iin)).toMatchObject({
+      "Латынша тегі": "ESEPSYNAQ",
+      "Латынша аты": "ULGI",
+      "Қазақша аты-жөні": a.fullNameKk,
+      "Орысша аты-жөні": a.fullNameRu,
+      "Туған жылы": 1990,
+      "Куәлік нөмірі": "012345678",
+      "Жарамдылық мерзімі": "01.01.2020 — 01.01.2030",
+      "Төленген мүшелік жарна, ₸": 6500,
+    });
+    expect(
+      urshyk.filter((r) => r["Төленген мүшелік жарна, ₸"] === 0),
+    ).toHaveLength(1);
+    expect(urshyk[0]).not.toHaveProperty("Телефон");
+    const international = ourPeople(
+      (await exportBook("international", withNames)).worksheets[0],
+    );
+    expect(international).toHaveLength(3);
+    expect(
+      international.find((r) => r["Латынша тегі"] === "ESEPSYNAQ"),
+    ).toMatchObject({ "Латынша аты": "ULGI", "Туған жылы": 1990 });
+    for (const key of ["Телефон", "Аймақ", "Төленген мүшелік жарна, ₸"])
+      expect(international[0]).not.toHaveProperty(key);
+  });
   it("writes audit logs and invalidates the session on logout", async () => {
     const { Audit } = await import("../server/models.js");
     expect(await Audit.countDocuments()).toBeGreaterThan(10);

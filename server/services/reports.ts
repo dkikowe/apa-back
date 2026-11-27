@@ -1,15 +1,49 @@
 import ExcelJS from "exceljs";
+import { Types } from "mongoose";
+import { REPORT_TITLES, type ReportType } from "../../shared/report-names.js";
 import { regionLabel } from "../../shared/locations.js";
 import { Participant, Payment, Finance } from "../models.js";
-import { memberPipeline, type Filters } from "./members.js";
+import { filtersSchema, memberPipeline, type Filters } from "./members.js";
 import {
   AGE_LABELS,
   paymentCategoryLabel,
-  RECEIPT_TYPES,
   STATUS_LABELS,
   missingParticipantFields,
   validityPeriod,
 } from "../../shared/domain.js";
+import {
+  addPaymentTables,
+  finishTable,
+  setPaymentDate,
+  startTable,
+  type ReportColumn,
+  documentName,
+  kkCollator,
+  type ReportPayment,
+  type ReportHeading,
+  type ReportCategory,
+} from "./report-workbook.js";
+
+const purposes: Record<ReportType, string> = {
+  "mangystau-oblast":
+    "Қатысушылардың тіркелуі және жылдық төлемдердің мақсаты мен сомасы.",
+  "mangystau-district":
+    "Аймақ пен елді мекен бойынша қатысушылардың қосымша төлемдері.",
+  awards:
+    "Марапат қағазына жазылатын аты-жөні. Тізім аймақ пен аты-жөні бойынша реттелген.",
+  urshyk:
+    "Республикалық «Ұршық» бірлестігіне жіберілетін қатысушылар мен төленген мүшелік жарналар.",
+  international:
+    "Шетелге жіберілетін қатысушылардың құжаттағы аты-жөні және туған жылы.",
+  members:
+    "Таңдалған қатысушылардың жеке мәліметтері мен жылдық жарнасының жағдайы.",
+  payments: "Әр қатысушының жарналары төлем мақсаты бойынша жинақталған.",
+  income:
+    "Жыл ішінде түскен мүшелік жарналар, қосымша төлемдер және өзге кірістер.",
+  expense: "Жыл ішінде тіркелген шығыстар, олардың санаты мен түсініктемесі.",
+  financial: "Күнтізбелік жылдағы кіріс, шығыс және есептік қалдық.",
+};
+
 export async function financialSummary(year: number) {
   const from = `${year}-01-01`,
     to = `${year + 1}-01-01`;
@@ -127,20 +161,166 @@ export async function statistics(f: Filters) {
     finance,
   };
 }
-export const reportTypes = [
-  "members",
-  "payments",
-  "income",
-  "expense",
-  "financial",
-] as const;
-export async function makeReport(type: string, f: Filters) {
+export const reportTypes = Object.keys(REPORT_TITLES) as [
+  ReportType,
+  ...ReportType[],
+];
+const reportPersonProjection = {
+  lastName: 1,
+  firstName: 1,
+  middleName: 1,
+  fullNameKk: 1,
+  fullNameRu: 1,
+  phone: 1,
+  birthDate: 1,
+  lastNameLatin: 1,
+  firstNameLatin: 1,
+  region: 1,
+  village: 1,
+  deletedAt: 1,
+};
+async function reportPayments(
+  match: Record<string, unknown>,
+  region = "",
+): Promise<ReportPayment[]> {
+  return Payment.aggregate<ReportPayment>([
+    { $match: { ...match, voidedAt: null } },
+    { $sort: { paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 } },
+    {
+      $lookup: {
+        from: Participant.collection.name,
+        localField: "participantId",
+        foreignField: "_id",
+        pipeline: [
+          {
+            $project: reportPersonProjection,
+          },
+        ],
+        as: "person",
+      },
+    },
+    { $set: { person: { $arrayElemAt: ["$person", 0] } } },
+    ...(region
+      ? [{ $match: { "person.region": region, "person.deletedAt": null } }]
+      : []),
+    {
+      $project: {
+        participantId: 1,
+        person: 1,
+        year: 1,
+        amount: 1,
+        paymentKind: 1,
+        paymentCategoryName: 1,
+        paymentCategoryId: 1,
+        paymentDate: 1,
+        paymentTime: 1,
+        receiptNumber: 1,
+        payerName: 1,
+        recipientName: 1,
+        receiptType: 1,
+        method: 1,
+      },
+    },
+  ]);
+}
+type RosterType = "awards" | "urshyk" | "international";
+
+const nativeName = {
+  header: "Аты-жөні (құжат бойынша)",
+  key: "name",
+  width: 39,
+};
+const rosterColumns: Record<RosterType, ReportColumn[]> = {
+  awards: [
+    nativeName,
+    { header: "Аймақ", key: "region", width: 40 },
+    { header: "Елді мекен", key: "village", width: 27 },
+  ],
+  urshyk: [
+    nativeName,
+    { header: "Қазақша аты-жөні", key: "fullNameKk", width: 32 },
+    { header: "Орысша аты-жөні", key: "fullNameRu", width: 32 },
+    { header: "Латынша тегі", key: "lastNameLatin", width: 24 },
+    { header: "Латынша аты", key: "firstNameLatin", width: 24 },
+    { header: "ЖСН", key: "iin", width: 19 },
+    { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
+    { header: "Кім берді", key: "issuedBy", width: 43 },
+    { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
+    { header: "Туған жылы", key: "birthYear", width: 16 },
+    { header: "Жасы", key: "age", width: 10 },
+    { header: "Жас санаты", key: "ageLabel", width: 28 },
+    {
+      header: "Төленген мүшелік жарна, ₸",
+      key: "totalPaid",
+      width: 25,
+      money: true,
+    },
+  ],
+  international: [
+    { header: "Латынша тегі", key: "lastNameLatin", width: 26 },
+    { header: "Латынша аты", key: "firstNameLatin", width: 26 },
+    nativeName,
+    { header: "Туған жылы", key: "birthYear", width: 16 },
+    { header: "Жасы", key: "age", width: 10 },
+    { header: "Жас санаты", key: "ageLabel", width: 29 },
+  ],
+};
+
+async function addRoster(
+  book: ExcelJS.Workbook,
+  type: RosterType,
+  heading: ReportHeading,
+  f: Filters,
+) {
+  const sheet = startTable(
+    book,
+    "Қатысушылар",
+    heading,
+    f.year,
+    rosterColumns[type],
+  );
+  const people = await Participant.aggregate(
+    memberPipeline(filtersSchema.parse({ year: f.year, region: f.region })),
+  );
+  people.sort(
+    (a, b) =>
+      (type === "awards"
+        ? kkCollator.compare(regionLabel(a.region), regionLabel(b.region))
+        : 0) ||
+      kkCollator.compare(documentName(a), documentName(b)) ||
+      String(a._id).localeCompare(String(b._id)),
+  );
+  for (const p of people) {
+    sheet.addRow({
+      ...p,
+      name: documentName(p),
+      region: regionLabel(p.region),
+      birthYear: p.birthDate ? Number(p.birthDate.slice(0, 4)) : null,
+      validity: validityPeriod(p.issueDate, p.expiryDate),
+      ageLabel: p.ageGroup == null ? "" : AGE_LABELS[p.ageGroup],
+      totalPaid: p.totalPaid / 100,
+    });
+  }
+  finishTable(sheet);
+}
+
+export async function makeReport(
+  type: ReportType,
+  f: Filters,
+  category?: ReportCategory,
+) {
   const book = new ExcelJS.Workbook();
   book.creator = "Бірлік";
   book.created = new Date();
-  const sheet = book.addWorksheet("Есеп");
+  const heading = { title: REPORT_TITLES[type], purpose: purposes[type] };
+  const territory = regionLabel(f.region) || "Барлық қала мен аудан";
+  if (
+    ["mangystau-district", "awards", "urshyk", "international"].includes(type)
+  ) {
+    heading.purpose += ` Аймақ — ${territory}.`;
+  }
   if (type === "members") {
-    sheet.columns = [
+    const sheet = startTable(book, "Есеп", heading, f.year, [
       { header: "Тегі", key: "lastName", width: 24 },
       { header: "Аты", key: "firstName", width: 24 },
       { header: "Латынша тегі", key: "lastNameLatin", width: 24 },
@@ -161,13 +341,13 @@ export async function makeReport(type: string, f: Filters) {
         width: 35,
       },
       { header: "Жыл", key: "year", width: 12 },
-      { header: "Төленді, ₸", key: "totalPaid", width: 18 },
-      { header: "Қалды, ₸", key: "remaining", width: 18 },
-      { header: "Артық төлем, ₸", key: "overpayment", width: 18 },
+      { header: "Төленді, ₸", key: "totalPaid", width: 18, money: true },
+      { header: "Қалды, ₸", key: "remaining", width: 18, money: true },
+      { header: "Артық төлем, ₸", key: "overpayment", width: 18, money: true },
       { header: "Мәртебе", key: "status", width: 24 },
       { header: "Мәліметтер", key: "completeness", width: 20 },
       { header: "Ескертпе", key: "notes", width: 50 },
-    ];
+    ]);
     for await (const row of Participant.aggregate(memberPipeline(f)).cursor()) {
       sheet.addRow({
         ...row,
@@ -187,20 +367,57 @@ export async function makeReport(type: string, f: Filters) {
         status: STATUS_LABELS[row.status as keyof typeof STATUS_LABELS],
       });
     }
+    finishTable(sheet);
+  } else if (type === "mangystau-oblast" || type === "mangystau-district") {
+    const byRegion = type === "mangystau-district";
+    const dateRange = { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` };
+    const region = byRegion ? f.region : "";
+    const [people, payments, otherIncome] = await Promise.all([
+      Participant.find({
+        deletedAt: null,
+        archivedAt: null,
+        ...(region ? { region } : {}),
+      })
+        .select(reportPersonProjection)
+        .lean(),
+      reportPayments(
+        {
+          paymentDate: dateRange,
+          ...(byRegion
+            ? {
+                paymentKind: "additional",
+                ...(category
+                  ? { paymentCategoryId: new Types.ObjectId(category.id) }
+                  : {}),
+              }
+            : {}),
+        },
+        region,
+      ),
+      !byRegion
+        ? Finance.find({ type: "income", voidedAt: null, date: dateRange })
+            .sort({ date: -1, _id: -1 })
+            .select("date category amount description")
+            .lean()
+        : undefined,
+    ]);
+    if (byRegion)
+      heading.purpose += category
+        ? ` Төлем түрі — ${category.name}.`
+        : " Барлық қосымша төлем түрлері қамтылған.";
+    addPaymentTables(book, heading, f.year, payments, {
+      people,
+      byRegion,
+      category: byRegion ? category : undefined,
+      otherIncome,
+    });
+  } else if (
+    type === "awards" ||
+    type === "urshyk" ||
+    type === "international"
+  ) {
+    await addRoster(book, type, heading, f);
   } else if (type === "payments") {
-    sheet.columns = [
-      { header: "Қатысушы", key: "name", width: 35 },
-      { header: "Жыл", key: "year", width: 16 },
-      { header: "Төлем күні", key: "paymentDate", width: 18 },
-      { header: "Төлем уақыты", key: "paymentTime", width: 18 },
-      { header: "Сома, ₸", key: "amount", width: 20 },
-      { header: "Алушы", key: "recipientName", width: 30 },
-      { header: "Төлеген адам", key: "payerName", width: 30 },
-      { header: "Чек түрі", key: "receiptTypeLabel", width: 35 },
-      { header: "Төлем тәсілі", key: "method", width: 24 },
-      { header: "Чек нөмірі", key: "receiptNumber", width: 25 },
-      { header: "Төлем түрі", key: "paymentCategoryLabel", width: 32 },
-    ];
     // The unfiltered ledger includes tombstones (archive state is cleared
     // on deletion). Personal filters only apply to identifiable profiles.
     const overall =
@@ -213,35 +430,17 @@ export async function makeReport(type: string, f: Filters) {
             { $project: { _id: 1 } },
           ])
         ).map((m) => m._id);
-    for await (const row of Payment.find({
+    const payments = await reportPayments({
       year: f.year,
-      voidedAt: null,
       participantId: { $in: memberIds },
-    })
-      .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
-      .populate("participantId")
-      .lean()
-      .cursor()) {
-      const p: any = row.participantId;
-      sheet.addRow({
-        ...row,
-        paymentCategoryLabel: paymentCategoryLabel(row),
-        receiptTypeLabel:
-          RECEIPT_TYPES[row.receiptType as keyof typeof RECEIPT_TYPES] ||
-          "Көрсетілмеген",
-        name:
-          !p || p.deletedAt
-            ? "Жойылған қатысушы"
-            : [p.lastName, p.firstName, p.middleName].filter(Boolean).join(" "),
-        amount: row.amount! / 100,
-      });
-    }
+    });
+    addPaymentTables(book, heading, f.year, payments);
   } else if (type === "financial") {
     const summary = await financialSummary(f.year);
-    sheet.columns = [
+    const sheet = startTable(book, "Есеп", heading, f.year, [
       { header: "Көрсеткіш", key: "label", width: 45 },
-      { header: "Сома, ₸", key: "amount", width: 25 },
-    ];
+      { header: "Сома, ₸", key: "amount", width: 25, money: true },
+    ]);
     for (const [key, label] of Object.entries({
       membership: "Мүшелік жарналар",
       additional: "Қосымша төлемдер",
@@ -251,52 +450,49 @@ export async function makeReport(type: string, f: Filters) {
       balance: "Есептік қалдық",
     }))
       sheet.addRow({ label, amount: (summary as any)[key] / 100 });
-    sheet.addRow({ label: "Жыл", amount: f.year });
+    finishTable(sheet);
   } else {
-    sheet.columns = [
-      { header: "Күні", key: "date", width: 18 },
-      { header: "Төлем уақыты", key: "paymentTime", width: 18 },
+    const sheet = startTable(book, "Есеп", heading, f.year, [
+      { header: "Күні мен уақыты (Астана)", key: "date", width: 25 },
       { header: "Санат", key: "category", width: 28 },
-      { header: "Сома, ₸", key: "amount", width: 20 },
+      { header: "Сома, ₸", key: "amount", width: 20, money: true },
       { header: "Түсініктеме", key: "description", width: 50 },
-    ];
-    if (type === "income") {
-      for await (const row of Payment.find({
-        voidedAt: null,
-        paymentDate: { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` },
-      })
-        .sort({ paymentDate: -1, paymentTime: -1, createdAt: -1, _id: -1 })
-        .lean()
-        .cursor()) {
-        sheet.addRow({
-          date: row.paymentDate,
-          paymentTime: row.paymentTime || "",
-          category: paymentCategoryLabel(row),
-          amount: row.amount! / 100,
-          description: row.recipientName || "",
-        });
-      }
-    }
-    for await (const row of Finance.find({
+    ]);
+    const dateRange = { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` };
+    const manual = await Finance.find({
       type,
       voidedAt: null,
-      date: { $gte: `${f.year}-01-01`, $lt: `${f.year + 1}-01-01` },
-    })
-      .sort({ date: -1 })
-      .lean()
-      .cursor())
-      sheet.addRow({ ...row, amount: row.amount! / 100 });
+      date: dateRange,
+    }).lean();
+    const entries = manual.map((row) => ({
+      day: row.date || "",
+      time: "",
+      category: row.category,
+      description: row.description,
+      amount: row.amount || 0,
+    }));
+    if (type === "income") {
+      const received = await Payment.find({
+        voidedAt: null,
+        paymentDate: dateRange,
+      }).lean();
+      for (const row of received)
+        entries.push({
+          day: row.paymentDate || "",
+          time: row.paymentTime || "",
+          category: paymentCategoryLabel(row),
+          description: row.recipientName,
+          amount: row.amount || 0,
+        });
+    }
+    entries.sort(
+      (a, b) => b.day.localeCompare(a.day) || b.time.localeCompare(a.time),
+    );
+    for (const entry of entries) {
+      const row = sheet.addRow({ ...entry, amount: entry.amount / 100 });
+      setPaymentDate(row, "date", entry.day, entry.time);
+    }
+    finishTable(sheet);
   }
-  sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
-  sheet.getRow(1).fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FF173F35" },
-  };
-  sheet.views = [{ state: "frozen", ySplit: 1 }];
-  sheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: 1, column: sheet.columnCount },
-  };
   return book.xlsx.writeBuffer();
 }

@@ -36,6 +36,7 @@ import {
   memberPipeline,
   normalizeParticipant,
 } from "./services/members.js";
+import { reportFilename } from "../shared/report-names.js";
 import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
 import {
@@ -1056,12 +1057,20 @@ export function createApp() {
   app.get("/api/reports/:type", async (req, res) => {
     const type = z.enum(reportTypes).parse(req.params.type),
       f = filtersSchema.parse(req.query);
+    let category: { id: string; name: string } | undefined;
+    if (type === "mangystau-district" && req.query.paymentCategoryId) {
+      const id = checkId(z.string().parse(req.query.paymentCategoryId));
+      const saved = await PaymentCategory.findById(id).select("name").lean();
+      if (!saved) throw new HttpError(404, "Төлем түрі табылмады.");
+      category = { id, name: saved.name };
+    }
+    const file = await makeReport(type, f, category);
     res.set({
       "Content-Type":
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "Content-Disposition": `attachment; filename="${type}-${f.year}.xlsx"`,
+      "Content-Disposition": `attachment; filename="${type}-${f.year}.xlsx"; filename*=UTF-8''${encodeURIComponent(reportFilename(type, f.year))}`,
     });
-    res.send(Buffer.from(await makeReport(type, f)));
+    res.send(Buffer.from(file));
   });
   app.get("/api/settings", (_req, res) =>
     res.json({

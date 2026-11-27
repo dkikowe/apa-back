@@ -12,6 +12,8 @@ const participant = new Schema(
     lastName: String,
     firstName: String,
     middleName: String,
+    fullNameKk: String,
+    fullNameRu: String,
     notes: String,
     lastNameLatin: String,
     firstNameLatin: String,

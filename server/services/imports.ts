@@ -30,6 +30,8 @@ export const IMPORT_COLUMNS = {
   middleName: ["Әкесінің аты", "Отчество", "middleName"],
   fullName: ["Аты-жөні", "ФИО", "Ф.И.О.", "Фамилия имя отчество", "АӘТ"],
   fullNameLatin: ["Ағылшын аты жөні", "Латынша аты-жөні"],
+  fullNameKk: ["Қазақша аты-жөні", "ФИО на казахском", "fullNameKk"],
+  fullNameRu: ["Орысша аты-жөні", "ФИО на русском", "fullNameRu"],
   validityPeriod: [
     "Жеке куәліктің жарамдылық мерзімі",
     "Куәліктің мерзімі (басталуы–аяқталуы)",
@@ -313,6 +315,8 @@ export async function previewImport(
       "lastName",
       "firstName",
       "fullName",
+      "fullNameKk",
+      "fullNameRu",
       "phone",
       "iin",
       "documentNumber",
@@ -341,6 +345,8 @@ export async function previewImport(
             k as Key,
             Boolean(book.properties.date1904),
           );
+        if (!data.lastName && !data.firstName)
+          data.fullName ||= data.fullNameKk || data.fullNameRu;
         if (data.fullName) {
           const [lastName, firstName, ...rest] = data.fullName
             .trim()
