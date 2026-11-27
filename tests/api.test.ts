@@ -2976,15 +2976,10 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Жас санаты",
       "Аймақ",
       "Мүшелік жарна (6 500 ₸)",
-      "Күні мен уақыты — Мүшелік жарна",
       "Аудандық жарна, ₸",
-      "Күні мен уақыты — Аудандық жарна",
       "Басқа мақсат, ₸",
-      "Күні мен уақыты — Басқа мақсат",
       "Ескі төлем, ₸",
-      "Күні мен уақыты — Ескі төлем",
       "Көрме, ₸",
-      "Күні мен уақыты — Көрме",
       "Барлығы, ₸",
       "Жіберуші",
       "Алушы",
@@ -2996,30 +2991,30 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       Жасы: age,
       "Жас санаты": AGE_LABELS[ageGroup(age)!],
       "Елді мекен": "Атамекен",
-      "Мүшелік жарна (6 500 ₸)": 12987,
-      "Аудандық жарна, ₸": 1500.75,
-      "Басқа мақсат, ₸": 5600,
-      "Көрме, ₸": 6500,
       "Барлығы, ₸": 26587.75,
       "Туған күні": new Date("1990-02-01T00:00Z"),
     });
-    const paymentTimes = (
+    const purposeLines = (
       row: Record<string, ExcelJS.CellValue>,
-      purpose: string,
+      column: string,
     ) =>
-      String(row["Күні мен уақыты — " + purpose] ?? "")
+      String(row[column] ?? "")
         .split("\n")
         .filter(Boolean);
-    expect(paymentTimes(twin, "Мүшелік жарна")).toEqual([
-      "1. 02.03.2044 10:35:22",
-      "4. 01.03.2044 09:05",
+    expect(purposeLines(twin, "Мүшелік жарна (6 500 ₸)")).toEqual([
+      "1. 6\u202f487 ₸ · 02.03.2044 10:35:22",
+      "4. 6\u202f500 ₸ · 01.03.2044 09:05",
     ]);
-    expect(paymentTimes(twin, "Көрме")).toEqual(["2. 01.03.2044 11:15"]);
-    expect(paymentTimes(twin, "Аудандық жарна")).toEqual([
-      "3. 01.03.2044 09:44",
+    expect(purposeLines(twin, "Көрме, ₸")).toEqual([
+      "2. 6\u202f500 ₸ · 01.03.2044 11:15",
     ]);
-    expect(paymentTimes(twin, "Басқа мақсат")).toEqual(["5. 01.03.2044"]);
-    expect(paymentTimes(twin, "Ескі төлем")).toEqual([]);
+    expect(purposeLines(twin, "Аудандық жарна, ₸")).toEqual([
+      "3. 1\u202f500,75 ₸ · 01.03.2044 09:44",
+    ]);
+    expect(purposeLines(twin, "Басқа мақсат, ₸")).toEqual([
+      "5. 5\u202f600 ₸ · 01.03.2044",
+    ]);
+    expect(String(twin["Ескі төлем, ₸"] ?? "")).toBe("");
     expect(String(twin["Жіберуші"]).split("\n")).toEqual([
       "1. —",
       "2. Көрме төлеушісі",
@@ -3037,26 +3032,17 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const otherTwin = registered.find((r) => r["Телефон"] === b.phone)!;
     expect(otherTwin).toMatchObject({
       "Аты-жөні (құжат бойынша)": twin["Аты-жөні (құжат бойынша)"],
-      "Мүшелік жарна (6 500 ₸)": 5600,
+      "Мүшелік жарна (6 500 ₸)": "5\u202f600 ₸ · 01.03.2044",
       "Барлығы, ₸": 5600,
       Жіберуші: "—",
       Алушы: "—",
     });
-    const dateCell = (memberNumber: ExcelJS.CellValue, purpose: string) => {
-      const column = (
-        summary.getRow(headerRow).values as ExcelJS.CellValue[]
-      ).indexOf("Күні мен уақыты — " + purpose);
-      const row = summary
-        .getRows(headerRow + 1, summary.rowCount - headerRow)!
-        .find((r) => r.getCell(1).value === memberNumber)!;
-      return row.getCell(column);
-    };
-    const dayOnly = dateCell(otherTwin["№"], "Мүшелік жарна");
-    expect(dayOnly.value).toEqual(new Date("2044-03-01T00:00Z"));
-    expect(dayOnly.numFmt).toBe("dd.mm.yyyy");
-    const dayAndTime = dateCell(archived.registrationNumber, "Ескі төлем");
-    expect(dayAndTime.value).toEqual(new Date("2044-03-01T09:05Z"));
-    expect(dayAndTime.numFmt).toMatch(/hh:mm/i);
+    expect(
+      registered.find((row) => row["№"] === archived.registrationNumber),
+    ).toMatchObject({
+      "Ескі төлем, ₸": "101,50 ₸ · 01.03.2044 09:05",
+      "Барлығы, ₸": 101.5,
+    });
     const unpaid = registered.find((r) => r["Елді мекен"] === c.village)!;
     expect(unpaid).toMatchObject({
       "Барлығы, ₸": 0,
@@ -3064,7 +3050,14 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Жас санаты": null,
       "Туған күні": null,
     });
-    expect(paymentTimes(unpaid, "Мүшелік жарна")).toEqual([]);
+    for (const purpose of [
+      "Мүшелік жарна (6 500 ₸)",
+      "Аудандық жарна, ₸",
+      "Басқа мақсат, ₸",
+      "Ескі төлем, ₸",
+      "Көрме, ₸",
+    ])
+      expect(String(unpaid[purpose] ?? "")).toBe("");
     for (const key of ["Жіберуші", "Алушы"])
       expect(String(unpaid[key] ?? "")).toMatch(/^(?:—)?$/);
     const ledger = records(regional.worksheets[1]);
@@ -3080,32 +3073,41 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     );
     expect(ledger).toHaveLength(7);
     expect(ledger[0]["Чек нөмірі"]).toBe("R-TWO");
-    const statementTime = "Төлем күні мен уақыты (Астана)";
-    expect(Object.keys(ledger[0])).not.toContain("Чек");
-    expect(Object.keys(ledger[0])).not.toContain(
+    const amountAndTime = "Сома, күні мен уақыты (Астана)";
+    for (const obsolete of [
+      "Чек",
+      "Сома, ₸",
       "Чек күні мен уақыты (Астана)",
-    );
+      "Төлем күні мен уақыты (Астана)",
+    ])
+      expect(Object.keys(ledger[0])).not.toContain(obsolete);
     expect(ledger[0]).toMatchObject({
-      [statementTime]: new Date("2044-03-02T10:35:22Z"),
-      "Сома, ₸": 6487,
+      [amountAndTime]: "6\u202f487 ₸ · 02.03.2044 10:35:22",
       "Чек түрі": RECEIPT_TYPES.urshyk,
       "Төлем мақсаты": "Мүшелік жарна",
     });
     expect(ledger.find((r) => r["Чек нөмірі"] === "R-PARTIAL")).toMatchObject({
-      [statementTime]: new Date("2044-03-01T09:44Z"),
-      "Сома, ₸": 1500.75,
+      [amountAndTime]: "1\u202f500,75 ₸ · 01.03.2044 09:44",
       "Чек түрі": RECEIPT_TYPES.personal,
       "Төлем мақсаты": "Аудандық жарна",
     });
     expect(
-      ledger.find((r) => r["Чек нөмірі"] === "R-THREE")?.[statementTime],
-    ).toEqual(new Date("2044-03-01T00:00Z"));
+      ledger.find((r) => r["Чек нөмірі"] === "R-THREE")?.[amountAndTime],
+    ).toBe("5\u202f600 ₸ · 01.03.2044");
     expect(ledger.find((r) => r["Чек нөмірі"] === "R-ONE")).toMatchObject({
       Жіберуші: "Сынақ төлеуші",
       Алушы: "Сынақ алушы",
       "Төлем мақсаты": "Мүшелік жарна",
     });
-    expect(records(regional.worksheets[2])).toHaveLength(2);
+    const otherIncome = records(regional.worksheets[2]);
+    expect(otherIncome.map((entry) => entry["Сомасы мен күні"]).sort()).toEqual(
+      ["10 ₸ · 01.03.2044", "23,55 ₸ · 01.03.2044"],
+    );
+    expect(Object.keys(otherIncome[0])).toEqual([
+      "Сомасы мен күні",
+      "Санат",
+      "Түсініктеме",
+    ]);
     const district = await exportBook(
       "mangystau-district",
       "&region=" + encodeURIComponent(common.region),
@@ -3429,9 +3431,15 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         const value = (label: string) =>
           ledger.getCell(4, labels.indexOf(label)).value;
         expect(value("Қатысушы")).toBe("Жасырылған қатысушы");
-        expect(value("Сома, ₸")).toBe(6500);
         expect(value("Чек нөмірі")).toBe("LEDGER-FIXTURE");
-        if (type === "mangystau-oblast") expect(value("№")).toBeNull();
+        if (type === "mangystau-oblast") {
+          expect(value("№")).toBeNull();
+          expect(value("Сома, күні мен уақыты (Астана)")).toBe(
+            "6\u202f500 ₸ · 01.03.2094",
+          );
+        } else {
+          expect(value("Сома, ₸")).toBe(6500);
+        }
       } else {
         expect(cells).not.toContain("Жасырылған қатысушы");
       }
