@@ -2953,9 +2953,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     }
     const ourPeople = (sheet: ExcelJS.Worksheet) =>
       records(sheet).filter((row) =>
-        String(row["Аты-жөні (құжат бойынша)"]).startsWith(
-          common.lastName + " ",
-        ),
+        String(row["Аты-жөні (құжат бойынша)"])
+          .split("\n")
+          .some((name) => name.startsWith(common.lastName + " ")),
       );
     const withNames = "&status=paid"; // Lists include unpaid members, even if an obsolete client sends a financial filter.
     const awards = ourPeople(
@@ -2996,15 +2996,44 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       urshyk.filter((r) => r["Төленген мүшелік жарна, ₸"] === 0),
     ).toHaveLength(1);
     expect(urshyk[0]).not.toHaveProperty("Телефон");
-    const international = ourPeople(
-      (await exportBook("international", withNames)).worksheets[0],
-    );
+    const internationalSheet = (await exportBook("international", withNames))
+      .worksheets[0];
+    const international = ourPeople(internationalSheet);
     expect(international).toHaveLength(3);
+    expect(internationalSheet.getCell("A1").text).toBe(
+      "Шетел рекорд Гиннеса · 2044 жыл",
+    );
+    expect(Object.keys(international[0])).toEqual([
+      "Аты-жөні (құжат бойынша)",
+      "Туған күні",
+      "Туған жылы",
+      "Жасы",
+      "Жас санаты",
+      "Куәлік нөмірі",
+      "Кім берді",
+      "Жарамдылық мерзімі",
+    ]);
+    const { ageAt, ageGroup, AGE_LABELS } = await import("../shared/domain.js");
+    const age = ageAt(common.birthDate);
     expect(
-      international.find((r) => r["Латынша тегі"] === "ESEPSYNAQ"),
-    ).toMatchObject({ "Латынша аты": "ULGI", "Туған жылы": 1990 });
-    for (const key of ["Телефон", "Аймақ", "Төленген мүшелік жарна, ₸"])
-      expect(international[0]).not.toHaveProperty(key);
+      international.find((r) => r["Куәлік нөмірі"] === "012345678"),
+    ).toMatchObject({
+      "Аты-жөні (құжат бойынша)": "ESEPSYNAQ ULGI\nЕсепсынақ Үлгі Қызы",
+      "Туған күні": new Date("1990-02-01T00:00:00Z"),
+      "Туған жылы": 1990,
+      Жасы: age,
+      "Жас санаты": AGE_LABELS[ageGroup(age)!],
+      "Кім берді": a.issuedBy,
+      "Жарамдылық мерзімі": "01.01.2020 — 01.01.2030",
+    });
+    const rowsAsText = JSON.stringify(internationalSheet.getSheetValues());
+    expect(rowsAsText).not.toContain(String(a.iin));
+    expect(rowsAsText).not.toMatch(/\bIIN\b|ЖСН|ИИН/u);
+    expect(
+      international.find(
+        (r) => r["Аты-жөні (құжат бойынша)"] === "Есепсынақ Әсел Қызы",
+      ),
+    ).toMatchObject({ "Туған күні": null, "Туған жылы": null, Жасы: null });
   });
   it("omits hidden profiles from rosters and keeps their actual money in the ledger", async () => {
     const { Participant, Payment } = await import("../server/models.js");

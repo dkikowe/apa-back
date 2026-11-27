@@ -6,9 +6,11 @@ import { Participant, Payment, Finance } from "../models.js";
 import { filtersSchema, memberPipeline, type Filters } from "./members.js";
 import {
   AGE_LABELS,
+  dateSchema,
   paymentCategoryLabel,
   STATUS_LABELS,
   missingParticipantFields,
+  validIdentityIssuer,
   validityPeriod,
 } from "../../shared/domain.js";
 import {
@@ -34,7 +36,7 @@ const purposes: Record<ReportType, string> = {
   urshyk:
     "Республикалық «Ұршық» бірлестігіне жіберілетін қатысушылар мен төленген мүшелік жарналар.",
   international:
-    "Шетелге жіберілетін қатысушылардың құжаттағы аты-жөні және туған жылы.",
+    "Қатысушылардың куәліктегі аты-жөні, жасы, жас санаты және куәлік деректері.",
   members:
     "Таңдалған қатысушылардың жеке мәліметтері мен жылдық жарнасының жағдайы.",
   payments: "Әр қатысушының жарналары төлем мақсаты бойынша жинақталған.",
@@ -265,12 +267,14 @@ const rosterColumns: Record<RosterType, ReportColumn[]> = {
     },
   ],
   international: [
-    { header: "Латынша тегі", key: "lastNameLatin", width: 26 },
-    { header: "Латынша аты", key: "firstNameLatin", width: 26 },
-    nativeName,
+    { ...nativeName, width: 48 },
+    { header: "Туған күні", key: "birthDate", width: 18 },
     { header: "Туған жылы", key: "birthYear", width: 16 },
     { header: "Жасы", key: "age", width: 10 },
     { header: "Жас санаты", key: "ageLabel", width: 29 },
+    { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
+    { header: "Кім берді", key: "issuedBy", width: 43 },
+    { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
   ],
 };
 
@@ -299,13 +303,56 @@ async function addRoster(
       String(a._id).localeCompare(String(b._id)),
   );
   for (const p of people) {
+    const ageLabel = p.ageGroup == null ? "" : AGE_LABELS[p.ageGroup];
+    if (type === "international") {
+      const latin = [p.lastNameLatin, p.firstNameLatin]
+        .filter(Boolean)
+        .join(" ");
+      const native = documentName(p) || p.fullNameKk || p.fullNameRu || "";
+      const names = [latin, native]
+        .map((name: string) => name.trim().replace(/\s+/g, " "))
+        .filter(
+          (name, i, all) =>
+            name &&
+            (i === 0 ||
+              name.localeCompare(all[0], "kk", { sensitivity: "accent" }) !==
+                0),
+        );
+      const birthDate = dateSchema.safeParse(p.birthDate);
+      const issuedBy = validIdentityIssuer(p.issuedBy) ? p.issuedBy : "";
+      const row = sheet.addRow({
+        name: names.join("\n"),
+        birthYear: birthDate.success
+          ? Number(birthDate.data.slice(0, 4))
+          : null,
+        age: birthDate.success ? p.age : null,
+        ageLabel: birthDate.success ? ageLabel : "",
+        documentNumber:
+          p.documentNumber == null ? "" : String(p.documentNumber),
+        issuedBy,
+        validity:
+          p.issueDate || p.expiryDate
+            ? validityPeriod(p.issueDate, p.expiryDate)
+            : "",
+      });
+      if (birthDate.success) setPaymentDate(row, "birthDate", birthDate.data);
+      const nameLines = names.reduce(
+        (total, name) => total + Math.ceil(name.length / 32),
+        0,
+      );
+      row.height = Math.min(
+        409,
+        21 * Math.max(1, nameLines, Math.ceil(issuedBy.length / 30)),
+      );
+      continue;
+    }
     sheet.addRow({
       ...p,
       name: documentName(p),
       region: regionLabel(p.region),
       birthYear: p.birthDate ? Number(p.birthDate.slice(0, 4)) : null,
       validity: validityPeriod(p.issueDate, p.expiryDate),
-      ageLabel: p.ageGroup == null ? "" : AGE_LABELS[p.ageGroup],
+      ageLabel,
       totalPaid: p.totalPaid / 100,
     });
   }
