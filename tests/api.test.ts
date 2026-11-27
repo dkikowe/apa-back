@@ -451,6 +451,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const payload = {
       ...base,
       receiptNumber: "QR28394700001",
+      paymentTime: "16:00",
       receiptDocumentId: String(doc._id),
     };
     const text = (number: string) =>
@@ -1642,7 +1643,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(duplicate.status).toBe(409);
     expect(duplicate.body.participantId).toBe(saved.body._id);
   });
-  it("blocks receipt numbers regardless of case, spaces, amount, date, recipient or voiding", async () => {
+  it("blocks the same receipt timestamp regardless of case, spaces, amount, accounting year, recipient or voiding", async () => {
     const p = await post("/api/participants", {
       ...person,
       firstName: "Қайталау",
@@ -1657,7 +1658,6 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       receiptNumber: " q r - d u p - 4 1 0 ",
       amount: 12300,
       year: 2027,
-      paymentDate: "2027-01-01",
       recipientName: "Different",
       confirmDuplicate: true,
     };
@@ -1694,14 +1694,16 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
     const { Payment } = await import("../server/models.js");
     expect(
-      await Payment.countDocuments({ receiptNumberKey: "QR-CONCURRENT-411" }),
+      await Payment.countDocuments({ receiptCode: "QR-CONCURRENT-411" }),
     ).toBe(1);
   });
-  it("recognizes duplicate receipt numbers in pasted text", async () => {
+  it("recognizes a duplicate at the same date and time in pasted text", async () => {
     const number = "QR16813534981";
     const pay = await post(`/api/participants/${participantId}/payments`, {
       ...base,
       receiptNumber: number,
+      paymentDate: "2026-08-01",
+      paymentTime: "16:00:00",
     });
     expect(pay.status).toBe(201);
     const text = `Оплата совершена 6 437 ₸ ОО Ремесленников URSHYK № чека ${number} Дата и время по Астане 01.08.2026 16:00 Оплачено с Kaspi Gold`;
@@ -1716,6 +1718,109 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         })
       ).status,
     ).toBe(200);
+  });
+  it("accepts the same receipt code in a different minute, second or date while blocking exact and missing-time repeats", async () => {
+    const { Admin, Document, Payment } = await import("../server/models.js");
+    const { completeRecognition } =
+      await import("../server/services/duplicates.js");
+    const admin = await Admin.findOne({ username: "test-admin" });
+    const first = await post("/api/participants", {
+      firstName: "ТөлемСынақ",
+    }).expect(201);
+    const second = await post("/api/participants", {
+      firstName: "УақытСынақ",
+    }).expect(201);
+    const url = (participant: string) =>
+      `/api/participants/${participant}/payments`;
+    const code = "QR00865200347";
+    const data = { ...base, receiptNumber: code, paymentDate: "2026-08-12" };
+    const legacy = await Payment.create({
+      ...data,
+      participantId: first.body._id,
+      receiptNumberKey: code,
+      paymentTime: "10:08",
+      dedupeKeys: ["receipt-number:" + code],
+    });
+    await post(url(second.body._id), {
+      ...data,
+      paymentTime: "10:08:00",
+    }).expect(409);
+    const distinct = await Promise.all([
+      post(url(first.body._id), { ...data, paymentTime: "10:09" }),
+      post(url(second.body._id), { ...data, paymentTime: "10:09:01" }),
+    ]);
+    expect(distinct.map((result) => result.status)).toEqual([201, 201]);
+    await post(url(second.body._id), {
+      ...data,
+      paymentTime: "10:09:01",
+    }).expect(409);
+    await post(url(second.body._id), { ...data, paymentTime: "" }).expect(409);
+    await post(url(second.body._id), {
+      ...data,
+      paymentDate: "2026-08-13",
+      paymentTime: "10:09:01",
+    }).expect(201);
+    await patch(`/api/payments/${distinct[0].body._id}`, {
+      ...data,
+      paymentTime: "10:09:01",
+    }).expect(409);
+    const text = (clock: string) =>
+      `Оплата совершена 1 090 ₸ Сынақ № чека ${code} Дата и время по Астане 12.08.2026 ${clock} Оплачено с Kaspi Gold`;
+    await post("/api/receipts/recognize-text", {
+      text: text("10:09:01"),
+    }).expect(409);
+    const { body } = await post("/api/receipts/recognize-text", {
+      text: text("10:09:02"),
+    }).expect(200);
+    expect(body.fields.paymentTime).toBe("10:09:02");
+    const pasted = { ...data, ...body.fields, receiptText: text("10:09:02") };
+    await post(url(first.body._id), {
+      ...pasted,
+      paymentTime: "10:09:03",
+    }).expect(400);
+    await post(url(first.body._id), pasted).expect(201);
+    const draft = await Document.create({
+      kind: "receipt",
+      ownerId: admin!._id,
+      status: "duplicate",
+      hash: "another-file-with-the-same-code",
+      fields: { ...data, paymentTime: "10:09:03" },
+      duplicate: {
+        paymentId: String(legacy._id),
+        participantId: first.body._id,
+      },
+    });
+    const refreshed = await agent
+      .get(`/api/documents/${draft._id}`)
+      .expect(200);
+    expect(refreshed.body.status).not.toBe("duplicate");
+    await completeRecognition(draft, { ...data, paymentTime: "10:09:03" });
+    await post(url(first.body._id), {
+      ...data,
+      paymentTime: "10:09:03",
+      receiptDocumentId: draft.id,
+    }).expect(201);
+    const copiedFile = await Document.create({
+      kind: "receipt",
+      ownerId: admin!._id,
+      status: "processing",
+      hash: draft.hash,
+    });
+    await completeRecognition(copiedFile, { ...data, paymentTime: "10:09:04" });
+    expect((await Document.findById(copiedFile._id))?.status).toBe("duplicate");
+
+    const withoutTime = {
+      ...data,
+      receiptNumber: "QR00865200348",
+      paymentTime: "",
+    };
+    const concurrent = await Promise.all([
+      post(url(first.body._id), withoutTime),
+      post(url(second.body._id), { ...withoutTime, paymentTime: "10:09:04" }),
+    ]);
+    expect(concurrent.map((response) => response.status).sort()).toEqual([
+      201, 409,
+    ]);
   });
   it("requires an identifier for document-backed records but allows partial manual records", async () => {
     const { Document, Admin } = await import("../server/models.js");
@@ -1870,6 +1975,12 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const saved = attempts.find((r) => r.status === 201)!;
     const c = await make();
     await completeRecognition(c, { receiptNumber: "QR-RACE-412" });
+    expect((await Document.findById(c._id))?.duplicate).toBeUndefined();
+    await completeRecognition(c, {
+      receiptNumber: "QR-RACE-412",
+      paymentDate: base.paymentDate,
+      paymentTime: "10:00:01",
+    });
     expect((await Document.findById(c._id))?.duplicate).toMatchObject({
       paymentId: saved.body._id,
     });
@@ -2086,6 +2197,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
           ...base,
           paymentCategoryId: cat._id,
           receiptNumber: "EXTRA-2038-1",
+          paymentDate: "2038-02-01",
         })
       ).status,
     ).toBe(409);

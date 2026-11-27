@@ -44,6 +44,10 @@ import { statistics, makeReport, reportTypes } from "./services/reports.js";
 import { storage } from "./services/storage.js";
 import {
   DuplicateError,
+  lockReceiptNumber,
+  prepareReceiptNumberLock,
+  receiptClock,
+  receiptIdentityKey,
   participantConflict,
   paymentConflict,
   receiptKey,
@@ -303,9 +307,11 @@ export function createApp() {
       try {
         const fields = extractReceiptText(text);
         const duplicate = await paymentConflict(
-          String(fields.receiptNumber || ""),
+          fields,
           undefined,
           paymentId,
+          undefined,
+          true,
         );
         if (duplicate) throw new DuplicateError(duplicate);
         res.json({ fields });
@@ -662,7 +668,11 @@ export function createApp() {
       id = req.params.paymentId
         ? checkId(String(req.params.paymentId))
         : undefined;
+    const numberKey = receiptKey(data.receiptNumber);
+    const identityKey = receiptIdentityKey(data);
+    await prepareReceiptNumberLock(numberKey);
     const result = await atomic(async (s) => {
+      await lockReceiptNumber(numberKey, s);
       const before = id
         ? await Payment.findOne({ _id: id, voidedAt: null }).session(s)
         : null;
@@ -685,22 +695,23 @@ export function createApp() {
       let fileHash: string | undefined;
       const receiptDocumentId =
         data.receiptDocumentId || before?.receiptDocumentId?.toString();
-      const numberKey = receiptKey(data.receiptNumber);
       const sameSources =
         before?.receiptDocumentId?.toString() === receiptDocumentId &&
         (before?.receiptText || "") === (data.receiptText || "") &&
         receiptKey(before?.receiptNumber) === numberKey;
       if ((receiptDocumentId || data.receiptText) && !numberKey)
         throw new HttpError(400, "Қайталануын тексеру үшін чек нөмірі қажет.");
-      if (data.receiptText && !sameSources) {
-        let printedNumber: string;
+      let printed: ReturnType<typeof extractReceiptText> | undefined;
+      if (
+        data.receiptText &&
+        (!sameSources || (before && receiptIdentityKey(before) !== identityKey))
+      ) {
         try {
-          printedNumber = receiptKey(
-            extractReceiptText(data.receiptText).receiptNumber,
-          );
+          printed = extractReceiptText(data.receiptText);
         } catch {
           throw new HttpError(400, "Бір чектің мәтінін ғана қойыңыз.");
         }
+        const printedNumber = receiptKey(printed.receiptNumber);
         if (
           (printedNumber && printedNumber !== numberKey) ||
           (receiptDocumentId && !printedNumber)
@@ -708,6 +719,16 @@ export function createApp() {
           throw new HttpError(
             400,
             "Чек нөмірі мәтіндегі нөмірмен сәйкес келуі керек.",
+          );
+        if (
+          (printed.paymentDate && printed.paymentDate !== data.paymentDate) ||
+          (receiptClock(printed.paymentTime) &&
+            receiptClock(printed.paymentTime) !==
+              receiptClock(data.paymentTime))
+        )
+          throw new HttpError(
+            400,
+            "Төлем күні мен уақыты чек мәтінімен сәйкес келуі керек.",
           );
       }
       if (receiptDocumentId) {
@@ -730,12 +751,20 @@ export function createApp() {
         await checkDocumentDuplicate(doc, s);
         if (["queued", "processing"].includes(doc.status!) && !sameSources)
           throw new HttpError(400, "Чек тексеріліп жатыр. Күте тұрыңыз.");
-        if (data.receiptText && !sameSources) {
+        if (printed) {
           const fileNumber = receiptKey(doc.fields?.receiptNumber);
-          if (fileNumber !== numberKey)
+          const fileTime = receiptClock(doc.fields?.paymentTime);
+          const textTime = receiptClock(printed.paymentTime);
+          if (
+            fileNumber !== numberKey ||
+            (doc.fields?.paymentDate &&
+              printed.paymentDate &&
+              doc.fields.paymentDate !== printed.paymentDate) ||
+            (fileTime && textTime && fileTime !== textTime)
+          )
             throw new HttpError(
               400,
-              "Файлдағы және мәтіндегі чек нөмірлерін тексеріңіз. Бір төлемге бір чек қажет.",
+              "Файлдағы және мәтіндегі чек нөмірі, күні мен уақыты сәйкес келуі керек.",
             );
         }
         const attachedPayment = await Payment.findOne({
@@ -755,20 +784,15 @@ export function createApp() {
           { session: s },
         );
       }
-      const duplicate = await paymentConflict(
-        data.receiptNumber,
-        fileHash,
-        id,
-        s,
-      );
+      const duplicate = await paymentConflict(data, fileHash, id, s);
       const unchangedLegacy =
         before &&
-        receiptKey(before.receiptNumber) === numberKey &&
+        receiptIdentityKey(before) === identityKey &&
         before.fileHash === fileHash;
       if (duplicate && !unchangedLegacy) throw new DuplicateError(duplicate);
       const keys = [
         ...(fileHash ? ["file:" + fileHash] : []),
-        ...(numberKey ? ["receipt-number:" + numberKey] : []),
+        ...(identityKey ? ["receipt-time:" + identityKey] : []),
       ];
       const values = {
         ...data,
@@ -778,7 +802,8 @@ export function createApp() {
         ...(category ? { paymentCategoryId: category._id.toString() } : {}),
         ...(receiptDocumentId ? { receiptDocumentId } : {}),
         ...(fileHash ? { fileHash } : {}),
-        ...(!duplicate && numberKey ? { receiptNumberKey: numberKey } : {}),
+        ...(numberKey ? { receiptCode: numberKey } : {}),
+        ...(!duplicate && identityKey ? { receiptNumberKey: identityKey } : {}),
         ...(!duplicate && keys.length ? { dedupeKeys: keys } : {}),
       };
       if (!category) delete values.paymentCategoryId;
@@ -792,7 +817,7 @@ export function createApp() {
               ...(!category ? { paymentCategoryId: 1 } : {}),
               fingerprint: 1,
               duplicateConfirmed: 1,
-              ...(!numberKey ? { receiptNumberKey: 1 } : {}),
+              ...(!numberKey ? { receiptNumberKey: 1, receiptCode: 1 } : {}),
               ...(!fileHash ? { fileHash: 1 } : {}),
               ...(!keys.length ? { dedupeKeys: 1 } : {}),
             },

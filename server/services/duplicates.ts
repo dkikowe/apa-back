@@ -5,7 +5,12 @@ import {
   receiptKey,
 } from "../../shared/document-recognition.js";
 import type mongoose from "mongoose";
-import { Document, Participant, Payment } from "../models.js";
+import {
+  Document,
+  Participant,
+  Payment,
+  ReceiptNumberLock,
+} from "../models.js";
 
 import {
   documentErrorMessage,
@@ -15,6 +20,56 @@ import {
 } from "./document-errors.js";
 
 export { receiptKey } from "../../shared/document-recognition.js";
+type ReceiptIdentity = {
+  receiptNumber?: unknown;
+  paymentDate?: unknown;
+  paymentTime?: unknown;
+};
+export function receiptClock(value: unknown) {
+  if (typeof value !== "string") return "";
+  const time = value.trim();
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(time)) return "";
+  return time.length === 5 ? time + ":00" : time;
+}
+const receiptDay = (value: unknown) =>
+  typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+
+export function receiptIdentityKey(fields: ReceiptIdentity) {
+  const number = receiptKey(fields.receiptNumber);
+  if (!number) return "";
+  const day = receiptDay(fields.paymentDate);
+  const time = receiptClock(fields.paymentTime);
+  // Keep the sparse unique index. The lowercase prefix cannot collide with
+  // the historical uppercase number-only keys.
+  return "at:" + JSON.stringify([number, day, time]);
+}
+
+// Serialize saves sharing a number even when one time is missing. This keeps
+// the conservative fallback check correct across different participants.
+export async function prepareReceiptNumberLock(number: string) {
+  if (!number) return;
+  try {
+    await ReceiptNumberLock.updateOne(
+      { _id: number },
+      { $setOnInsert: { version: 0 } },
+      { upsert: true },
+    );
+  } catch (error) {
+    if ((error as { code?: number }).code !== 11000) throw error;
+  }
+}
+export async function lockReceiptNumber(
+  number: string,
+  session: mongoose.ClientSession,
+) {
+  if (number)
+    await ReceiptNumberLock.updateOne(
+      { _id: number },
+      { $inc: { version: 1 } },
+      { session },
+    );
+}
+
 const receiptPattern = (value: string) =>
   new RegExp(
     "^\\s*" +
@@ -60,25 +115,45 @@ export async function participantConflict(
   };
 }
 export async function paymentConflict(
-  number: string,
+  fields: ReceiptIdentity,
   fileHash?: string,
   except?: string,
   session?: mongoose.ClientSession,
+  partialRead = false,
 ) {
-  const key = receiptKey(number);
-  const alternatives: any[] = [
+  const day = receiptDay(fields.paymentDate);
+  const time = receiptClock(fields.paymentTime);
+  // An unfinished read can still recover a date or time that distinguishes
+  // the receipt. The file hash remains enough to identify an exact reupload.
+  const key =
+    partialRead && (!day || !time) ? "" : receiptKey(fields.receiptNumber);
+  const alternatives = [
     ...(key
-      ? [{ receiptNumberKey: key }, { receiptNumber: receiptPattern(number) }]
+      ? [
+          { receiptNumberKey: receiptIdentityKey(fields) },
+          { receiptNumberKey: key },
+          { receiptCode: key },
+          { receiptNumber: receiptPattern(key) },
+        ]
       : []),
     ...(fileHash ? [{ fileHash }] : []),
   ];
   if (!alternatives.length) return null;
-  const pay = await Payment.findOne({
+  const candidates = await Payment.find({
     ...(except ? { _id: { $ne: except } } : {}),
     $or: alternatives,
   })
+    .select("participantId paymentDate paymentTime fileHash")
     .session(session || null)
     .lean();
+  const pay = candidates.find((candidate) => {
+    if (fileHash && candidate.fileHash === fileHash) return true;
+    const savedDay = receiptDay(candidate.paymentDate);
+    const savedTime = receiptClock(candidate.paymentTime);
+    if (day && savedDay && day !== savedDay) return false;
+    // An old payment without a clock cannot be distinguished on the same day.
+    return !time || !savedTime || time === savedTime;
+  });
   if (!pay) return null;
   return savedPaymentConflict(pay, session);
 }
@@ -107,6 +182,8 @@ export async function currentDocumentDuplicate(
   doc: any,
   session?: mongoose.ClientSession,
 ) {
+  if (doc.kind === "receipt")
+    return recognitionConflict(doc, doc.fields || {}, session);
   const cached = doc.duplicate;
   if (
     cached &&
@@ -140,7 +217,7 @@ export async function savedDocumentConflict(
       };
   }
   return doc.kind === "receipt"
-    ? paymentConflict(String(doc.fields?.receiptNumber || ""), doc.hash)
+    ? paymentConflict(doc.fields || {}, doc.hash, undefined, undefined, true)
     : participantConflict(String(doc.fields?.iin || ""));
 }
 export async function resumeDraft(doc: any) {
@@ -298,10 +375,11 @@ export async function recognitionConflict(
           session,
         )
       : await paymentConflict(
-          number,
+          fields,
           doc.hash,
           boundPayment ? String(boundPayment._id) : undefined,
           session,
+          true,
         );
   return conflict;
 }

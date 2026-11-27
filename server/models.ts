@@ -119,6 +119,7 @@ const payment = new Schema(
     recipientName: String,
     payerName: { type: String, default: "" },
     receiptNumber: String,
+    receiptCode: String,
     receiptNumberKey: String,
     method: String,
     receiptDocumentId: { type: Schema.Types.ObjectId, ref: "Document" },
@@ -132,6 +133,7 @@ const payment = new Schema(
   options,
 );
 payment.index({ receiptNumberKey: 1 }, { unique: true, sparse: true });
+payment.index({ receiptCode: 1 }, { sparse: true });
 payment.index({ participantId: 1, year: 1, voidedAt: 1 });
 payment.index({ paymentDate: 1, voidedAt: 1 });
 payment.index({ year: 1, voidedAt: 1 });
@@ -212,6 +214,10 @@ export const PaymentCategory = mongoose.model(
   paymentCategory,
 );
 export const Payment = mongoose.model("MembershipPayment", payment);
+export const ReceiptNumberLock = mongoose.model(
+  "ReceiptNumberLock",
+  new Schema({ _id: String, version: Number }),
+);
 export const Finance = mongoose.model("FinancialTransaction", finance);
 export const Document = mongoose.model("Document", document);
 export const Audit = mongoose.model("AuditLog", audit);
@@ -234,6 +240,7 @@ export async function connect() {
       Admin,
       Participant,
       Payment,
+      ReceiptNumberLock,
       PaymentCategory,
       Finance,
       Document,
