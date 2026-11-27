@@ -905,6 +905,7 @@ export async function recognize(
     seed: Record<string, string | number> = {},
     nativeValues: PositionedText[] = [],
     singlePage = true,
+    inspectPrintedDetails = true,
   ) => {
     const fields = mergeIdentityFields({ ...previous }, seed);
     const confirmedIin = singlePage
@@ -914,7 +915,7 @@ export async function recognize(
       resolvedNumber = fields.iin = confirmedIin;
       if (
         !missingDocumentFields("identity", fields).length &&
-        hasDemographics(fields)
+        (hasDemographics(fields) || !inspectPrintedDetails)
       )
         return { text: "", fields };
     }
@@ -1193,7 +1194,6 @@ export async function recognize(
           // the labels for sex, birthplace or citizenship are printed pixels.
           const hasUnscannedLabels =
             kind === "identity" &&
-            completeLayer &&
             !hasDemographics({ ...previous, ...layerFields }) &&
             (await page.getOperatorList()).fnArray.some((op: number) =>
               [
@@ -1331,6 +1331,7 @@ export async function recognize(
                     layerFields,
                     values,
                     pdf.numPages === 1,
+                    hasUnscannedLabels,
                   );
           } catch (error) {
             if (error instanceof WrongDocumentKindError) {
