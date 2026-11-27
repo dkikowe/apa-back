@@ -25,6 +25,8 @@ import {
 } from "./models.js";
 import {
   participantSchema,
+  OPTIONAL_IDENTITY_FIELDS,
+  type ParticipantInput,
   paymentSchema,
   paymentCategorySchema,
   MEMBERSHIP_PAYMENT_LABEL,
@@ -91,6 +93,23 @@ function checkFailedAttachment(
     documentReadState(doc);
   if (wrongDocumentKind || permanentReadFailure || previousId)
     throw new HttpError(400, error || "Құжат оқылмады. Файлды қайта таңдаңыз.");
+}
+// Older clients omit these fields when attaching a newly read identity card.
+// Explicit corrections, including an empty value, take precedence over OCR.
+function optionalDraftDetails(
+  doc: { status?: string | null; fields?: Record<string, unknown> | null },
+  data: ParticipantInput,
+  input: Record<string, unknown>,
+) {
+  const details: Partial<ParticipantInput> = {};
+  if (doc.status !== "done" || !doc.fields) return details;
+  if (doc.fields.iin && doc.fields.iin !== data.iin) return details;
+  for (const [key] of OPTIONAL_IDENTITY_FIELDS) {
+    if (Object.hasOwn(input, key) || data[key]) continue;
+    const value = participantSchema.shape[key].safeParse(doc.fields[key]);
+    if (value.success && value.data) details[key] = value.data;
+  }
+  return details;
 }
 async function checkDocumentDuplicate(
   doc: any,
@@ -358,6 +377,7 @@ export function createApp() {
   app.post("/api/participants", async (req, res) => {
     const data = participantSchema.parse(req.body);
     const result = await atomic(async (s) => {
+      let draftDetails: Partial<ParticipantInput> = {};
       const conflict = await participantConflict(data.iin, undefined, s);
       if (conflict) throw new DuplicateError(conflict);
       if (data.identityDocumentId) {
@@ -381,10 +401,14 @@ export function createApp() {
         await checkDocumentDuplicate(doc, s);
         if (["queued", "processing"].includes(doc.status!))
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
+        draftDetails = optionalDraftDetails(doc, data, req.body);
       }
-      const [p] = await Participant.create([normalizeParticipant(data)], {
-        session: s,
-      });
+      const [p] = await Participant.create(
+        [normalizeParticipant({ ...data, ...draftDetails })],
+        {
+          session: s,
+        },
+      );
       if (data.identityDocumentId)
         await Document.updateOne(
           { _id: data.identityDocumentId },
@@ -480,6 +504,8 @@ export function createApp() {
             before.iin !== data.iin)
         )
           throw new HttpError(400, "Құжат тексеріліп жатыр. Күте тұрыңыз.");
+        if (before.identityDocumentId?.toString() !== data.identityDocumentId)
+          Object.assign(normalized, optionalDraftDetails(doc, data, input));
         await Document.updateOne(
           { _id: doc._id },
           { $set: { participantId: id } },

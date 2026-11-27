@@ -272,6 +272,9 @@ const rosterColumns: Record<RosterType, ReportColumn[]> = {
     { header: "Туған жылы", key: "birthYear", width: 16 },
     { header: "Жасы", key: "age", width: 10 },
     { header: "Жас санаты", key: "ageLabel", width: 29 },
+    { header: "Жынысы", key: "sex", width: 16 },
+    { header: "Азаматтығы", key: "citizenship", width: 25 },
+    { header: "Туған жері", key: "birthplace", width: 35 },
     { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
     { header: "Кім берді", key: "issuedBy", width: 43 },
     { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
@@ -327,6 +330,9 @@ async function addRoster(
           : null,
         age: birthDate.success ? p.age : null,
         ageLabel: birthDate.success ? ageLabel : "",
+        sex: p.sex ?? "",
+        citizenship: p.citizenship ?? "",
+        birthplace: p.birthplace ?? "",
         documentNumber:
           p.documentNumber == null ? "" : String(p.documentNumber),
         issuedBy,
@@ -336,13 +342,25 @@ async function addRoster(
             : "",
       });
       if (birthDate.success) setPaymentDate(row, "birthDate", birthDate.data);
+      for (const key of ["age", "documentNumber"]) {
+        const cell = row.getCell(key);
+        cell.alignment = { ...cell.alignment, horizontal: "center" };
+      }
       const nameLines = names.reduce(
         (total, name) => total + Math.ceil(name.length / 32),
         0,
       );
       row.height = Math.min(
         409,
-        21 * Math.max(1, nameLines, Math.ceil(issuedBy.length / 30)),
+        21 *
+          Math.max(
+            1,
+            nameLines,
+            Math.ceil(issuedBy.length / 30),
+            Math.ceil((p.sex?.length ?? 0) / 11),
+            Math.ceil((p.citizenship?.length ?? 0) / 17),
+            Math.ceil((p.birthplace?.length ?? 0) / 24),
+          ),
       );
       continue;
     }

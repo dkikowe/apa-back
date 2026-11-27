@@ -611,6 +611,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const identity = {
       iin: "000123456789",
       documentNumber: "001234567",
+      sex: "Әйел",
+      citizenship: "Қазақстан",
+      birthplace: "Ақтау қаласы",
       issuedBy: "Сынақ органы",
       issueDate: "2020-01-02",
       expiryDate: "2030-01-02",
@@ -629,10 +632,19 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       lastName: "ҚұжатСынақ",
       ...identity,
       issuedBy: "",
+      birthplace: "Маңғыстау облысы",
     });
     expect(changed.status).toBe(200);
     expect(changed.body.documentNumber).toBe("001234567");
     expect(changed.body.issuedBy).toBe("");
+    expect(changed.body.birthplace).toBe("Маңғыстау облысы");
+    expect(
+      (
+        await patch(`/api/participants/${created.body._id}`, {
+          citizenship: 42,
+        })
+      ).status,
+    ).toBe(400);
     expect(
       (
         await post("/api/participants", {
@@ -642,6 +654,47 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         })
       ).status,
     ).toBe(400);
+  });
+  it("loads optional fields from a confirmed identity draft while preserving explicit edits", async () => {
+    const { Admin, Document } = await import("../server/models.js");
+    const owner = await Admin.findOne({ username: "test-admin" }).orFail();
+    const fields = {
+      sex: "Әйел",
+      citizenship: "Қазақстан",
+      birthplace: "Астана қаласы",
+    };
+    for (const attachOnEdit of [false, true]) {
+      const iin = attachOnEdit ? "000000001904" : "000000002904";
+      const doc = await Document.create({
+        kind: "identity",
+        ownerId: owner._id,
+        status: "done",
+        fields: { iin, ...fields },
+      });
+      const preview = await agent.get("/api/documents/" + doc.id);
+      expect(preview.body.fields).toMatchObject(fields);
+      const input = {
+        iin,
+        identityDocumentId: doc.id,
+        citizenship: "Түзетілген",
+        birthplace: "",
+      };
+      const created = await post("/api/participants", {
+        lastName: "Мысал",
+        ...(attachOnEdit ? {} : input),
+      });
+      expect(created.status).toBe(201);
+      const url = "/api/participants/" + created.body._id;
+      if (attachOnEdit) expect((await patch(url, input)).status).toBe(200);
+      const saved = (await agent.get(url)).body;
+      expect(saved).toMatchObject({
+        sex: fields.sex,
+        citizenship: input.citizenship,
+        birthplace: "",
+      });
+      expect((await patch(url, { sex: "" })).body.sex).toBe("");
+      expect((await patch(url, { notes: "Үлгі" })).body.sex).toBe("");
+    }
   });
   async function workbookBytes(
     rows: any[][],
@@ -2682,6 +2735,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         phone: "+70000000001",
         iin: "001122000007",
         documentNumber: "012345678",
+        sex: "Әйел",
+        citizenship: "Қазақстан",
+        birthplace: "Маңғыстау облысы",
         issuedBy: "ҚР ІШКІ ІСТЕР МИНИСТРЛІГІ",
         issueDate: "2020-01-01",
         expiryDate: "2030-01-01",
@@ -3009,6 +3065,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Туған жылы",
       "Жасы",
       "Жас санаты",
+      "Жынысы",
+      "Азаматтығы",
+      "Туған жері",
       "Куәлік нөмірі",
       "Кім берді",
       "Жарамдылық мерзімі",
@@ -3023,6 +3082,9 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Туған жылы": 1990,
       Жасы: age,
       "Жас санаты": AGE_LABELS[ageGroup(age)!],
+      Жынысы: a.sex,
+      Азаматтығы: a.citizenship,
+      "Туған жері": a.birthplace,
       "Кім берді": a.issuedBy,
       "Жарамдылық мерзімі": "01.01.2020 — 01.01.2030",
     });
@@ -3033,7 +3095,14 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       international.find(
         (r) => r["Аты-жөні (құжат бойынша)"] === "Есепсынақ Әсел Қызы",
       ),
-    ).toMatchObject({ "Туған күні": null, "Туған жылы": null, Жасы: null });
+    ).toMatchObject({
+      "Туған күні": null,
+      "Туған жылы": null,
+      Жасы: null,
+      Жынысы: "",
+      Азаматтығы: "",
+      "Туған жері": "",
+    });
   });
   it("omits hidden profiles from rosters and keeps their actual money in the ledger", async () => {
     const { Participant, Payment } = await import("../server/models.js");
