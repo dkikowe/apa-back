@@ -3196,7 +3196,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     const awards = ourPeople(
       (await exportBook("awards", withNames)).worksheets[0],
     );
-    for (const type of ["awards", "urshyk", "international"] as const) {
+    for (const type of ["awards", "international"] as const) {
       const byTerritory = await exportBook(
         type,
         "&region=" + encodeURIComponent(common.region),
@@ -3213,24 +3213,6 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Аймақ",
       "Елді мекен",
     ]);
-    const urshyk = ourPeople(
-      (await exportBook("urshyk", withNames)).worksheets[0],
-    );
-    expect(urshyk).toHaveLength(3);
-    expect(urshyk.find((r) => r["ЖСН"] === a.iin)).toMatchObject({
-      "Латынша тегі": "ESEPSYNAQ",
-      "Латынша аты": "ULGI",
-      "Қазақша аты-жөні": a.fullNameKk,
-      "Орысша аты-жөні": a.fullNameRu,
-      "Туған жылы": 1990,
-      "Куәлік нөмірі": "012345678",
-      "Жарамдылық мерзімі": "01.01.2020 — 01.01.2030",
-      "Төленген мүшелік жарна, ₸": 6500,
-    });
-    expect(
-      urshyk.filter((r) => r["Төленген мүшелік жарна, ₸"] === 0),
-    ).toHaveLength(1);
-    expect(urshyk[0]).not.toHaveProperty("Телефон");
     const internationalSheet = (await exportBook("international", withNames))
       .worksheets[0];
     expect(
@@ -3276,6 +3258,127 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       Азаматтығы: "",
       "Туған жері": "",
     });
+    const [registration, fixedRegistration] = await PaymentCategory.create([
+      {
+        name: "Тіркеу ақысы",
+        nameKey: "urshyk-test-registration",
+        amount: 160000,
+      },
+      {
+        name: "1600 тенге",
+        nameKey: "urshyk-test-fixed-registration",
+        amount: 160000,
+      },
+    ]);
+    const [memberOnly, hidden, deleted] = await Participant.create([
+      { lastName: "Жарнасынақ", firstName: "Үлгі", region: "Бейнеу ауданы" },
+      { ...common, firstName: "Жасырылған", siteHiddenAt: new Date() },
+      { ...common, firstName: "Жойылған", deletedAt: new Date() },
+    ]);
+    const signup = {
+      ...payment,
+      amount: 160000,
+      paymentKind: "additional",
+      paymentCategoryId: registration._id,
+      paymentCategoryName: registration.name,
+    };
+    await Payment.create([
+      signup,
+      { ...signup, participantId: c._id, paymentDate: "2044-01-01" },
+      {
+        ...signup,
+        participantId: c._id,
+        paymentCategoryId: fixedRegistration._id,
+        // A legacy payment kept only the reference to its "1600 тенге" category.
+        paymentCategoryName: "",
+        paymentDate: "2044-12-31",
+      },
+      {
+        ...signup,
+        participantId: b._id,
+        paymentCategoryId: undefined,
+        paymentCategoryName: "Зал арендасы — 1600 теңге",
+      },
+      { ...signup, participantId: b._id, amount: 159900 },
+      { ...signup, participantId: b._id, paymentDate: "2045-01-01" },
+      { ...signup, participantId: b._id, voidedAt: new Date() },
+      ...[archived, hidden, deleted].map((person) => ({
+        ...payment,
+        participantId: person._id,
+      })),
+    ]);
+    // Historical payments written before paymentKind existed have no model default.
+    await Payment.collection.insertOne({
+      ...payment,
+      participantId: memberOnly._id,
+    });
+    const moneyHeaders = ["Мүшелік жарна, ₸", "Тіркеу ақысы, ₸", "Барлығы, ₸"];
+    async function republican(region: string, expectedTotals: number[]) {
+      const book = await exportBook(
+        "urshyk",
+        region ? "&region=" + encodeURIComponent(region) : "",
+      );
+      expect(book.worksheets).toHaveLength(1);
+      const sheet = book.worksheets[0];
+      if (region) expect(sheet.getCell("A2").text).toContain(region);
+      expect(
+        ["B3", "D3", "F3"].map((address) => sheet.getCell(address).value),
+      ).toEqual(expectedTotals);
+      const headers = (
+        sheet.getRow(tableHeader(sheet)).values as ExcelJS.CellValue[]
+      ).slice(1);
+      expect(headers).toEqual([
+        ...Object.keys(international[0]),
+        ...moneyHeaders,
+      ]);
+      const rows = records(sheet);
+      for (const [index, header] of moneyHeaders.entries()) {
+        expect(
+          rows.reduce((total, row) => total + Number(row[header]), 0),
+        ).toBe(expectedTotals[index]);
+      }
+      expect(JSON.stringify(sheet.getSheetValues())).not.toContain(
+        String(a.iin),
+      );
+      return rows;
+    }
+    const resultingRows = await republican("", [19487, 4800, 24287]);
+    expect(resultingRows).toHaveLength(3);
+    const memberA = resultingRows.find(
+      (r) => r["Куәлік нөмірі"] === a.documentNumber,
+    );
+    expect(memberA).toMatchObject({
+      "Аты-жөні (құжат бойынша)": "ESEPSYNAQ ULGI\nЕсепсынақ Үлгі Қызы",
+      "Туған күні": new Date("1990-02-01T00:00Z"),
+      Жынысы: a.sex,
+      Азаматтығы: a.citizenship,
+      "Туған жері": a.birthplace,
+      "Кім берді": a.issuedBy,
+      "Жарамдылық мерзімі": "01.01.2020 — 01.01.2030",
+      "Мүшелік жарна, ₸": 12987,
+      "Тіркеу ақысы, ₸": 1600,
+      "Барлығы, ₸": 14587,
+    });
+    expect(await republican(common.region, [12987, 1600, 14587])).toEqual([
+      memberA,
+    ]);
+    expect(await republican("Ақтау", [0, 3200, 3200])).toEqual([
+      expect.objectContaining({
+        "Аты-жөні (құжат бойынша)": "Есепсынақ Әсел Қызы",
+        "Мүшелік жарна, ₸": 0,
+        "Тіркеу ақысы, ₸": 3200,
+        "Барлығы, ₸": 3200,
+      }),
+    ]);
+    expect(await republican("Бейнеу ауданы", [6500, 0, 6500])).toEqual([
+      expect.objectContaining({
+        "Аты-жөні (құжат бойынша)": "Жарнасынақ Үлгі",
+        "Мүшелік жарна, ₸": 6500,
+        "Тіркеу ақысы, ₸": 0,
+        "Барлығы, ₸": 6500,
+      }),
+    ]);
+    expect(await republican("Қарақия ауданы", [0, 0, 0])).toEqual([]);
   });
   it("omits hidden profiles from rosters and keeps their actual money in the ledger", async () => {
     const { Participant, Payment } = await import("../server/models.js");

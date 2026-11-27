@@ -35,7 +35,7 @@ const purposes: Record<ReportType, string> = {
   awards:
     "Марапат қағазына жазылатын аты-жөні. Тізім аймақ пен аты-жөні бойынша реттелген.",
   urshyk:
-    "Республикалық «Ұршық» бірлестігіне жіберілетін қатысушылар мен төленген мүшелік жарналар.",
+    "Чектегі күні бойынша 6 500 ₸ және 6 487 ₸ мүшелік жарна, 1 600 ₸ тіркеу ақысы есепке алынды.",
   international:
     "Қатысушылардың аты-жөні, туған күні және жеке куәлік деректері.",
   members:
@@ -242,43 +242,131 @@ const nativeName = {
   key: "name",
   width: 39,
 };
+const documentColumns: ReportColumn[] = [
+  { ...nativeName, width: 48 },
+  { header: "Туған күні", key: "birthDate", width: 18 },
+  { header: "Жынысы", key: "sex", width: 26 },
+  { header: "Азаматтығы", key: "citizenship", width: 25 },
+  { header: "Туған жері", key: "birthplace", width: 35 },
+  { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
+  { header: "Кім берді", key: "issuedBy", width: 43 },
+  { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
+];
+const republicanAmountColumns = [
+  { header: "Мүшелік жарна, ₸", key: "membership", width: 23, money: true },
+  { header: "Тіркеу ақысы, ₸", key: "registration", width: 22, money: true },
+  { header: "Барлығы, ₸", key: "total", width: 22, money: true },
+] as const;
 const rosterColumns: Record<RosterType, ReportColumn[]> = {
   awards: [
     nativeName,
     { header: "Аймақ", key: "region", width: 40 },
     { header: "Елді мекен", key: "village", width: 27 },
   ],
-  urshyk: [
-    nativeName,
-    { header: "Қазақша аты-жөні", key: "fullNameKk", width: 32 },
-    { header: "Орысша аты-жөні", key: "fullNameRu", width: 32 },
-    { header: "Латынша тегі", key: "lastNameLatin", width: 24 },
-    { header: "Латынша аты", key: "firstNameLatin", width: 24 },
-    { header: "ЖСН", key: "iin", width: 19 },
-    { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
-    { header: "Кім берді", key: "issuedBy", width: 43 },
-    { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
-    { header: "Туған жылы", key: "birthYear", width: 16 },
-    { header: "Жасы", key: "age", width: 10 },
-    { header: "Жас санаты", key: "ageLabel", width: 28 },
-    {
-      header: "Төленген мүшелік жарна, ₸",
-      key: "totalPaid",
-      width: 25,
-      money: true,
-    },
-  ],
-  international: [
-    { ...nativeName, width: 48 },
-    { header: "Туған күні", key: "birthDate", width: 18 },
-    { header: "Жынысы", key: "sex", width: 26 },
-    { header: "Азаматтығы", key: "citizenship", width: 25 },
-    { header: "Туған жері", key: "birthplace", width: 35 },
-    { header: "Куәлік нөмірі", key: "documentNumber", width: 20 },
-    { header: "Кім берді", key: "issuedBy", width: 43 },
-    { header: "Жарамдылық мерзімі", key: "validity", width: 31 },
-  ],
+  urshyk: [...documentColumns, ...republicanAmountColumns],
+  international: documentColumns,
 };
+
+// Monetary amounts are stored in tiyn. Scope by purpose as well as amount:
+// an unrelated 1,600 ₸ payment (such as rent) is not a registration fee.
+async function republicanPayers(year: number, region: string) {
+  const registrationName =
+    /^\s*(?:1\s*600(?:\s*(?:теңге|тенге|тг\.?|₸))?|тіркел?у\s+(?:ақысы|жарнасы|құны)|регистрационный\s+взнос)\s*$/i;
+  const registrationIds = await PaymentCategory.distinct("_id", {
+    name: registrationName,
+  });
+  return Payment.aggregate([
+    {
+      $match: {
+        voidedAt: null,
+        paymentDate: { $gte: `${year}-01-01`, $lt: `${year + 1}-01-01` },
+        $or: [
+          {
+            paymentKind: { $in: [null, "membership"] },
+            amount: { $in: [650000, 648700] },
+          },
+          {
+            paymentKind: "additional",
+            amount: 160000,
+            $or: [
+              { paymentCategoryName: registrationName },
+              // Older payments may have retained only the category reference.
+              {
+                paymentCategoryName: { $in: [null, ""] },
+                paymentCategoryId: { $in: registrationIds },
+              },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      $group: {
+        _id: "$participantId",
+        membership: {
+          $sum: {
+            $cond: [{ $eq: ["$paymentKind", "additional"] }, 0, "$amount"],
+          },
+        },
+        registration: {
+          $sum: {
+            $cond: [{ $eq: ["$paymentKind", "additional"] }, "$amount", 0],
+          },
+        },
+      },
+    },
+    {
+      $lookup: {
+        from: Participant.collection.name,
+        localField: "_id",
+        foreignField: "_id",
+        pipeline: [
+          {
+            $match: {
+              archivedAt: null,
+              deletedAt: null,
+              siteHiddenAt: null,
+              ...(region ? { region } : {}),
+            },
+          },
+          {
+            $project: {
+              lastName: 1,
+              firstName: 1,
+              middleName: 1,
+              fullNameKk: 1,
+              fullNameRu: 1,
+              lastNameLatin: 1,
+              firstNameLatin: 1,
+              birthDate: 1,
+              sex: 1,
+              citizenship: 1,
+              birthplace: 1,
+              documentNumber: 1,
+              issuedBy: 1,
+              issueDate: 1,
+              expiryDate: 1,
+            },
+          },
+        ],
+        as: "person",
+      },
+    },
+    { $unwind: "$person" },
+    {
+      $replaceWith: {
+        $mergeObjects: [
+          "$person",
+          {
+            membership: "$membership",
+            registration: "$registration",
+            total: { $add: ["$membership", "$registration"] },
+          },
+        ],
+      },
+    },
+  ]);
+}
 
 async function addRoster(
   book: ExcelJS.Workbook,
@@ -286,15 +374,28 @@ async function addRoster(
   heading: ReportHeading,
   f: Filters,
 ) {
+  const people =
+    type === "urshyk"
+      ? await republicanPayers(f.year, f.region)
+      : await Participant.aggregate(
+          memberPipeline(
+            filtersSchema.parse({ year: f.year, region: f.region }),
+          ),
+        );
+  const totals =
+    type === "urshyk"
+      ? republicanAmountColumns.map(({ header, key }) => ({
+          label: header,
+          amount: people.reduce((sum, p) => sum + p[key], 0),
+        }))
+      : [];
   const sheet = startTable(
     book,
     "Қатысушылар",
     heading,
     f.year,
     rosterColumns[type],
-  );
-  const people = await Participant.aggregate(
-    memberPipeline(filtersSchema.parse({ year: f.year, region: f.region })),
+    totals,
   );
   people.sort(
     (a, b) =>
@@ -305,7 +406,7 @@ async function addRoster(
       String(a._id).localeCompare(String(b._id)),
   );
   for (const p of people) {
-    if (type === "international") {
+    if (type !== "awards") {
       const latin = [p.lastNameLatin, p.firstNameLatin]
         .filter(Boolean)
         .join(" ");
@@ -323,7 +424,14 @@ async function addRoster(
       const issuedBy = validIdentityIssuer(p.issuedBy) ? p.issuedBy : "";
       const row = sheet.addRow({
         name: names.join("\n"),
-        sex: "Әйел",
+        sex: type === "international" ? "Әйел" : p.sex,
+        ...(type === "urshyk"
+          ? {
+              membership: p.membership / 100,
+              registration: p.registration / 100,
+              total: p.total / 100,
+            }
+          : {}),
         citizenship: p.citizenship ?? "",
         birthplace: p.birthplace ?? "",
         documentNumber:
@@ -355,13 +463,9 @@ async function addRoster(
       continue;
     }
     sheet.addRow({
-      ...p,
       name: documentName(p),
       region: regionLabel(p.region),
-      birthYear: p.birthDate ? Number(p.birthDate.slice(0, 4)) : null,
-      validity: validityPeriod(p.issueDate, p.expiryDate),
-      ageLabel: p.ageGroup == null ? "" : AGE_LABELS[p.ageGroup],
-      totalPaid: p.totalPaid / 100,
+      village: p.village,
     });
   }
   finishTable(sheet);
