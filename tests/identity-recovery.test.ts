@@ -795,6 +795,27 @@ describe("printed Latin names on a photographed identity card", () => {
     expect(engine.recognize).toHaveBeenCalledTimes(3);
   });
   it.each([
+    [latin, true],
+    ["unreadable", false],
+  ])(
+    "requires two matching scale readings when one crop is unreadable (%s)",
+    async (last, recovered) => {
+      const full = primary(labelled, [mrz]);
+      engine.recognize
+        .mockResolvedValueOnce(full)
+        .mockResolvedValueOnce(response([latin]))
+        .mockResolvedValueOnce(response(["unreadable"]))
+        .mockResolvedValueOnce(response([String(last)]))
+        .mockResolvedValue(full);
+      const result = await recognize(await image(), "image/png", "identity", {
+        previousFields: checkpoint,
+        recoveryStage: 1,
+      });
+      expect(result.lastNameLatin).toBe(recovered ? "AK-SU ALEM" : undefined);
+      expect(result.firstNameLatin).toBe(recovered ? "AI ZHAN" : undefined);
+    },
+  );
+  it.each([
     [
       "two different readings",
       labelled,

@@ -461,7 +461,10 @@ export async function recognize(
     const latin = await getLatinWorker();
     let first: { lastNameLatin: string; firstNameLatin: string } | undefined;
     for (const [h, mode] of [
+      // Too much enlargement can turn chevrons into L or E. Read compact
+      // lettering at a smaller scale before trying an enlarged fallback.
       [60, PSM.SINGLE_LINE],
+      [44, PSM.SINGLE_BLOCK],
       [78, PSM.SINGLE_BLOCK],
     ] as const) {
       const strip = await sharp(crop)
@@ -482,24 +485,25 @@ export async function recognize(
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ<-'",
       });
       const text = (await latin.recognize(strip)).data.text.trim();
-      if (text.includes("\n")) return;
+      if (text.includes("\n")) continue;
       const names = text
         .replace(/\s/g, "")
         .match(/^([A-Z]+(?:[-'<][A-Z]+)*)<<([A-Z]+(?:[-'<][A-Z]+)*)<{6,}/);
-      if (!names) return;
+      if (!names) continue;
       const current = {
         lastNameLatin: names[1].replaceAll("<", " "),
         firstNameLatin: names[2].replaceAll("<", " "),
       };
-      if (
-        first &&
-        (current.lastNameLatin !== first.lastNameLatin ||
-          current.firstNameLatin !== first.firstNameLatin)
-      )
+      if (first) {
+        if (
+          current.lastNameLatin === first.lastNameLatin &&
+          current.firstNameLatin === first.firstNameLatin
+        )
+          return current;
         return;
+      }
       first = current;
     }
-    return first;
   };
   const confirmReceiptToken = async (
     rendered: Buffer,

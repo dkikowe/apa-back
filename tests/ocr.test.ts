@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, it, expect } from "vitest";
 import sharp from "sharp";
 import {
@@ -280,18 +281,14 @@ describe.runIf(process.env.RUN_OCR_TESTS === "1")(
   },
 );
 
-it.runIf(process.env.RUN_OCR_TESTS === "1")(
-  "recovers printed Latin names from the MRZ of a compressed JPEG",
-  async () => {
-    const jpg = await sharp(
-      textImage([
-        "ЖСН / ИИН: 750415400007",
-        "DOCUMENT NUMBER: 000005432",
-        "TEST<<AINA<<<<<<<<<<<<<<<<KKKA<",
-      ]),
-    )
-      .jpeg({ quality: 85 })
-      .toBuffer();
+it.runIf(process.env.RUN_OCR_TESTS === "1").each(["liberation", "dejavu"])(
+  "recovers printed Latin names from a compressed %s JPEG",
+  async (font) => {
+    // Fictitious samples rendered once using two Linux typefaces. Keep the
+    // JPEG bytes identical on CI and developer machines.
+    const jpg = await readFile(
+      new URL("./fixtures/identity-mrz-" + font + ".jpg", import.meta.url),
+    );
     const fields = await recognize(jpg, "image/jpeg", "identity", {
       recoveryStage: 2,
       previousFields: {
