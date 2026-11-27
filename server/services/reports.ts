@@ -36,7 +36,7 @@ const purposes: Record<ReportType, string> = {
   urshyk:
     "Республикалық «Ұршық» бірлестігіне жіберілетін қатысушылар мен төленген мүшелік жарналар.",
   international:
-    "Қатысушылардың аты-жөні, туған күні және жеке куәлік деректері. Жынысы тегіне қарап болжанса, «тегі бойынша» деп белгіленеді.",
+    "Қатысушылардың аты-жөні, туған күні және жеке куәлік деректері.",
   members:
     "Таңдалған қатысушылардың жеке мәліметтері мен жылдық жарнасының жағдайы.",
   payments: "Әр қатысушының жарналары төлем мақсаты бойынша жинақталған.",
@@ -278,23 +278,6 @@ const rosterColumns: Record<RosterType, ReportColumn[]> = {
   ],
 };
 
-function internationalRosterSex(person: {
-  sex?: string;
-  lastName?: string;
-  lastNameLatin?: string;
-}) {
-  const recorded = person.sex?.trim();
-  if (recorded) return recorded;
-  const surname = person.lastName?.trim() || person.lastNameLatin?.trim() || "";
-  const ending = surname
-    .normalize("NFC")
-    .match(/^\p{L}[\p{L}\p{M}'’\p{Pd}]*(ова|ов|ova|ov)$/iu);
-  if (!ending) return "";
-  return /[аa]$/iu.test(ending[1])
-    ? "Әйел (тегі бойынша)"
-    : "Ер (тегі бойынша)";
-}
-
 async function addRoster(
   book: ExcelJS.Workbook,
   type: RosterType,
@@ -336,10 +319,9 @@ async function addRoster(
         );
       const birthDate = dateSchema.safeParse(p.birthDate);
       const issuedBy = validIdentityIssuer(p.issuedBy) ? p.issuedBy : "";
-      const sex = internationalRosterSex(p);
       const row = sheet.addRow({
         name: names.join("\n"),
-        sex,
+        sex: "Әйел",
         citizenship: p.citizenship ?? "",
         birthplace: p.birthplace ?? "",
         documentNumber:
@@ -364,7 +346,6 @@ async function addRoster(
             1,
             nameLines,
             Math.ceil(issuedBy.length / 30),
-            Math.ceil(sex.length / 20),
             Math.ceil((p.citizenship?.length ?? 0) / 17),
             Math.ceil((p.birthplace?.length ?? 0) / 24),
           ),

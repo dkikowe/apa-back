@@ -2735,7 +2735,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
         phone: "+70000000001",
         iin: "001122000007",
         documentNumber: "012345678",
-        sex: "Әйел",
+        sex: "Ер",
         citizenship: "Қазақстан",
         birthplace: "Маңғыстау облысы",
         issuedBy: "ҚР ІШКІ ІСТЕР МИНИСТРЛІГІ",
@@ -3052,34 +3052,12 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       urshyk.filter((r) => r["Төленген мүшелік жарна, ₸"] === 0),
     ).toHaveLength(1);
     expect(urshyk[0]).not.toHaveProperty("Телефон");
-    const surnameCases = [
-      { lastName: "Сынақова", expected: "Әйел (тегі бойынша)" },
-      { lastName: "Сынақов", expected: "Ер (тегі бойынша)" },
-      { lastNameLatin: "SYNAQOVA", expected: "Әйел (тегі бойынша)" },
-      { lastNameLatin: "SYNAQOV", expected: "Ер (тегі бойынша)" },
-      { lastName: "Үлгібай", expected: "" },
-      { lastName: "Сынақов", sex: "Әйел", expected: "Әйел" },
-    ];
-    const surnameRows = await Participant.create(
-      surnameCases.map(({ lastName, lastNameLatin, sex }, index) => ({
-        lastName,
-        lastNameLatin,
-        sex,
-        firstName: "Үлгі",
-        documentNumber: `00899000${index}`,
-      })),
-    );
     const internationalSheet = (await exportBook("international", withNames))
       .worksheets[0];
-    const allRows = records(internationalSheet);
-    for (const [index, fixture] of surnameCases.entries()) {
-      const row = allRows.find(
-        (entry) => entry["Куәлік нөмірі"] === surnameRows[index].documentNumber,
-      );
-      expect(row, JSON.stringify(fixture)).toMatchObject({
-        Жынысы: fixture.expected,
-      });
-    }
+    expect(
+      new Set(records(internationalSheet).map((row) => row["Жынысы"])),
+    ).toEqual(new Set(["Әйел"]));
+    expect((await Participant.findById(a._id).lean())?.sex).toBe("Ер");
     const international = ourPeople(internationalSheet);
     expect(international).toHaveLength(3);
     expect(internationalSheet.getCell("A1").text).toBe(
@@ -3100,7 +3078,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     ).toMatchObject({
       "Аты-жөні (құжат бойынша)": "ESEPSYNAQ ULGI\nЕсепсынақ Үлгі Қызы",
       "Туған күні": new Date("1990-02-01T00:00:00Z"),
-      Жынысы: a.sex,
+      Жынысы: "Әйел",
       Азаматтығы: a.citizenship,
       "Туған жері": a.birthplace,
       "Кім берді": a.issuedBy,
@@ -3115,7 +3093,7 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       ),
     ).toMatchObject({
       "Туған күні": null,
-      Жынысы: "",
+      Жынысы: "Әйел",
       Азаматтығы: "",
       "Туған жері": "",
     });
