@@ -3052,8 +3052,34 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       urshyk.filter((r) => r["Төленген мүшелік жарна, ₸"] === 0),
     ).toHaveLength(1);
     expect(urshyk[0]).not.toHaveProperty("Телефон");
+    const surnameCases = [
+      { lastName: "Сынақова", expected: "Әйел (тегі бойынша)" },
+      { lastName: "Сынақов", expected: "Ер (тегі бойынша)" },
+      { lastNameLatin: "SYNAQOVA", expected: "Әйел (тегі бойынша)" },
+      { lastNameLatin: "SYNAQOV", expected: "Ер (тегі бойынша)" },
+      { lastName: "Үлгібай", expected: "" },
+      { lastName: "Сынақов", sex: "Әйел", expected: "Әйел" },
+    ];
+    const surnameRows = await Participant.create(
+      surnameCases.map(({ lastName, lastNameLatin, sex }, index) => ({
+        lastName,
+        lastNameLatin,
+        sex,
+        firstName: "Үлгі",
+        documentNumber: `00899000${index}`,
+      })),
+    );
     const internationalSheet = (await exportBook("international", withNames))
       .worksheets[0];
+    const allRows = records(internationalSheet);
+    for (const [index, fixture] of surnameCases.entries()) {
+      const row = allRows.find(
+        (entry) => entry["Куәлік нөмірі"] === surnameRows[index].documentNumber,
+      );
+      expect(row, JSON.stringify(fixture)).toMatchObject({
+        Жынысы: fixture.expected,
+      });
+    }
     const international = ourPeople(internationalSheet);
     expect(international).toHaveLength(3);
     expect(internationalSheet.getCell("A1").text).toBe(
@@ -3062,9 +3088,6 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
     expect(Object.keys(international[0])).toEqual([
       "Аты-жөні (құжат бойынша)",
       "Туған күні",
-      "Туған жылы",
-      "Жасы",
-      "Жас санаты",
       "Жынысы",
       "Азаматтығы",
       "Туған жері",
@@ -3072,16 +3095,11 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       "Кім берді",
       "Жарамдылық мерзімі",
     ]);
-    const { ageAt, ageGroup, AGE_LABELS } = await import("../shared/domain.js");
-    const age = ageAt(common.birthDate);
     expect(
       international.find((r) => r["Куәлік нөмірі"] === "012345678"),
     ).toMatchObject({
       "Аты-жөні (құжат бойынша)": "ESEPSYNAQ ULGI\nЕсепсынақ Үлгі Қызы",
       "Туған күні": new Date("1990-02-01T00:00:00Z"),
-      "Туған жылы": 1990,
-      Жасы: age,
-      "Жас санаты": AGE_LABELS[ageGroup(age)!],
       Жынысы: a.sex,
       Азаматтығы: a.citizenship,
       "Туған жері": a.birthplace,
@@ -3097,8 +3115,6 @@ describe("Real MongoDB API integration", { concurrent: false }, () => {
       ),
     ).toMatchObject({
       "Туған күні": null,
-      "Туған жылы": null,
-      Жасы: null,
       Жынысы: "",
       Азаматтығы: "",
       "Туған жері": "",
